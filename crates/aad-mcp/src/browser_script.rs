@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const NAME: &str = "browser_script";
+mod download_export;
 pub const SOURCE_LIMIT: usize = 64 * 1024;
 const RESULT_LIMIT: usize = 512 * 1024;
 const MAX_CALLS: usize = 500;
@@ -36,7 +37,7 @@ pub struct Script {
 pub fn tool() -> Tool {
     Tool {
         name: NAME,
-        description: "Run synchronous JavaScript starting on one observed resource selected by resource_id or exact url. Use page.observe, present, read, fields, table, collect, wait, click, fill, key, scroll and act. In Chromium, page.openPopup(locator, exactUrl?) clicks and binds to one new popup opened by the bound frame; page.returnToOpener() restores that frame. Popup switching is unavailable with explicit resource grants. page.chooseFiles(locator, files) selects files through an upload button; page.upload sets a file input directly. Pass JSON in inputs and return JSON. Writes need the server's input grant; file selection also needs an allowed upload directory.",
+        description: "Run synchronous JavaScript starting on one observed resource selected by resource_id or exact url. Use page.observe, present, read, fields, table, collect, wait, click, fill, key, scroll and act. In Chromium, page.openPopup(locator, exactUrl?) clicks and binds to one new popup opened by the bound frame; page.returnToOpener() restores that frame. Popup switching is unavailable with explicit resource grants. page.chooseFiles(locator, files) selects files through an upload button; page.upload sets a file input directly. In a session-launched Chromium, page.downloadExport({task_id,trigger,expected}) verifies a task download and returns its preserved file path and digest. Pass JSON in inputs and return JSON. Writes need the server's input grant; file selection also needs an allowed upload directory.",
         schema: json!({"type":"object","additionalProperties":false,"required":["source"],
             "oneOf":[{"required":["resource_id"]},{"required":["url"]}],
             "properties":{"source":{"type":"string","maxLength":SOURCE_LIMIT},
@@ -54,6 +55,9 @@ fn failure(code: &str, message: impl ToString) -> Value {
 #[derive(Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 enum PageCall {
+    DownloadExport {
+        spec: Box<download_export::Spec>,
+    },
     Observe {
         mode: ViewMode,
     },
@@ -289,6 +293,7 @@ impl Page {
             PageCall::OpenPopup { locator, url } => self.open_popup(locator, url),
             PageCall::ReturnToOpener {} => self.return_to_opener(),
             PageCall::Observe { mode } => self.observe(mode),
+            PageCall::DownloadExport { spec } => self.download_export(*spec),
             PageCall::Fields { fields } => self.request(Operation::ReadFields {
                 resource_id: self.resource_id.clone(),
                 fields,
@@ -378,16 +383,47 @@ fn stopped(token: &CancellationToken) -> Value {
 }
 
 pub fn run(session: Arc<Session>, script: Script, stop: CancellationToken) -> Result<Value> {
+    run_with_limit(session, script, stop, 120_000)
+}
+
+pub fn run_download_export(
+    session: Arc<Session>,
+    resource_id: String,
+    spec: Value,
+    timeout_ms: u64,
+    stop: CancellationToken,
+) -> Result<Value> {
+    run_with_limit(
+        session,
+        Script {
+            source: "return page.downloadExport(inputs);".into(),
+            inputs: spec,
+            resource_id: Some(resource_id),
+            url: None,
+            provider: Some(CDP.into()),
+            timeout_ms: Some(timeout_ms),
+        },
+        stop,
+        1_800_000,
+    )
+}
+
+fn run_with_limit(
+    session: Arc<Session>,
+    script: Script,
+    stop: CancellationToken,
+    max_timeout_ms: u64,
+) -> Result<Value> {
     let timeout = script.timeout_ms.unwrap_or(30_000);
     let provider = script.provider.as_deref().unwrap_or(CDP);
     if script.source.is_empty()
         || script.source.len() > SOURCE_LIMIT
         || script.inputs.to_string().len() > SOURCE_LIMIT
-        || !(1..=120_000).contains(&timeout)
+        || !(1..=max_timeout_ms).contains(&timeout)
         || !matches!(provider, CDP | BIDI)
         || script.url.is_some() == script.resource_id.is_some()
     {
-        return Err(failure("BROWSER.SCRIPT_INVALID", "provide one page (resource_id or exact url), a script up to 65536 bytes, and timeout_ms in 1..120000"));
+        return Err(failure("BROWSER.SCRIPT_INVALID", format!("provide one page (resource_id or exact url), a script up to 65536 bytes, and timeout_ms in 1..{max_timeout_ms}")));
     }
     let start = Instant::now();
     let deadline = start + Duration::from_millis(timeout);

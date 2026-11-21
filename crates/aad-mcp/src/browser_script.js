@@ -15,6 +15,7 @@
     const page = Object.freeze({
         observe: (mode = "outline") => call("observe", {mode}),
         read, fields, act,
+        downloadExport: spec => call("download_export", {spec}),
         present: locator => read(locator, "present"),
         click: locator => act(locator, {type: "click"}),
         fill: (locator, value) => act(locator, {type: "fill", value}),
