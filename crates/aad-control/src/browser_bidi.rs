@@ -31,15 +31,51 @@ const ACTIONS: &[&str] = &[
     "close_page",
 ];
 const MAX_FRAMES: usize = 256;
-// These actions execute on the revalidated element in its own isolated realm.
-// Physical pointer and keyboard events use the top-level browsing context.
-const FRAME_ACTIONS: &[&str] = &["focus", "invoke", "fill", "select", "check"];
+const FRAME_DOM_ACTIONS: &[&str] = &["focus", "invoke", "fill", "select", "check"];
+const FRAME_ACTIONS: &[&str] = &[
+    "focus",
+    "invoke",
+    "fill",
+    "select",
+    "check",
+    "click",
+    "hover",
+    "scroll",
+    "key",
+    "type_text",
+];
 
 #[derive(Clone)]
 struct Frame {
     id: String,
     parent: Option<String>,
     url: String,
+}
+
+impl Frame {
+    // Listing can establish the URL boundary. Observation also has to prove
+    // the actual embedding elements and their viewport geometry.
+    fn physical_route<'a>(
+        &'a self,
+        tree: &'a BTreeMap<String, Frame>,
+    ) -> Option<(&'a str, Vec<&'a str>)> {
+        self.parent.as_ref()?;
+        let url = url::Url::parse(&self.url).ok()?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return None;
+        }
+        let origin = url.origin();
+        let mut at = self;
+        let mut urls = vec![self.url.as_str()];
+        while let Some(parent) = &at.parent {
+            at = tree.get(parent)?;
+            if url::Url::parse(&at.url).ok()?.origin() != origin {
+                return None;
+            }
+            urls.push(&at.url);
+        }
+        Some((&at.id, urls))
+    }
 }
 
 pub struct FirefoxBackend {
@@ -143,6 +179,26 @@ impl Request<'_> {
             action.commit()?;
         }
         Ok(())
+    }
+    fn frame_hosts_clear(
+        &self,
+        client: &mut Client,
+        realm: &str,
+        observation: &Value,
+    ) -> Result<bool> {
+        let result = self.command(client, "script.evaluate", json!({
+            "target":{"realm":realm}, "expression":format!("globalThis.__aadBidiV1.embedding_hosts({observation})"),
+            "awaitPromise":false, "serializationOptions":{"maxObjectDepth":1,"maxDomDepth":0,"includeShadowTree":"all"}
+        }))?;
+        Ok(result["type"] == "success"
+            && result["result"]["value"].as_array().is_some_and(|hosts| {
+                !hosts.is_empty()
+                    && hosts.iter().all(|host| {
+                        host["type"] == "node"
+                            && host["value"]["nodeType"] == 1
+                            && host["value"].get("shadowRoot") == Some(&Value::Null)
+                    })
+            }))
     }
 }
 
@@ -363,7 +419,8 @@ impl FirefoxBackend {
         let mut state = self.lock(&request)?;
         let client = state.as_mut().unwrap();
         let id = selector["context"].as_str().ok_or_else(unsupported)?;
-        let frame = self.authorized(&frames(client, &request)?, id)?;
+        let tree = frames(client, &request)?;
+        let frame = self.authorized(&tree, id)?;
         let realm = self.realm(client, &frame, &request)?;
         let observation = uuid::Uuid::new_v4().to_string();
         let expression = if let Some((snapshot, node)) = root {
@@ -383,6 +440,26 @@ impl FirefoxBackend {
             )
         };
         let mut result = request.value(client, &realm, &expression)?;
+        // Bind the embedding documents/elements to this observation in the
+        // leaf realm. Dispatch viewport coordinates in the proven top context.
+        let mut input_context = None;
+        if let Some((root, urls)) = frame.physical_route(&tree) {
+            let bound = request.value(
+                client,
+                &realm,
+                &format!(
+                    "globalThis.__aadBidiV1.bind_frames({}, {})",
+                    json!(observation),
+                    json!(urls)
+                ),
+            )?;
+            if bound == true && request.frame_hosts_clear(client, &realm, &json!(observation))? {
+                let top = request.script(client, json!({"realm":realm}), "window.top")?;
+                if top["result"]["value"]["context"] == root {
+                    input_context = Some(root);
+                }
+            }
+        }
         let history = request.value(client, &realm, "globalThis.__aadBidiV1.history_targets()")?;
         for node in result["nodes"].as_array_mut().into_iter().flatten() {
             let protected = node["states"]["protected"] == true;
@@ -394,8 +471,10 @@ impl FirefoxBackend {
                 if actions.iter().any(|a| a == "click") {
                     actions.push(json!("invoke"));
                 }
-                let supported = if frame.parent.is_some() {
+                let supported = if input_context.is_some() {
                     FRAME_ACTIONS
+                } else if frame.parent.is_some() {
+                    FRAME_DOM_ACTIONS
                 } else {
                     ACTIONS
                 };
@@ -409,7 +488,7 @@ impl FirefoxBackend {
             }
         }
         result["snapshot_id"] = json!(observation);
-        result["metadata"] = json!({"context":id,"realm":realm,"parent":frame.parent,"url":frame.url,
+        result["metadata"] = json!({"context":id,"realm":realm,"parent":frame.parent,"url":frame.url,"input_context":input_context,
             "main_frame":frame.parent.is_none(),"accessibility":{"applied":false,"source":"bounded DOM semantics"},"closed_shadow_inspection":{"complete":true}});
         let current = self.authorized(&frames(client, &request)?, id)?;
         let active = request.script(client, json!({"context":id,"sandbox":self.world}), "true")?;
@@ -430,6 +509,11 @@ impl FirefoxBackend {
         request: &Request<'_>,
     ) -> Result<(String, String)> {
         let (id, realm) = self.fresh(client, snapshot, request)?;
+        if args["frame_input"] == true
+            && !request.frame_hosts_clear(client, &realm, &args["observation"])?
+        {
+            return Err(unsupported());
+        }
         request.value(
             client,
             &realm,
@@ -449,6 +533,41 @@ impl FirefoxBackend {
             )
             .is_ok()
     }
+    fn check_physical_anchor(
+        &self,
+        client: &mut Client,
+        snapshot: &Value,
+        args: &Value,
+        point: Option<(i64, i64)>,
+        request: &Request<'_>,
+    ) -> Result<()> {
+        let (_, realm) = self.input_check(client, snapshot, args, request)?;
+        if let Some((x, y)) = point {
+            let current = request.value(
+                client,
+                &realm,
+                &format!("globalThis.__aadBidiV1.point({args})"),
+            )?;
+            if current["x"] != x || current["y"] != y {
+                return Err(error(
+                    "CONTROL.STALE_TARGET",
+                    "Firefox pointer anchor moved",
+                ));
+            }
+        } else if request.value(
+            client,
+            &realm,
+            &format!("globalThis.__aadBidiV1.verify_focus({args})"),
+        )?["ok"]
+            != true
+        {
+            return Err(error(
+                "CONTROL.FOCUS_FAILED",
+                "Firefox focus left the observed element",
+            ));
+        }
+        request.remaining()
+    }
     fn hold(
         &self,
         client: &mut Client,
@@ -463,32 +582,7 @@ impl FirefoxBackend {
         };
         let until = Instant::now() + Duration::from_millis(ms);
         loop {
-            let (_, realm) = self.input_check(client, snapshot, args, request)?;
-            if let Some((x, y)) = point {
-                let current = request.value(
-                    client,
-                    &realm,
-                    &format!("globalThis.__aadBidiV1.point({args})"),
-                )?;
-                if current["x"] != x || current["y"] != y {
-                    return Err(error(
-                        "CONTROL.STALE_TARGET",
-                        "Firefox held pointer anchor moved",
-                    ));
-                }
-            } else if request.value(
-                client,
-                &realm,
-                &format!("globalThis.__aadControlV1.verify({args})"),
-            )?["ok"]
-                != true
-            {
-                return Err(error(
-                    "CONTROL.FOCUS_FAILED",
-                    "Firefox focus left the held key anchor",
-                ));
-            }
-            request.remaining()?;
+            self.check_physical_anchor(client, snapshot, args, point, request)?;
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Ok(());
@@ -656,7 +750,10 @@ impl Backend for FirefoxBackend {
             let access=self.authorized(&tree,&frame.id);
             let capabilities=match (access.is_ok(), frame.parent.is_some()) {
                 (false, _) => Vec::new(),
-                (true, true) => FRAME_ACTIONS.iter().map(|s| (*s).into()).collect(),
+                (true, true) => {
+                    let actions = if frame.physical_route(&tree).is_some() {FRAME_ACTIONS} else {FRAME_DOM_ACTIONS};
+                    actions.iter().map(|s| (*s).into()).collect()
+                }
                 (true, false) => self.capabilities(),
             };
             BackendResource{resource:Resource{resource_id:resource_id(PROVIDER,&selector),provider:PROVIDER.into(),kind:"browser".into(),name:frame.url.clone(),capabilities,
@@ -783,7 +880,19 @@ impl Backend for FirefoxBackend {
             action.name()
         };
         let mut args = json!({"document_token":snapshot["document_token"],"observation":snapshot["snapshot_id"],"node_id":node["node_id"],"action":action_name});
+        if snapshot["metadata"]["main_frame"] != true && !FRAME_DOM_ACTIONS.contains(&action.name())
+        {
+            if !snapshot["metadata"]["input_context"].is_string() {
+                return Err(unsupported());
+            }
+            args["frame_input"] = json!(true);
+        }
         let (id, realm) = self.input_check(client, snapshot, &args, &request)?;
+        let input_context = if snapshot["metadata"]["main_frame"] == true {
+            Some(id.as_str())
+        } else {
+            snapshot["metadata"]["input_context"].as_str()
+        };
         match action {
             Action::Back {} | Action::Forward {} => self.history(client, snapshot, &args, &request),
             Action::Navigate { url } => self.navigate(client, &id, url, &request),
@@ -840,8 +949,12 @@ impl Backend for FirefoxBackend {
             Action::Click { fraction, .. }
             | Action::Hover { fraction, .. }
             | Action::Scroll { fraction, .. } => {
+                let input_context = input_context.ok_or_else(unsupported)?;
                 args["fraction"] = json!(fraction);
-                request.commit()?;
+                if args["frame_input"] != true {
+                    // Top-level point calculation may scroll the element into view.
+                    request.commit()?;
+                }
                 let point = request.value(
                     client,
                     &realm,
@@ -849,27 +962,20 @@ impl Backend for FirefoxBackend {
                 )?;
                 let x = point["x"].as_f64().ok_or_else(unsupported)?.round() as i64;
                 let y = point["y"].as_f64().ok_or_else(unsupported)?.round() as i64;
-                let result = (|| {
+                args["noscroll"] = json!(true);
+                let result: Result<Value> = (|| {
                     let count = match action {
                         Action::Click { count, .. } => count.unwrap_or(1),
                         _ => 1,
                     };
                     for _ in 0..count {
-                        self.input_check(client, snapshot, &args, &request)?;
-                        args["noscroll"] = json!(true);
-                        let current = request.value(
+                        self.check_physical_anchor(
                             client,
-                            &realm,
-                            &format!("globalThis.__aadBidiV1.point({args})"),
+                            snapshot,
+                            &args,
+                            Some((x, y)),
+                            &request,
                         )?;
-                        if (current["x"].as_f64().unwrap_or(f64::NAN) - x as f64).abs() > 1.0
-                            || (current["y"].as_f64().unwrap_or(f64::NAN) - y as f64).abs() > 1.0
-                        {
-                            return Err(error(
-                                "CONTROL.STALE_TARGET",
-                                "Firefox pointer anchor moved",
-                            ));
-                        }
                         request.commit()?;
                         if let Action::Scroll {
                             direction, notches, ..
@@ -882,30 +988,25 @@ impl Backend for FirefoxBackend {
                                 Direction::Left => (-amount, 0),
                                 Direction::Right => (amount, 0),
                             };
-                            request.command(client,"input.performActions",json!({"context":id,"actions":[{"type":"wheel","id":"aad-wheel","actions":[{"type":"scroll","x":x,"y":y,"deltaX":dx,"deltaY":dy,"duration":0,"origin":"viewport"}]}]}))?;
+                            request.command(client,"input.performActions",json!({"context":input_context,"actions":[{"type":"wheel","id":"aad-wheel","actions":[{"type":"scroll","x":x,"y":y,"deltaX":dx,"deltaY":dy,"duration":0,"origin":"viewport"}]}]}))?;
                         } else {
                             pointer(
                                 client,
                                 &request,
-                                &id,
+                                input_context,
                                 json!({"type":"pointerMove","x":x,"y":y,"origin":"viewport","duration":0}),
                             )?;
                             if let Action::Click {
                                 button, hold_ms, ..
                             } = action
                             {
-                                self.input_check(client, snapshot, &args, &request)?;
-                                let current = request.value(
+                                self.check_physical_anchor(
                                     client,
-                                    &realm,
-                                    &format!("globalThis.__aadBidiV1.point({args})"),
+                                    snapshot,
+                                    &args,
+                                    Some((x, y)),
+                                    &request,
                                 )?;
-                                if current["x"] != x || current["y"] != y {
-                                    return Err(error(
-                                        "CONTROL.STALE_TARGET",
-                                        "Firefox pointer anchor moved after hover",
-                                    ));
-                                }
                                 request.commit()?;
                                 let button = match button.unwrap_or(Button::Left) {
                                     Button::Left => 0,
@@ -916,7 +1017,7 @@ impl Backend for FirefoxBackend {
                                 pointer(
                                     client,
                                     &request,
-                                    &id,
+                                    input_context,
                                     json!({"type":"pointerDown","button":button}),
                                 )?;
                                 self.hold(
@@ -927,12 +1028,18 @@ impl Backend for FirefoxBackend {
                                     &request,
                                     *hold_ms,
                                 )?;
-                                self.input_check(client, snapshot, &args, &request)?;
+                                self.check_physical_anchor(
+                                    client,
+                                    snapshot,
+                                    &args,
+                                    Some((x, y)),
+                                    &request,
+                                )?;
                                 request.commit()?;
                                 pointer(
                                     client,
                                     &request,
-                                    &id,
+                                    input_context,
                                     json!({"type":"pointerUp","button":button}),
                                 )?;
                             }
@@ -942,7 +1049,7 @@ impl Backend for FirefoxBackend {
                         json!({"submitted":true,"trusted_event":true,"native_operation":"WebDriver BiDi input.performActions"}),
                     )
                 })();
-                let cleared = Self::release(client, &id);
+                let cleared = Self::release(client, input_context);
                 match result {
                     Err(e) => Err(e.with_detail("residual_state_cleared", json!(cleared))),
                     Ok(v) if cleared => Ok(v),
@@ -953,6 +1060,7 @@ impl Backend for FirefoxBackend {
                 }
             }
             Action::Key { .. } | Action::TypeText { .. } => {
+                let input_context = input_context.ok_or_else(unsupported)?;
                 let hold_ms = match action {
                     Action::Key { hold_ms, .. } => *hold_ms,
                     _ => None,
@@ -968,54 +1076,34 @@ impl Backend for FirefoxBackend {
                 request.value(
                     client,
                     &realm,
-                    &format!("globalThis.__aadControlV1.act({args})"),
+                    &format!("globalThis.__aadBidiV1.focus_for_keys({args})"),
                 )?;
-                let result = (|| {
+                let result: Result<Value> = (|| {
                     for chord in chords {
-                        request.hold_budget(hold_ms)?;
-                        self.input_check(client, snapshot, &args, &request)?;
-                        if request.value(
-                            client,
-                            &realm,
-                            &format!("globalThis.__aadControlV1.verify({args})"),
-                        )?["ok"]
-                            != true
-                        {
-                            return Err(error(
-                                "CONTROL.FOCUS_FAILED",
-                                "Firefox focus left the observed element",
-                            ));
-                        }
                         for key in &chord {
-                            self.input_check(client, snapshot, &args, &request)?;
-                            if request.value(
-                                client,
-                                &realm,
-                                &format!("globalThis.__aadControlV1.verify({args})"),
-                            )?["ok"]
-                                != true
-                            {
-                                return Err(error(
-                                    "CONTROL.FOCUS_FAILED",
-                                    "Firefox focus left the observed element",
-                                ));
-                            }
+                            self.check_physical_anchor(client, snapshot, &args, None, &request)?;
                             request.hold_budget(hold_ms)?;
                             request.commit()?;
-                            keyboard(client, &request, &id, "keyDown", key)?;
+                            keyboard(client, &request, input_context, "keyDown", key)?;
                         }
                         self.hold(client, snapshot, &args, None, &request, hold_ms)?;
                         for key in chord.iter().rev() {
-                            self.input_check(client, snapshot, &args, &request)?;
+                            if args["frame_input"] == true {
+                                self.check_physical_anchor(
+                                    client, snapshot, &args, None, &request,
+                                )?;
+                            } else {
+                                self.input_check(client, snapshot, &args, &request)?;
+                            }
                             request.commit()?;
-                            keyboard(client, &request, &id, "keyUp", key)?;
+                            keyboard(client, &request, input_context, "keyUp", key)?;
                         }
                     }
                     Ok(
                         json!({"submitted":true,"trusted_event":true,"native_operation":"WebDriver BiDi input.performActions"}),
                     )
                 })();
-                let cleared = Self::release(client, &id);
+                let cleared = Self::release(client, input_context);
                 match result {
                     Err(e) => Err(e.with_detail("residual_state_cleared", json!(cleared))),
                     Ok(v) if cleared => Ok(v),

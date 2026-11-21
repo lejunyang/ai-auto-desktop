@@ -31,7 +31,7 @@ const html=`<!doctype html><meta charset=utf-8><title>AAD Firefox fixture</title
 <div id=panel aria-label=Panel style="overflow:auto;width:240px;height:45px"><div style="height:300px">rows</div></div>
 <div id=covered style="position:relative;width:200px"><button aria-label=Covered>Covered</button></div>
 <input id=password type=password value=synthetic-light-private>
-<x-closed></x-closed><iframe src=/frame style="width:240px;height:35px"></iframe>
+<x-closed></x-closed><div id=frame-host><iframe id=outer src=/outer style="position:absolute;left:100px;top:250px;width:700px;height:220px;border:3px solid;padding:2px"></iframe></div>
 <script>
 const closed=document.querySelector('x-closed').attachShadow({mode:'closed'});
 closed.innerHTML='<input type=password value=synthetic-closed-first><input type=password value=synthetic-closed-second>';
@@ -52,7 +52,20 @@ if(next==='reveal'){for(const el of [document.querySelector('#password'),...clos
 if(next==='remove'){for(const el of [...document.querySelectorAll('input:not(#editor):not(#agree)'),...document.querySelectorAll('iframe,x-closed,#overlay')])el.remove()}
 if(next==='navigate'){location.href='/next';return}
 if(next==='focus-away')document.querySelector('#hover').focus();
-if(next==='reload-frame')await new Promise(resolve=>{const frame=document.querySelector('iframe');frame.onload=resolve;frame.src='/frame?replacement'});
+if(next==='reload-frame')await new Promise(resolve=>{const frame=outer.contentDocument.querySelector('#leaf');frame.onload=resolve;frame.src='/frame?replacement'});
+if(next==='move-outer')outer.style.left='124px';
+if(next==='scale-outer')outer.style.transform='scale(0.9)';
+if(next==='restore-outer'){outer.style.transform='';outer.style.left='100px';}
+function coverFrame(frame){
+  const cover=frame.ownerDocument.createElement('div'), r=frame.getBoundingClientRect();
+  cover.id='frame-cover';Object.assign(cover.style,{position:'fixed',left:r.left+'px',top:r.top+'px',width:r.width+'px',height:r.height+'px',background:'white',zIndex:1000});
+  frame.after(cover);
+}
+if(next==='cover-outer'||next==='cover-inner')coverFrame(next==='cover-outer'?outer:outer.contentDocument.querySelector('#leaf'));
+if(next==='cover-on-hover')outer.contentDocument.querySelector('#leaf').contentDocument.querySelector('button')
+  .addEventListener('mouseover',()=>coverFrame(outer),{once:true});
+if(next==='slot-outer')document.querySelector('#frame-host').attachShadow({mode:'closed'}).innerHTML='<slot></slot>';
+if(next==='uncover-frames'){document.querySelector('#frame-cover')?.remove();outer.contentDocument.querySelector('#frame-cover')?.remove();}
 if(next==='cover-next')coverNext=true;
 if(next==='uncover')document.querySelector('#overlay')?.remove();
 if(next)lastCommand=next;
@@ -63,8 +76,10 @@ checked:document.querySelector('#agree').checked,scroll:document.querySelector('
 }catch{}setTimeout(tick,10)}tick();
 </script>`;
 let frameResult;
+const frameEvents=[];
 const server=createServer(async(req,res)=>{
   if(req.url==='/frame-result'){let bytes='';for await(const b of req)bytes+=b;frameResult=JSON.parse(bytes);res.end('ok');return}
+  if(req.url==='/frame-event'){let bytes='';for await(const b of req)bytes+=b;frameEvents.push(JSON.parse(bytes));res.end('ok');return}
   if(req.url==='/nav-state'){let bytes='';for await(const b of req)bytes+=b;const state=JSON.parse(bytes);state.sequence=++navigationReports;navigationStates.set(state.path,state);res.end('ok');return}
   if(req.url==='/observed'){let bytes='';for await(const b of req)bytes+=b;browserState=JSON.parse(bytes);res.end('ok');return}
   if(req.url==='/command'){const next=command;command='';res.end(next);return}
@@ -76,10 +91,23 @@ async function report(){try{await fetch('/nav-state',{method:'POST',body:state()
 if(location.pathname==='/nav-guard')document.addEventListener('visibilitychange',()=>{if(document.hidden){const body=document.createElement('body');body.innerHTML='<button>Replaced</button>';document.body.replaceWith(body)}});
 document.querySelector('#long').onclick=()=>{history.pushState(null,'','/nav-long?'+('x'.repeat(2600)));history.pushState(null,'','/nav-after-long')};
 </script>`);return}
-  res.end(req.url.split('?')[0]==='/frame'?`<title>child</title><input type=password value=synthetic-frame-private>
+  if(req.url==='/outer'){res.end(`<!doctype html><iframe id=leaf src=/frame style="position:absolute;left:28px;top:12px;width:260px;height:170px;border:4px solid"></iframe>
+    <iframe src=/sibling style="position:absolute;left:350px;top:12px;width:260px;height:170px"></iframe>
+    <iframe src="http://localhost:${server.address().port}/foreign" style="width:50px;height:30px"></iframe>`);return}
+  res.end(['/frame','/sibling','/foreign'].includes(req.url.split('?')[0])?`<!doctype html><title>child</title><input type=password value=synthetic-frame-private hidden>
     <input aria-label="Frame order"><select aria-label="Frame size"><option>S</option><option>L</option></select>
     <input aria-label="Frame agree" type="checkbox"><button>Child</button>
-    <script>document.querySelector('button').onclick=()=>fetch('/frame-result',{method:'POST',body:JSON.stringify({
+    <div aria-label="Frame scroller" style="height:48px;overflow:auto"><div style="height:300px">rows</div></div>
+    <div role=button aria-label="Frame wrapper" style="position:absolute;right:2px;bottom:2px;width:38px;height:28px"><iframe srcdoc="nested" style="width:100%;height:100%;border:0"></iframe></div>
+    <script>for(const type of ['click','mouseover','keydown','keyup','wheel','scroll']){
+      document.addEventListener(type,e=>{const el=e.target;if(!el.getBoundingClientRect)return;
+        const box=el.getBoundingClientRect();
+        navigator.sendBeacon('/frame-event',JSON.stringify({path:location.pathname,type,trusted:e.isTrusted,
+          target:el.getAttribute('aria-label')||el.textContent,key:e.key,value:el.value,start:el.selectionStart,end:el.selectionEnd,
+          top:el.scrollTop,offset:e.clientX-box.left,width:box.width}));
+      },true);
+    }
+    document.querySelector('button').onclick=()=>fetch('/frame-result',{method:'POST',body:JSON.stringify({
       value:document.querySelector('[aria-label="Frame order"]').value,
       size:document.querySelector('select').value,agreed:document.querySelector('[type=checkbox]').checked
     })});</script>`:req.url==='/next'?'<title>Next</title><button>Next</button>':html);
@@ -120,10 +148,11 @@ try{
   for(const secret of ['synthetic-light-private','synthetic-closed-first','synthetic-closed-second'])assert.ok(!JSON.stringify(o).includes(secret));
   assert.ok(o.nodes.some(n=>n.states.protected&&n.value===null&&n.actions.length===0));
   record('protected values and inline script source absent from observation');
-  const child=resources.find(r=>r.provider==='browser.firefox_bidi'&&!r.metadata.main_frame);
-  assert.ok(child);assert.deepEqual([...child.capabilities].sort(),['check','fill','focus','invoke','select']);
+  const child=resources.find(r=>r.metadata.url===url+'frame');
+  assert.ok(child);assert.ok(child.capabilities.includes('click'));
   const childObservation=await observe(child.resource_id);
-  assert.ok(childObservation.nodes.every(n=>!n.actions.includes('click')&&!n.actions.includes('key')));
+  assert.ok(childObservation.nodes.find(n=>n.name==='Child').actions.includes('click'));
+  assert.ok(childObservation.nodes.find(n=>n.name==='Frame order').actions.includes('key'));
   assert.ok(!JSON.stringify(childObservation).includes('synthetic-frame-private'));
   await perform(child.resource_id,'Frame order',{type:'fill',value:'Frame 101'});
   await perform(child.resource_id,'Frame size',{type:'select',option:'L'});
@@ -131,15 +160,79 @@ try{
   await perform(child.resource_id,'Child',{type:'invoke'});
   await wait(()=>frameResult?.value==='Frame 101','frame form submission');
   assert.deepEqual(frameResult,{value:'Frame 101',size:'L',agreed:true});
-  const childButton=await findName(await observe(child.resource_id),'Child');
-  const rejected=await send({method:'act',target:childButton,action:{type:'click'}}).promise;
-  assert.ok(rejected.error);
+  const childAction=(name,action)=>perform(child.resource_id,name,action);
+  const seen=(type,test)=>frameEvents.some(e=>e.path==='/frame'&&e.type===type&&e.trusted&&test(e));
+  await childAction('Child',{type:'hover'});
+  await wait(()=>seen('mouseover',e=>e.target==='Child'),'trusted child hover');
+  await childAction('Child',{type:'click',fraction:{fx:0.25,fy:0.5}});
+  await wait(()=>seen('click',e=>e.target==='Child'&&Math.abs(e.offset-e.width/4)<=1),'trusted click at child fraction');
+  await childAction('Frame order',{type:'key',keys:['ctrl','a']});
+  await wait(()=>seen('keyup',e=>e.start===0&&e.end==='Frame 101'.length),'child selection');
+  await childAction('Frame order',{type:'type_text',text:'KB',mode:'keys'});
+  await wait(()=>seen('keyup',e=>e.value==='KB'),'trusted child key events and value');
+  await childAction('Frame scroller',{type:'scroll',direction:'down',notches:1});
+  await wait(()=>seen('scroll',e=>e.target==='Frame scroller'&&e.top>0),'wheel scrolled child');
+  assert.ok(seen('wheel',()=>true));
+  assert.ok(!frameEvents.some(e=>e.path==='/sibling'));
+  record('nested physical input reaches only the selected frame, including wheel and element fraction');
+  const attempt=async (target,action)=>send({method:'act',target,action}).promise;
+  const button=()=>observe(child.resource_id).then(o=>findName(o,'Child'));
+  const clicks=()=>frameEvents.filter(e=>e.type==='click'&&e.trusted).length;
+  const beforeClicks=clicks();
+  const wrapper=await findName(await observe(child.resource_id),'Frame wrapper');
+  assert.equal((await attempt(wrapper,{type:'click'})).error?.code,'CONTROL.ACTION_UNSUPPORTED');
+  const childCapture=await send({method:'capture',target:await button()}).promise;
+  assert.equal(childCapture.error?.code,'CONTROL.ACTION_UNSUPPORTED');
+  for(const overlay of ['cover-outer','cover-inner']){
+    const target=await button();await mutate(overlay);
+    assert.equal((await attempt(target,{type:'click'})).error?.code,'CONTROL.OCCLUDED');
+    await mutate('uncover-frames');
+  }
+  await childAction('Frame order',{type:'hover'});await mutate('cover-on-hover');
+  assert.equal((await attempt(await button(),{type:'click'})).error?.code,'CONTROL.OCCLUDED');
+  await mutate('uncover-frames');
+  const oldButton=await button();await mutate('move-outer');
+  assert.equal((await attempt(oldButton,{type:'click'})).error?.code,'CONTROL.STALE_TARGET');
+  await mutate('scale-outer');
+  assert.ok(!(await observe(child.resource_id)).nodes.find(n=>n.name==='Child').actions.includes('click'));
+  await mutate('restore-outer');
+  const foreign=resources.find(r=>r.metadata.url.endsWith('/foreign'));
+  const foreignObservation=await observe(foreign.resource_id);
+  assert.ok(!foreignObservation.nodes.find(n=>n.name==='Child').actions.includes('click'));
+  assert.equal((await attempt(await findName(foreignObservation,'Child'),{type:'click'})).error?.code,'CONTROL.ACTION_UNSUPPORTED');
+  assert.equal(clicks(),beforeClicks);
+  record('both ancestor overlays, stale offsets, transformed and cross-origin frames refuse physical input');
+  const edit=await findName(await observe(child.resource_id),'Frame order');
+  const hold=attempt(edit,{type:'key',keys:['ArrowRight'],hold_ms:3000});
+  await wait(()=>seen('keydown',e=>e.key==='ArrowRight'),'child key held');
+  await mutate('focus-away');
+  const lost=await hold;
+  assert.equal(lost.error?.code,'CONTROL.FOCUS_FAILED');
+  assert.equal(lost.error.details.residual_state_cleared,true);
+  const background=await pageAction(rid,{type:'open_tab',url:url+'nav-background'});
+  const foreground=(await call({method:'targets'})).resources.find(r=>r.metadata.context===background.backend_result.page_id);
+  await wait(()=>navigationStates.get('/nav-background')?.visibility==='visible','other tab foreground');
+  for(const [name,action] of [['Frame order',{type:'type_text',text:'wrong',mode:'keys'}],['Child',{type:'click'}]]){
+    const target=await findName(await observe(child.resource_id),name);
+    assert.ok(['CONTROL.FOCUS_FAILED','CONTROL.OCCLUDED'].includes((await attempt(target,action)).error?.code));
+  }
+  assert.equal(navigationStates.get('/nav-background').visibility,'visible');
+  await pageAction(foreground.resource_id,{type:'close_page'});
+  await pageAction(rid,{type:'activate_page'});
+  assert.equal((await observe(child.resource_id)).nodes.find(n=>n.name==='Frame order').value,'KB');
+  assert.equal(clicks(),beforeClicks);
+  record('focus loss releases a held child key and a background frame receives no input');
   const oldChildInput=await findName(await observe(child.resource_id),'Frame order');
   await mutate('reload-frame');
   const staleFrame=await send({method:'act',target:oldChildInput,action:{type:'fill',value:'old'}}).promise;
   assert.equal(staleFrame.error?.code,'CONTROL.STALE_TARGET');
   assert.equal((await observe(child.resource_id)).nodes.find(n=>n.name==='Frame order').value,'');
-  record('child frame submits its own form and rejects physical input');
+  record('child frame submits its own form and rejects pre-navigation identity');
+  const beforeSlot=await button();await mutate('slot-outer');
+  assert.ok(['CONTROL.STALE_TARGET','CONTROL.ACTION_UNSUPPORTED'].includes((await attempt(beforeSlot,{type:'click'})).error?.code));
+  assert.ok(!(await observe(child.resource_id)).nodes.find(n=>n.name==='Child').actions.includes('click'));
+  assert.equal(clicks(),beforeClicks);
+  record('a closed shadow slot introduced above an observed frame disables physical input');
   await perform(rid,'Editor',{type:'fill',value:'Firefox 中文'});await wait(()=>browserState.value==='Firefox 中文','fill effect');
   await perform(rid,'Editor',{type:'key',keys:['ctrl','a']});await wait(()=>browserState.start===0&&browserState.end==='Firefox 中文'.length,'real selection');
   await perform(rid,'Editor',{type:'type_text',text:'AZ',mode:'keys'});await wait(()=>browserState.value==='AZ','real key input');
