@@ -184,7 +184,7 @@ aad run 报销附件 --permission desktop.observe --permission desktop.input --a
 
 ### 在已经打开的文件选择器里选文件
 
-Chromium 已经弹出系统文件窗口时，先用 `aad browser pages` 找到发起操作的页面 ID。根据网页想做的事，选下面一种调用。三个命令都操作已打开的窗口。
+Chromium 已经弹出系统文件窗口时，先用 `aad browser pages` 找到发起操作的页面 ID，根据网页请求选择文件、目录或保存位置。
 
 ```powershell
 aad browser pages --cdp-port 9222
@@ -198,11 +198,22 @@ aad browser choose-files --cdp-port 9222 --page $page --allow-input --allow-uplo
 # 网页通过 showOpenFilePicker() 向系统请求一个文件句柄。
 aad browser choose-files --cdp-port 9222 --page $page --allow-input --allow-upload-dir $dir --file $source --native-file
 
+# 网页通过 showDirectoryPicker() 请求一个已有目录。
+aad browser choose-directory --cdp-port 9222 --page $page --allow-input --allow-directory $dir --directory (Join-Path $dir '十一月')
+
+# Linux 上网页附件框已经弹出“上传文件夹”。快照放在源目录外，使用新路径。
+$stage = Join-Path (Resolve-Path ./private).Path 'invoice-snapshot-001'
+aad browser choose-directory --cdp-port 9222 --page $page --allow-input --allow-upload-tree $dir --upload-tree-stage $stage
+
 # 为“另存为”选择一个尚未使用的文件名。目录须已存在。
 aad browser save-as --cdp-port 9222 --page $page --allow-input --allow-save-dir $dir --file (Join-Path $dir '十一月账单.pdf')
 ```
 
 附件选好后返回 `files_submitted`，原生文件句柄模式返回 `native_file_selected`。两者都会报告 `picker_closed`。若网页已经收到附件而对话框关闭失败，请先核对网页上的附件。旧命令 `aad do choose-files` 仍可使用。脚本从“添加附件”按钮开始时，`page.chooseFiles` 可以在一次脚本调用内完成点击和选择。[浏览器脚本示例](browser-script.md)
+
+选择目录后返回 `directory_selected`、`picker_closed` 和实际选择的路径。`--allow-directory` 指定允许公开给网页的目录范围，`--directory` 指定本次选择的已有目录。Linux 已在 X11 的 GTK portal 和 KWin Wayland 的 GTK、KDE portal 核对了系统返回给 Chromium 的目录 URI。浏览器随后可能另行询问是否允许该网站访问。Windows 需要前台标准目录窗口，macOS 需要能识别目录提示和完整路径的可见列表行。两个平台的交互桌面均 **[待验证]**。[目录回读用例](../tests/browser/portal-directory.mjs)
+
+网页的“上传文件夹”使用 HTML `webkitdirectory` 附件框。命令把指定目录复制到私有快照，在已经打开的系统窗口中选择快照。返回的 `snapshot` 是浏览器拿到的路径。`file_list: verified` 表示网页收到的相对路径和文件大小与快照吻合。`pending` 表示网页仍未更新文件列表，Chromium 可能正在等操作员确认上传。`unavailable` 表示页面已无法回读。保留快照直到上传结束。[快照条件与大小限制](browser-script.md#选择整个目录chromiumlinux)
 
 另存为成功后返回 `destination_selected` 和路径。文件由网页或浏览器随后写入。流程需要验收最终文件时，继续检查内容或摘要。已有文件和悬空符号链接都会被拒绝。网站通过后台任务生成下载时，还可以[按任务号取得并核对文件](browser-download-export.md)。
 
@@ -216,6 +227,19 @@ aad browser save-as --cdp-port 9222 --page $page --allow-input --allow-save-dir 
 原生文件句柄和另存为都需要能唯一确定发起者。请将页面放在单标签窗口内，使用没有子 frame 的页面。Windows、macOS 和 X11 通过浏览器窗口区分发起者，其他独立窗口可以打开带跨站 iframe 的页面。Wayland 的 portal 通过浏览器进程区分发起者，需要使用单页面浏览器实例。HTML 附件模式通过网页上已弹出选择器的文件控件确定目标。来自 `file://` 的网页还需要用 `--allow-browser-file-dir` 单独授权页面所在目录。[Linux 浏览器用例](../tests/browser/native-portal-picker.test.mjs)
 
 KDE 文件窗口须在前台，焦点在“名称”框内。原生打开和另存为支持路径分量中的中英文字母、数字、点、下划线、短横线和内嵌空格。另存为时若窗口勾选了自动扩展名，请先取消勾选，再传入带目标扩展名的文件名。可用 `tests/linux/verify-browser-file-portal.ps1 -Desktop wayland -Backend kde` 在独立的 KWin 会话复现三个流程。[KDE 浏览器用例](../tests/browser/native-kde-picker.test.mjs)
+
+### 录下网页的“另存为”
+
+录制 Chromium 页面时，点击导出按钮或用 Enter 触发网页的 `showSaveFilePicker()`，在系统窗口选好新文件。停止录制后，`browser-record steps` 会把触发按钮和成功的选择合成一个 `save_as` 步骤。取消窗口会跳过这次触发。导出的步骤用参数表示目的地，回放可以换目录和文件名。
+
+```powershell
+aad browser-record steps --out ./ledger-recording --save export-ledger
+# 从上一步返回的步骤读取 input.name，例如 rec1_destination。
+$inputs = @{rec1_destination = (Join-Path $dir '第二次导出.csv')} | ConvertTo-Json -Compress
+aad run export-ledger --permission desktop.input --permission desktop.observe --allow-save-dir $dir --inputs $inputs
+```
+
+回放会先检查授权目录和目标文件名，再操作录下的按钮。给工作流一个尚未存在的文件名。Linux 上已通过网页文件句柄和磁盘两处读回回放写出的内容。[录制与回放用例](../tests/browser/record-save-as.test.mjs)
 
 ## 完整性与当前边界
 

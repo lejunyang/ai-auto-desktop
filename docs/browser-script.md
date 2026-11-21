@@ -75,7 +75,7 @@ $inputs = @{tree = $tree} | ConvertTo-Json -Compress
 aad browser script ./folder.js --url 'http://localhost:8080/import' --allow-input --allow-upload-tree $tree --upload-tree-stage $stage --inputs $inputs
 ```
 
-- `--allow-upload-dir` **不授予递归读取权限**；`--allow-upload-tree` 也不授权选择任意单文件、子目录或相邻目录。当前目录授权只在 `aad browser script` 的 Chromium 模式提供，不用于 Firefox、MCP 或已打开的系统目录选择器。
+- `--allow-upload-dir` 用于普通附件。`--allow-upload-tree` 授权上传指定目录的完整快照。Linux Chromium 可从脚本里的附件控件发起上传，也可以在系统窗口已弹出时用 `aad browser choose-directory` 选快照。[接管已打开的窗口](browser-recording.md#在已经打开的文件选择器里选文件)
 - 源目录和快照位置都用无软链接的绝对路径。快照要放在源树外、仅由自己和受信任管理员管理的目录中。源树包含软链接（即使指向树内）、多硬链接文件、特殊文件或下级挂载点时，整次选择拒绝，不跳过后继续。只选择可公开给该页面的目录，包括其中的隐藏文件。
 - 需要 Linux `openat2` 和 `/proc/self/fd`。授权时固定源根目录；复制时，每个条目都从该根禁止跟随链接、禁止跨挂载地打开，再从已固定的普通文件读取。不把原始目录路径交给浏览器枚举。不支持所需系统能力时拒绝，没有不安全的路径遍历回退。上限为 512 个文件、2048 个条目、16 层目录、总计 64 MiB；空目录树不提交。
 - 快照根权限为 `0700`。提交前重新校验观察到的元素及其目录模式；提交后比较浏览器实际 `FileList` 的全部 `webkitRelativePath` 和大小。已派发但不能确认时，不要自动再上传，先核对业务端。
