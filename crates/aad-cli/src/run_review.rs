@@ -26,6 +26,7 @@ fn inspect(mut input: impl BufRead) -> Result<Value, String> {
     let mut terminal = None;
     let mut torn = false;
     let mut line = Vec::new();
+    let mut slowest = Vec::<(u64, Value)>::with_capacity(6);
     loop {
         line.clear();
         let size = input
@@ -62,6 +63,28 @@ fn inspect(mut input: impl BufRead) -> Result<Value, String> {
         } else if event["runId"] != run {
             return Err("mixed run IDs".into());
         }
+        if event["type"] == "step.finished" {
+            if let (Some(elapsed), Some(id), Some(status)) = (
+                payload["elapsed_ms"].as_u64(),
+                payload["id"].as_str(),
+                payload["status"].as_str(),
+            ) {
+                // Keep earlier steps first on ties. A loop may finish the
+                // same step repeatedly, so retain the original event number.
+                let index = slowest.partition_point(|(ms, _)| *ms >= elapsed);
+                if index < 5 {
+                    slowest.insert(
+                        index,
+                        (
+                            elapsed,
+                            json!({"step":id,"status":status,
+                        "elapsed_ms":elapsed,"event":sequence}),
+                        ),
+                    );
+                    slowest.truncate(5);
+                }
+            }
+        }
         match event["type"].as_str() {
             Some("action.started") => {
                 action = json!({"step":payload["id"],"uses":payload["uses"],"effect":"unknown"})
@@ -82,10 +105,11 @@ fn inspect(mut input: impl BufRead) -> Result<Value, String> {
     if sequence == 0 {
         return Err("no complete journal header".into());
     }
+    let slowest_steps: Vec<_> = slowest.into_iter().map(|(_, step)| step).collect();
     Ok(
         json!({"run_id":run,"plan_digest":digest,"status":terminal.unwrap_or(json!("no_final_event")),
         "last_completed_step":last,"unconfirmed_action":action,"last_action_error":failed,
-        "last_complete_event":sequence,"partial_final_line":torn}),
+        "last_complete_event":sequence,"partial_final_line":torn,"slowest_steps":slowest_steps}),
     )
 }
 

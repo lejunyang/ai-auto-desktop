@@ -53,6 +53,10 @@ test('compact recipes execute 100 and 500 steps; a failed check stops at step 53
         assert.equal(review.status,'failed');
         assert.equal(review.last_completed_step,'s52');
         assert.equal(review.last_action_error.step,'s53');
+        const slowest=journal.filter(event=>event.type==='step.finished')
+          .sort((a,b)=>b.payload.elapsed_ms-a.payload.elapsed_ms).slice(0,5)
+          .map(({seq,payload})=>({step:payload.id,status:payload.status,elapsed_ms:payload.elapsed_ms,event:seq}));
+        assert.deepEqual(review.slowest_steps,slowest);
       } else {
         const result=await command(args);
         assert.equal(result.status,'succeeded');
