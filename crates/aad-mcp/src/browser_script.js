@@ -19,6 +19,7 @@
         click: locator => act(locator, {type: "click"}),
         fill: (locator, value) => act(locator, {type: "fill", value}),
         upload: (locator, files) => act(locator, {type: "upload", files}),
+        chooseFiles: (locator, files) => act(locator, {type: "choose_files", files}),
         key: (locator, keys) => act(locator, {type: "key", keys}),
         scroll: (locator, direction, notches = 1) => act(locator, {type: "scroll", direction, notches}),
         wait: (locator, condition = "appears", states) => call("wait", {locator, condition, states}),

@@ -3,6 +3,7 @@ import {execFile} from 'node:child_process';
 import {mkdir, writeFile} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 import {test} from 'node:test';
+import {setTimeout as delay} from 'node:timers/promises';
 import {promisify} from 'node:util';
 import {fixture} from './fixture.mjs';
 
@@ -13,7 +14,23 @@ test('browser scripts select only granted files and the page receives their cont
 }, async t => {
   const page = await fixture((_req, res) => {
     res.setHeader('Content-Type', 'text/html');
-    res.end('<input type="file" multiple aria-label="Attachments">');
+    res.end(`<input type="file" multiple aria-label="Attachments">
+      <button onclick="openPicker()">Add invoice</button>
+      <script>
+        function openPicker() {
+          window.opens = (window.opens || 0) + 1;
+          const input = document.createElement("input");
+          input.type = "file";
+          input.hidden = true;
+          input.multiple = true;
+          input.onchange = async event => {
+            if (!event.isTrusted) return;
+            window.invoices = await Promise.all(Array.from(input.files, async f => [f.name, await f.text()]));
+          };
+          document.body.append(input);
+          input.click();
+        }
+      </script>`);
   });
   t.after(() => page.close());
   const upload = join(page.root, 'allowed');
@@ -38,4 +55,12 @@ test('browser scripts select only granted files and the page receives their cont
   assert.equal(JSON.parse(result.stdout).completed_actions, 1);
   const contents = await page.cdp.eval('Promise.all(Array.from(document.querySelector("input").files, async f => [f.name, await f.text()]))');
   assert.deepEqual(contents, [['1.txt', 'one'], ['2.txt', 'two']]);
+  await writeFile(src, 'return page.chooseFiles({name:"Add invoice",role:"button"}, inputs.files);');
+  await assert.rejects(call([outside], '--allow-input', '--allow-upload-dir', upload), denied);
+  assert.equal(await page.cdp.eval('window.opens || 0'), 0);
+  const chosen = await call([second, first], '--allow-input', '--allow-upload-dir', upload);
+  assert.equal(JSON.parse(chosen.stdout).completed_actions, 1);
+  assert.equal(await page.cdp.eval('window.opens'), 1);
+  for (let i=0; i<100 && !await page.cdp.eval('Array.isArray(window.invoices)'); i++) await delay(20);
+  assert.deepEqual(await page.cdp.eval('window.invoices'), [['2.txt', 'two'], ['1.txt', 'one']]);
 });

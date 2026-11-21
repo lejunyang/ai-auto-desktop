@@ -33,7 +33,7 @@ pub struct Script {
 pub fn tool() -> Tool {
     Tool {
         name: NAME,
-        description: "Run one synchronous JavaScript function body against a single observed browser page. Select by resource_id or exact url. Use page.observe(), present(locator), read(locator,property), fields(fields), table(locator,columns), wait(locator,condition), click(locator), fill(locator,value), key(locator,keys), scroll(locator,direction), act(locator,action) as methods of page. Pass JSON in inputs and return JSON. Browser writes require the server's input grant.",
+        description: "Run a synchronous JavaScript function body on one observed page, selected by resource_id or exact url. Use page.observe, present, read, fields, table, collect, wait, click, fill, key, scroll and act. page.chooseFiles(locator, files) selects files through an upload button. page.upload(locator, files) sets a file input directly. Pass JSON in inputs and return JSON. Writes need the server's input grant, file selection also needs an allowed upload directory.",
         schema: json!({"type":"object","additionalProperties":false,"required":["source"],
             "oneOf":[{"required":["resource_id"]},{"required":["url"]}],
             "properties":{"source":{"type":"string","maxLength":SOURCE_LIMIT},
@@ -187,6 +187,7 @@ impl Page {
                         | Action::Invoke {}
                         | Action::Fill { .. }
                         | Action::Upload { .. }
+                        | Action::ChooseFiles { .. }
                         | Action::TypeText { .. }
                         | Action::Key { .. }
                         | Action::Scroll { .. }
