@@ -3384,6 +3384,8 @@ fn manifest_document() -> Value {
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::gtk4_picker::Gtk4Picker;
 
 #[cfg(test)]
 mod tests {

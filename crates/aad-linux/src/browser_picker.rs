@@ -1,5 +1,5 @@
 //! Lifetime of an observed, mapped GTK file dialog on the local X11 server.
-use crate::window_geometry;
+use crate::{atspi::Gtk4Picker, window_geometry};
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt as _};
@@ -28,6 +28,7 @@ pub struct OpenPicker {
     owner: Window,
     pid: u32,
     bounds: [i32; 4],
+    gtk4: Option<Gtk4Picker>,
 }
 
 impl OpenPicker {
@@ -84,7 +85,7 @@ impl OpenPicker {
             .and_then(|mut ids| ids.next())
             .filter(|&w| w != 0 && w != picker && parent.bytes_after == 0)
             .ok_or("chooser has no exact transient parent")?;
-        let observed = Self {
+        let mut observed = Self {
             conn,
             atoms,
             root,
@@ -92,7 +93,28 @@ impl OpenPicker {
             owner,
             pid,
             bounds,
+            gtk4: None,
         };
+        if observed
+            .bytes(picker, atoms.WM_WINDOW_ROLE, AtomEnum::STRING.into())?
+            .is_empty()
+        {
+            observed.check_window(picker, atoms._NET_WM_WINDOW_TYPE_DIALOG)?;
+            let class =
+                observed.bytes(picker, AtomEnum::WM_CLASS.into(), AtomEnum::STRING.into())?;
+            let name = class
+                .split(|&b| b == 0)
+                .next()
+                .filter(|s| !s.is_empty())
+                .ok_or("missing GTK window class")?;
+            let title = observed.open_title()?;
+            observed.gtk4 = Some(Gtk4Picker::observe(
+                pid,
+                std::str::from_utf8(name)?.into(),
+                String::from_utf8(title)?,
+                deadline,
+            )?);
+        }
         observed.revalidate(deadline)?;
         Ok(observed)
     }
@@ -152,12 +174,38 @@ impl OpenPicker {
         Ok(())
     }
 
+    fn open_title(&self) -> Result<Vec<u8>> {
+        let title = self.bytes(self.picker, self.atoms._NET_WM_NAME, self.atoms.UTF8_STRING)?;
+        if !matches!(
+            std::str::from_utf8(&title)?,
+            "Open File" | "Open Files" | "打开文件"
+        ) {
+            return Err("expected an Open File title".into());
+        }
+        Ok(title)
+    }
+
     fn check_pinned(&self) -> Result<()> {
         let a = &self.atoms;
         self.check_window(self.picker, a._NET_WM_WINDOW_TYPE_DIALOG)?;
         self.check_window(self.owner, a._NET_WM_WINDOW_TYPE_NORMAL)?;
         let active = self.words(self.root, a._NET_ACTIVE_WINDOW, AtomEnum::WINDOW)?;
-        let title = self.bytes(self.picker, a._NET_WM_NAME, a.UTF8_STRING)?;
+        let title = self.open_title()?;
+        let role = self.bytes(self.picker, a.WM_WINDOW_ROLE, AtomEnum::STRING.into())?;
+        let chooser = match &self.gtk4 {
+            Some(gtk) => {
+                role.is_empty()
+                    && gtk.matches_window(
+                        &self.bytes(
+                            self.picker,
+                            AtomEnum::WM_CLASS.into(),
+                            AtomEnum::STRING.into(),
+                        )?,
+                        &title,
+                    )
+            }
+            None => role == b"GtkFileChooserDialog",
+        };
         if active.first() != Some(&self.picker)
             || active.iter().skip(1).any(|&w| w != 0)
             || self.words(
@@ -168,12 +216,7 @@ impl OpenPicker {
             || !self
                 .words(self.picker, a._NET_WM_STATE, AtomEnum::ATOM)?
                 .contains(&a._NET_WM_STATE_MODAL)
-            || self.bytes(self.picker, a.WM_WINDOW_ROLE, AtomEnum::STRING.into())?
-                != b"GtkFileChooserDialog"
-            || !matches!(
-                std::str::from_utf8(&title)?,
-                "Open File" | "Open Files" | "打开文件"
-            )
+            || !chooser
             || !self
                 .words(self.picker, a.WM_PROTOCOLS, AtomEnum::ATOM)?
                 .contains(&a.WM_DELETE_WINDOW)
@@ -212,9 +255,16 @@ impl OpenPicker {
                 self.atoms.WM_WINDOW_ROLE,
                 AtomEnum::STRING.into(),
             )? == b"GtkFileChooserDialog"
+                || (self.gtk4.is_some()
+                    && self
+                        .words(window.id, self.atoms._NET_WM_WINDOW_TYPE, AtomEnum::ATOM)?
+                        .contains(&self.atoms._NET_WM_WINDOW_TYPE_DIALOG))
             {
                 return Err("multiple native file choosers belong to this browser".into());
             }
+        }
+        if let Some(gtk) = &self.gtk4 {
+            gtk.revalidate(deadline)?;
         }
         self.check_pinned()?;
         if self.ended()? {

@@ -25,6 +25,7 @@ mod coordinates;
 mod drag_between;
 mod drag_path;
 mod focus_discovery;
+pub(super) mod gtk4_picker;
 use focus_discovery::FocusDiscovery;
 mod window_focus;
 use window_focus::append_window_args;
