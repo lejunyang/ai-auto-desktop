@@ -7,6 +7,7 @@
 | 你在做什么 | 怎么调用 |
 |---|---|
 | 看页面正文或控件 | 运行 `aad browser read --url <页面地址>` 或加 `--view outline`。 |
+| 用 WebKit 读正文或页面结构 | 启动本机 WebKitWebDriver 后运行 `aad browser read --webkit-port 4444 --url <完整 HTTP(S) 地址> --view outline`，正文用 `--view text`。每次调用打开一个临时浏览器会话，读取指定地址后关闭。已在 Linux WebKitGTK 验证。macOS Safari **[待验证]**。 |
 | 同时取单号和提交状态 | 用 `aad browser read --url <页面地址> --fields '[{"as":"order","locator":{"name":"订单号"},"property":"value"},{"as":"saved","locator":{"name":"已保存"},"property":"present"}]'`。两个值来自同一次观察，在返回的 `values` 里。 |
 | 看当前页的几列 | 在浏览器脚本中写 `page.table({role:"table", name:"Bills"}, ["ID","Amount"])`。 |
 | 在已有脚本里收完整张表，再用结果继续操作 | 写 `const bills = page.collect(spec)`，检查 `bills.complete` 后遍历 `bills.records`。 |

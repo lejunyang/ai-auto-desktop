@@ -184,15 +184,36 @@ aad run 报销附件 --permission desktop.observe --permission desktop.input --a
 
 ### 在已经打开的文件选择器里选文件
 
-Linux X11 下，如果 Chromium 主页面的 HTML 文件框已经弹出 GTK 3、GTK 4 或 GTK 桌面 portal 的选择器，可以接手续选文件。先用 `aad browser pages` 找到页面 ID。驱动会检查前台窗口及其和该页面的关联。
+Chromium 已经弹出系统文件窗口时，先用 `aad browser pages` 找到发起操作的页面 ID。根据网页想做的事，选下面一种调用。三个命令都操作已打开的窗口。
 
 ```powershell
 aad browser pages --cdp-port 9222
+$page = '<页面 ID>'
 $dir = (Resolve-Path ./invoices).Path
-aad do choose-files --cdp-port 9222 --page '<页面 ID>' --allow-input --allow-upload-dir $dir --file (Join-Path $dir '发票.pdf')
+$source = Join-Path $dir '发票.pdf'
+
+# 网页附件框。多选时重复传 --file。
+aad browser choose-files --cdp-port 9222 --page $page --allow-input --allow-upload-dir $dir --file $source
+
+# 网页通过 showOpenFilePicker() 向系统请求一个文件句柄。
+aad browser choose-files --cdp-port 9222 --page $page --allow-input --allow-upload-dir $dir --file $source --native-file
+
+# 为“另存为”选择一个尚未使用的文件名。目录须已存在。
+aad browser save-as --cdp-port 9222 --page $page --allow-input --allow-save-dir $dir --file (Join-Path $dir '十一月账单.pdf')
 ```
 
-多选框可以重复传 `--file`。成功时 `files_submitted` 和 `picker_closed` 都为 `true`。如文件已经交给网页但窗口关闭失败，先检查网页上的附件，避免重复选择。脚本从网页的“添加附件”按钮开始时，可以直接调用 `page.chooseFiles` 完成点击和选文件。[浏览器脚本示例](browser-script.md) · [已打开窗口的适用条件](research/chromium-open-file-picker-x11-2026-11-21.md)
+附件选好后返回 `files_submitted`，原生文件句柄模式返回 `native_file_selected`。两者都会报告 `picker_closed`。若网页已经收到附件而对话框关闭失败，请先核对网页上的附件。旧命令 `aad do choose-files` 仍可使用。脚本从“添加附件”按钮开始时，`page.chooseFiles` 可以在一次脚本调用内完成点击和选择。[浏览器脚本示例](browser-script.md)
+
+另存为成功后返回 `destination_selected` 和路径。文件由网页或浏览器随后写入。流程需要验收最终文件时，继续检查内容或摘要。已有文件和悬空符号链接都会被拒绝。网站通过后台任务生成下载时，还可以[按任务号取得并核对文件](browser-download-export.md)。
+
+| 平台 | 窗口与使用条件 |
+|---|---|
+| Linux Wayland | 已在 KWin 上跑通 Chromium 和 GTK 桌面 portal 的附件、原生文件句柄和另存为。请给该任务单独开一个浏览器实例，只留一个标签页。GTK portal 通过 D-Bus 提供请求归属，通常没有可传给 `--window` 的数字 ID。 |
+| Linux X11 | 附件覆盖 GTK 3、GTK 4 和 GTK portal。GTK portal 已验证原生文件句柄，以及网页实际写出新文件。可通过 `--window` 额外指定 XID。 |
+| Windows | 接管 Chromium 所属的前台标准“打开／另存为”窗口，可通过 `--window` 指定 HWND。使用本地盘的普通文件，另存为时带完整扩展名。**[待验证]** 需要交互式 Windows 桌面。[Windows 浏览器用例](../tests/windows/native-browser-picker.test.mjs) |
+| macOS | 接管挂在浏览器窗口上的 AppKit 文件面板。原生打开模式需要在列表中看到带完整路径的文件行。保存支持当前目录，或面板能识别并直接打开的可见目录，保留建议扩展名。**[待验证]** 需要已授予辅助功能权限的 Mac。[AppKit 用例](../crates/aad-macos/tests/browser_picker.rs) |
+
+原生文件句柄和另存为都需要能唯一确定发起者。请将页面放在单标签窗口内，使用没有子 frame 的页面。调试会话中存在跨进程 iframe 时也会提示无法确认归属。HTML 附件模式通过网页上已弹出选择器的文件控件确定目标。来自 `file://` 的网页还需要用 `--allow-browser-file-dir` 单独授权页面所在目录。[Linux 浏览器用例](../tests/browser/native-portal-picker.test.mjs)
 
 ## 完整性与当前边界
 

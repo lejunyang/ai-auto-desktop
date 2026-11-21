@@ -100,4 +100,6 @@ return page.present({name: "授权成功"});
 aad browser script ./consent.js --url 'http://localhost:8080/account' --allow-input --inputs '{"consentUrl":"http://localhost:9090/consent"}'
 ```
 
-匹配依据是 Chromium 报告的 opener 标签页和 frame，不是活动窗口或相似标题。旧标签页、其他 frame 新开的标签页和没有 opener 关联的标签页不能接管。多个同时匹配会报歧义；没有匹配会等到调用截止或取消，不会重试点击。切回时授权页可以已经自行关闭，但原资源必须仍在。此接口不支持嵌套弹窗、Firefox 或显式资源白名单会话；后者在点击前拒绝，不会把原资源的权限传给新页。
+如果授权页还会打开身份验证页，在授权页再调用一次 `openPopup`。第一次 `returnToOpener()` 回到授权页，第二次回到业务页。业务页可以在同一段脚本末尾读回执。
+
+每一层都核对 Chromium 报告的 opener 标签页和 frame。多个新页同时匹配会报歧义。等到截止时间仍未匹配时结束，点击只派发一次。返回时子页可以已经自行关闭，父页必须仍然存在。此功能适用于 Chromium 的普通脚本会话。Firefox 和显式资源白名单会话还不能切页。真实三级页面用例见[弹窗脚本验收](../tests/browser/script-popup.test.mjs)。
