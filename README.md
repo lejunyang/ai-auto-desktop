@@ -360,6 +360,27 @@ aad mcp --allow-input --provider browser.firefox_bidi --browser-bidi-port 9223
 
 需要根据页面上的值决定下一步时，可写 `recipe/2` 的循环和条件，或使用 JavaScript。Recipe 可以调用指定版本的子流程并接收它的结果。JavaScript 可以一次填多张表单、翻页、处理数据，再返回一份 JSON。命令行运行 `aad browser-script`，MCP 使用 `browser_script`。示例见[可编程 Recipe](docs/recipe-programs.md)和[浏览器 JavaScript](docs/browser-script.md)。
 
+### 请求闸门
+
+Chromium 会话可以在 HTTP 请求发送前暂停，向本机策略服务询问是否放行。同一浏览器里的页面脚本、人工点击和远程画面输入共用这条规则。
+
+给驱动浏览器的进程设置 `AAD_REQUEST_GATE_URL`（完整 HTTP 接口地址）和 `AAD_REQUEST_GATE_TOKEN`。也可以在 CLI 或 MCP 启动时指定地址和保存令牌的环境变量名，例如：
+
+```sh
+aad mcp --browser-port 9222 --allow-input \
+  --request-gate-url http://127.0.0.1:4317/api/operation-gate/http \
+  --request-gate-token-env POLICY_TOKEN
+```
+
+启动参数优先于同名配置。没有显式配置时，`OMEM_URL` 与 `OMEM_TOKEN` 同时存在就使用 `{OMEM_URL}/api/operation-gate/http`。全新会话缺少这两种配置时沿用普通 CDP 连接。接口只接受回环 HTTP，使用 Bearer 鉴权，禁用代理和重定向。通过 SSH 驱动远端时，在浏览器所在机器配置接口和令牌。
+
+- **范围**　客户端用 GET 读取 `revision` 和 `watch`，每 10 秒刷新。主机可取精确名称、`*.example.com`（仅子域）或 `null`。方法列表为 `null` 时匹配任意方法。空范围关闭 Fetch 拦截。已暂停的请求先完成裁决。刷新失败保留已有范围，第一次读取失败时暂停并拒绝 HTTP(S) 请求，直到读到有效范围。
+- **裁决**　命中后用 POST 提交方法、完整 URL、页面地址和标题、浏览器实例标识。文本、JSON 和 URL 编码表单的正文按 UTF-8 边界截到 64 KiB，截断时带 `bodyTruncated`。策略服务可读取这些业务数据。
+- **结果**　`allow` 继续发送。另两种决定均让请求以 `BlockedByClient` 失败。`deny` 表示规则禁止，不要换路径绕过。`pending` 带 `askId`，等本人批准后重做该步。401、连不上、无效响应或超过 125 秒也会阻断请求。CLI 和 MCP 动作错误的 `details.blocked_requests` 列出决定、原因和恢复提示。网络诊断和录制里的请求带 `request_gate`。
+- **会话**　同一系统用户的 aad 进程按浏览器调试端口共用一个闸门进程。带配置的 CLI、MCP 或录制进程经本机双向鉴权连接交付配置，最近建立连接的配置生效。发现文件只保存进程间握手信息，闸门令牌留在内存。最后一个连接退出时释放拦截。
+- **边界**　拦截覆盖 CDP 提供 Fetch 的页面、弹窗、跨进程 iframe 和 worker 目标。部分 Chromium 的专用 worker 没有 Fetch 域。Firefox BiDi、浏览器以外的请求、已经建立的 WebSocket 消息和完全由页面缓存满足的操作均在范围之外。动作结果按页面和动作时间窗口关联。同页并发的后台请求也可能出现在结果里。附加到已有浏览器前已经发出的请求无法追回。脱离动作时间窗口、稍后由定时器发起的请求可在网络诊断中查询。
+
+
 整张账单可以用 `aad table collect` 翻页或滚动采集，导出 CSV，再按订单号和金额核对。涉及网页、文件管理器、表格软件的操作可用 `aad browser-record mixed start` 一起录制，每个桌面应用指定要录的窗口。见[收集表格与对账](docs/table-collection.md)和[跨应用录制](docs/mixed-recording.md)。
 
 **保存与运行流程**（重复劳动）：`save_workflow`、`list_workflows`、`describe_workflow`、`run_workflow`。
