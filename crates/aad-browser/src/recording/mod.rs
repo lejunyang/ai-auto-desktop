@@ -60,7 +60,11 @@ struct Pending {
     started: Instant,
 }
 
+mod navigation;
+use navigation::StartupNavigation;
+
 pub struct Recorder {
+    navigation: Option<StartupNavigation>,
     request_gate: crate::gate_session::GateParticipant,
     #[cfg(test)]
     snapshot_changes: Vec<Value>,
@@ -161,6 +165,7 @@ impl Recorder {
         let storage = storage::Storage::new(&options)?;
         let session_id = uuid::Uuid::new_v4().simple().to_string();
         let mut recorder = Self {
+            navigation: None,
             request_gate: crate::gate_session::GateParticipant::join(options.port)?,
             #[cfg(test)]
             snapshot_changes: Vec::new(),
@@ -331,6 +336,7 @@ impl Recorder {
                 }
                 companion(false)?;
                 self.poll()?;
+                self.check_navigation()?;
                 if capture.elapsed() >= Duration::from_millis(300) {
                     self.capture()?;
                     capture = Instant::now();
@@ -345,6 +351,10 @@ impl Recorder {
             // Drain already received final events and capture the visible final state.
             companion(true)?;
             self.poll()?;
+            self.check_navigation()?;
+            if self.navigation.is_some() {
+                return Err("recording stopped before startup navigation was confirmed".into());
+            }
             self.capture()?;
             Ok(())
         })();
@@ -449,6 +459,13 @@ impl Recorder {
         let p = &event["params"];
         let session = event["sessionId"].as_str().unwrap_or("");
         let page_id = self.pages[index].id.clone();
+        if let Some(nav) = self
+            .navigation
+            .as_mut()
+            .filter(|_| index == 0 && session.is_empty())
+        {
+            nav.observe(method, p);
+        }
         match method {
             "Page.fileChooserOpened" => {
                 let frame = p["frameId"].as_str().ok_or("missing file chooser frame")?;
@@ -1257,6 +1274,7 @@ impl Recorder {
         // Preserve network evidence already received before stopping. Do not
         // resume UI capture or install scripts while cancellation is set.
         let deadline = Instant::now() + Duration::from_secs(2);
+        let mut settling = false;
         loop {
             let mut received = false;
             for index in 0..self.pages.len() {
@@ -1271,28 +1289,60 @@ impl Recorder {
                     self.interruption
                         .get_or_insert("network events dropped during stop".into());
                 }
-                received |= !batch.events.is_empty();
                 for event in batch.events {
-                    if event["method"].as_str().is_some_and(|m| {
-                        m.starts_with("Network.")
-                            || matches!(m, "Page.fileChooserOpened" | "Runtime.bindingCalled")
-                    }) {
+                    let method = event["method"].as_str().unwrap_or("");
+                    let include = if settling {
+                        matches!(
+                            method,
+                            "Network.responseReceived"
+                                | "Network.loadingFinished"
+                                | "Network.loadingFailed"
+                                | "Network.requestWillBeSent"
+                        ) && event["params"]["requestId"].as_str().is_some_and(|id| {
+                            self.pending.contains_key(&wire(
+                                &self.pages[index].id,
+                                event["sessionId"].as_str().unwrap_or(""),
+                                id,
+                            ))
+                        })
+                    } else {
+                        method.starts_with("Network.")
+                            || matches!(method, "Page.fileChooserOpened" | "Runtime.bindingCalled")
+                    };
+                    if include {
+                        received = true;
                         self.event(index, event)?;
                     }
                 }
             }
-            if !received {
+            let cancelled = self
+                .cancellation
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::SeqCst));
+            if Instant::now() >= deadline || cancelled {
+                if received && !settling {
+                    self.interruption
+                        .get_or_insert("recording drain interrupted".into());
+                }
                 break;
             }
-            if Instant::now() >= deadline
-                || self
-                    .cancellation
-                    .as_ref()
-                    .is_some_and(|c| c.load(Ordering::SeqCst))
-            {
-                self.interruption
-                    .get_or_insert("recording drain interrupted".into());
-                break;
+            if !received {
+                // An empty inbox can precede loadingFinished. Give requests
+                // observed before stop the remaining drain budget to finish.
+                if error.is_some()
+                    || self.interruption.is_some()
+                    || self.options.body_limit == 0
+                    || !self.pending.values().any(|p| {
+                        matches!(
+                            p.record["type"].as_str(),
+                            Some("Document" | "Fetch" | "XHR")
+                        )
+                    })
+                {
+                    break;
+                }
+                settling = true;
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
         for page in &mut self.pages {

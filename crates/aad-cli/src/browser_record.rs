@@ -201,11 +201,11 @@ pub fn run(command: &Command) -> recording::Result<Value> {
                 max_bytes: args.max_bytes,
                 follow_popups: !args.no_follow_popups,
             })?;
-            if let (Some(browser), Some(url)) = (&browser, &args.url) {
-                browser.open_url(url)?;
-            }
             eprintln!("Recording page {} into {}; Ctrl+C or browser-record stop finishes the walkthrough.",page,args.out.display());
-            let result = recorder.run(&cancel);
+            let result = match (&browser, &args.url) {
+                (Some(browser), Some(url)) => recorder.run_from_blank(browser, url, &cancel),
+                _ => recorder.run(&cancel),
+            };
             drop(browser);
             result
         }

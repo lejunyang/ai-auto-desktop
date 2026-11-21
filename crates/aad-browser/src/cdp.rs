@@ -271,7 +271,10 @@ impl Client {
         params: serde_json::Value,
     ) -> Result<std::sync::mpsc::Receiver<Result<serde_json::Value, CdpError>>, CdpError> {
         self.next_id += 1;
-        let message = serde_json::json!({"id":self.next_id,"sessionId":session,"method":method,"params":params});
+        let mut message = serde_json::json!({"id":self.next_id,"method":method,"params":params});
+        if !session.is_empty() {
+            message["sessionId"] = session.into();
+        }
         let deadline = self
             .deadline
             .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(8));
