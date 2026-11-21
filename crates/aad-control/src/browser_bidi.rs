@@ -31,6 +31,9 @@ const ACTIONS: &[&str] = &[
     "close_page",
 ];
 const MAX_FRAMES: usize = 256;
+// These actions execute on the revalidated element in its own isolated realm.
+// Physical pointer and keyboard events use the top-level browsing context.
+const FRAME_ACTIONS: &[&str] = &["focus", "invoke", "fill", "select", "check"];
 
 #[derive(Clone)]
 struct Frame {
@@ -388,17 +391,21 @@ impl FirefoxBackend {
                 node["value"] = Value::Null;
             }
             if let Some(actions) = node["actions"].as_array_mut() {
+                if actions.iter().any(|a| a == "click") {
+                    actions.push(json!("invoke"));
+                }
+                let supported = if frame.parent.is_some() {
+                    FRAME_ACTIONS
+                } else {
+                    ACTIONS
+                };
                 actions.retain(|a| {
-                    frame.parent.is_none()
-                        && ACTIONS.iter().any(|name| a == name)
+                    supported.iter().any(|name| a == name)
                         && (!matches!(a.as_str(), Some("back" | "forward"))
                             || history[a.as_str().unwrap()]["destination"]["url"]
                                 .as_str()
                                 .is_some_and(|url| self.access.check_document(url).is_ok()))
                 });
-                if actions.iter().any(|a| a == "click") {
-                    actions.push(json!("invoke"));
-                }
             }
         }
         result["snapshot_id"] = json!(observation);
@@ -423,9 +430,6 @@ impl FirefoxBackend {
         request: &Request<'_>,
     ) -> Result<(String, String)> {
         let (id, realm) = self.fresh(client, snapshot, request)?;
-        if snapshot["metadata"]["main_frame"] != true {
-            return Err(unsupported());
-        }
         request.value(
             client,
             &realm,
@@ -650,7 +654,11 @@ impl Backend for FirefoxBackend {
         Ok(tree.values().map(|frame|{
             let selector=json!({"context":frame.id});
             let access=self.authorized(&tree,&frame.id);
-            let capabilities=if access.is_ok()&&frame.parent.is_none(){self.capabilities()}else{Vec::new()};
+            let capabilities=match (access.is_ok(), frame.parent.is_some()) {
+                (false, _) => Vec::new(),
+                (true, true) => FRAME_ACTIONS.iter().map(|s| (*s).into()).collect(),
+                (true, false) => self.capabilities(),
+            };
             BackendResource{resource:Resource{resource_id:resource_id(PROVIDER,&selector),provider:PROVIDER.into(),kind:"browser".into(),name:frame.url.clone(),capabilities,
                 metadata:json!({"context":frame.id,"parent":frame.parent,"main_frame":frame.parent.is_none(),"url":frame.url,"access_error":access.err().map(|e|json!({"code":e.code,"message":e.message}))})},selector}
         }).collect())
@@ -757,6 +765,9 @@ impl Backend for FirefoxBackend {
         context: &Context,
     ) -> Result<Value> {
         validate_action(action)?;
+        if snapshot["metadata"]["main_frame"] != true && !FRAME_ACTIONS.contains(&action.name()) {
+            return Err(unsupported());
+        }
         if let Action::Navigate { url } | Action::OpenTab { url } = action {
             self.access.navigation_url(url)?;
         }

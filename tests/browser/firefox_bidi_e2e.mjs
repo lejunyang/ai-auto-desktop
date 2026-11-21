@@ -51,6 +51,7 @@ if(next==='reveal'){for(const el of [document.querySelector('#password'),...clos
 if(next==='remove'){for(const el of [...document.querySelectorAll('input:not(#editor):not(#agree)'),...document.querySelectorAll('iframe,x-closed,#overlay')])el.remove()}
 if(next==='navigate'){location.href='/next';return}
 if(next==='focus-away')document.querySelector('#hover').focus();
+if(next==='reload-frame')await new Promise(resolve=>{const frame=document.querySelector('iframe');frame.onload=resolve;frame.src='/frame?replacement'});
 if(next==='cover-next')coverNext=true;
 if(next==='uncover')document.querySelector('#overlay')?.remove();
 if(next)lastCommand=next;
@@ -60,17 +61,27 @@ clicks,clickedTrusted,hovered,keys,ups,held:[...held],pointerButtons,doubles,key
 checked:document.querySelector('#agree').checked,scroll:document.querySelector('#panel').scrollTop})});
 }catch{}setTimeout(tick,10)}tick();
 </script>`;
+let frameResult;
 const server=createServer(async(req,res)=>{
+  if(req.url==='/frame-result'){let bytes='';for await(const b of req)bytes+=b;frameResult=JSON.parse(bytes);res.end('ok');return}
   if(req.url==='/nav-state'){let bytes='';for await(const b of req)bytes+=b;const state=JSON.parse(bytes);state.sequence=++navigationReports;navigationStates.set(state.path,state);res.end('ok');return}
   if(req.url==='/observed'){let bytes='';for await(const b of req)bytes+=b;browserState=JSON.parse(bytes);res.end('ok');return}
   if(req.url==='/command'){const next=command;command='';res.end(next);return}
   res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
   if(req.url.startsWith('/nav-')){res.end(`<!doctype html><title>Navigation fixture</title><button>Navigation</button><button id=long>Long history</button><script>
-const token=crypto.randomUUID();async function report(){try{await fetch('/nav-state',{method:'POST',body:JSON.stringify({path:location.pathname,token,visibility:document.visibilityState,focused:document.hasFocus()})})}catch{}setTimeout(report,20)}report();
+const token=crypto.randomUUID();const state=()=>JSON.stringify({path:location.pathname,token,visibility:document.visibilityState,focused:document.hasFocus()});
+addEventListener('pageshow',()=>navigator.sendBeacon('/nav-state',state()));
+async function report(){try{await fetch('/nav-state',{method:'POST',body:state()})}catch{}setTimeout(report,20)}report();
 if(location.pathname==='/nav-guard')document.addEventListener('visibilitychange',()=>{if(document.hidden){const body=document.createElement('body');body.innerHTML='<button>Replaced</button>';document.body.replaceWith(body)}});
 document.querySelector('#long').onclick=()=>{history.pushState(null,'','/nav-long?'+('x'.repeat(2600)));history.pushState(null,'','/nav-after-long')};
 </script>`);return}
-  res.end(req.url==='/frame'?'<title>child</title><input type=password value=synthetic-frame-private><button>Child</button>':req.url==='/next'?'<title>Next</title><button>Next</button>':html);
+  res.end(req.url.split('?')[0]==='/frame'?`<title>child</title><input type=password value=synthetic-frame-private>
+    <input aria-label="Frame order"><select aria-label="Frame size"><option>S</option><option>L</option></select>
+    <input aria-label="Frame agree" type="checkbox"><button>Child</button>
+    <script>document.querySelector('button').onclick=()=>fetch('/frame-result',{method:'POST',body:JSON.stringify({
+      value:document.querySelector('[aria-label="Frame order"]').value,
+      size:document.querySelector('select').value,agreed:document.querySelector('[type=checkbox]').checked
+    })});</script>`:req.url==='/next'?'<title>Next</title><button>Next</button>':html);
 });
 server.listen(0,'127.0.0.1');await once(server,'listening');
 const url=`http://127.0.0.1:${server.address().port}/`;
@@ -106,10 +117,25 @@ try{
   assert.ok(o.nodes.some(n=>n.states.protected&&n.value===null&&n.actions.length===0));
   record('protected values and inline script source absent from observation');
   const child=resources.find(r=>r.provider==='browser.firefox_bidi'&&!r.metadata.main_frame);
-  assert.ok(child);assert.deepEqual(child.capabilities,[]);
-  const childObservation=await observe(child.resource_id);assert.ok(childObservation.nodes.every(n=>n.actions.length===0));
+  assert.ok(child);assert.deepEqual([...child.capabilities].sort(),['check','fill','focus','invoke','select']);
+  const childObservation=await observe(child.resource_id);
+  assert.ok(childObservation.nodes.every(n=>!n.actions.includes('click')&&!n.actions.includes('key')));
   assert.ok(!JSON.stringify(childObservation).includes('synthetic-frame-private'));
-  record('child contexts read-only with protected values removed');
+  await perform(child.resource_id,'Frame order',{type:'fill',value:'Frame 101'});
+  await perform(child.resource_id,'Frame size',{type:'select',option:'L'});
+  await perform(child.resource_id,'Frame agree',{type:'check',checked:true});
+  await perform(child.resource_id,'Child',{type:'invoke'});
+  await wait(()=>frameResult?.value==='Frame 101','frame form submission');
+  assert.deepEqual(frameResult,{value:'Frame 101',size:'L',agreed:true});
+  const childButton=await findName(await observe(child.resource_id),'Child');
+  const rejected=await send({method:'act',target:childButton,action:{type:'click'}}).promise;
+  assert.ok(rejected.error);
+  const oldChildInput=await findName(await observe(child.resource_id),'Frame order');
+  await mutate('reload-frame');
+  const staleFrame=await send({method:'act',target:oldChildInput,action:{type:'fill',value:'old'}}).promise;
+  assert.equal(staleFrame.error?.code,'CONTROL.STALE_TARGET');
+  assert.equal((await observe(child.resource_id)).nodes.find(n=>n.name==='Frame order').value,'');
+  record('child frame submits its own form and rejects physical input');
   await perform(rid,'Editor',{type:'fill',value:'Firefox 中文'});await wait(()=>browserState.value==='Firefox 中文','fill effect');
   await perform(rid,'Editor',{type:'key',keys:['ctrl','a']});await wait(()=>browserState.start===0&&browserState.end==='Firefox 中文'.length,'real selection');
   await perform(rid,'Editor',{type:'type_text',text:'AZ',mode:'keys'});await wait(()=>browserState.value==='AZ','real key input');
@@ -160,6 +186,7 @@ try{
   await wait(()=>browserState.keys>before,'typing began');
   await call({method:'cancel',request_id:typing.request_id});
   const cancelled=await typing.promise;assert.equal(cancelled.error?.code,'CONTROL.CANCELLED');
+  await mutate('sample-after-cancel');
   await wait(()=>browserState.held.length===0,'keys released');const length=browserState.value.length;await delay(200);assert.equal(browserState.value.length,length);assert.ok(length<512);
   await perform(rid,'Save',{type:'click'});await wait(()=>browserState.clicks===3,'input after cancel');
   record('in-flight cancellation stops typing, releases keys and permits next action');
