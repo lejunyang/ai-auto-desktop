@@ -164,6 +164,30 @@ aad run 后台开权限 --permission desktop.input --permission desktop.observe
 
 每一步按页面地址（到路径为止，去掉查询和锚点）找页面，按控制会话自己的角色和名字找元素：录制脚本和控制会话用同一份命名规则（`aad-browser/src/naming.js`），所以录下的名字回放时能找到同一个元素。页面和它里面的同站 iframe 地址前缀相同时，选地址完全一致的那个。连续输入合并成一次填写，点进输入框或勾选框的那一下并入它引起的修改，勾选框和单选框记成勾选，Enter 记成按键，表单提交不单独成步（引起它的点击或 Enter 已经是一步）；密码框的内容不保存，改成运行时输入。回放前浏览器要已经打开那个页面（例如 MCP 的 `browser_open`）。这个版本以前的录制没有控制会话的定位，转换时列在 `skipped` 里。
 
+### 回放时换一份附件
+
+网页通过 HTML 文件输入框打开选择器时，可以手动选择文件。录制器将确认的选择导出为一个 `upload` 步骤，回放时再指定这一批要用的文件。用 `aad browser-record steps` 查看该步的 `input.name`。例如录到的名字是 `rec1_files`，可这样换一份附件再运行：
+
+```powershell
+$dir = (Resolve-Path ./invoices).Path
+$inputs = @{rec1_files = @((Join-Path $dir '新版发票.pdf'))} | ConvertTo-Json -Compress
+aad run 报销附件 --permission desktop.observe --permission desktop.input --allow-upload-dir $dir --inputs $inputs
+```
+
+上传步骤只保存控件位置和参数名。页面自己显示的文件名、网络正文和截图仍按这次录制的证据设置采集。取消选择时会跳过该次上传。无法确认哪个文件框完成了选择时，会给出原因供审阅。
+
+### 在已经打开的文件选择器里选文件
+
+Linux X11 下，如果 Chromium 自己的 GTK 3 文件选择器已经显示在前台，且由主页面的 HTML 文件框打开，可以直接选文件。先用 `aad browser-record targets` 找到打开选择器的页面 ID。
+
+```powershell
+aad browser-record targets --cdp-port 9222
+$dir = (Resolve-Path ./invoices).Path
+aad do choose-files --cdp-port 9222 --page '<页面 ID>' --allow-input --allow-upload-dir $dir --file (Join-Path $dir '发票.pdf')
+```
+
+多选框可以重复传 `--file`。成功时 `files_submitted` 和 `picker_closed` 都为 `true`。如文件已经交给网页但窗口关闭失败，先检查网页上的附件，避免重复选择。脚本从网页的“添加附件”按钮开始时，可以直接调用 `page.chooseFiles` 完成点击和选文件。[浏览器脚本示例](browser-script.md) · [已打开窗口的适用条件](research/chromium-open-file-picker-x11-2026-11-21.md)
+
 ## 完整性与当前边界
 
 - CDP 断连、写入失败、超预算会失败退出并尽力写入 `incomplete`，不要把缺失当作用户没有操作。网络和步骤分组在正常停止时最终落盘；崩溃时可读动作/UI 检查点，但不能保证所有内存中的请求分组已保存。当前不自动重连恢复录制。
