@@ -5,6 +5,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod atspi;
+pub mod browser_picker;
 mod desktop;
 pub mod probe;
 pub mod wayland_portal;

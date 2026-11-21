@@ -23,7 +23,7 @@ zbus = { workspace = true }
 futures-core = "0.3"
 # The X11 desktop, spoken to directly: damage tells what changed, XTest
 # injects input, XFixes gives the pointer, RandR the displays.
-x11rb = { version = "0.13", features = ["xtest", "damage", "xfixes", "randr"] }
+x11rb = { version = "0.13", features = ["xtest", "damage", "xfixes", "randr", "res"] }
 
 # Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
 [lints]
