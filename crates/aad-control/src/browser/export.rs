@@ -47,6 +47,7 @@ pub struct DownloadCursor {
     directory: PathBuf,
     sequence: u64,
     lost: u64,
+    active: bool,
 }
 
 impl Session {
@@ -64,6 +65,9 @@ impl Session {
             })?),
             sequence: list["sequence"].as_u64().unwrap(),
             lost: list["lost"].as_u64().unwrap(),
+            active: list["downloads"]
+                .as_array()
+                .is_none_or(|items| items.iter().any(|item| item["state"] == "in_progress")),
         })
     }
 
@@ -90,7 +94,28 @@ impl Session {
                 )
             })?;
         let (bytes, sha256, path) =
-            verify_file(&cursor.directory, Path::new(path), expected, item, check)?;
+            verify_file(&cursor.directory, Path::new(path), expected, item, &check)?;
+        let confirm = || {
+            check()?;
+            let final_list = self.browser_downloads(timeout)?;
+            if !cursor
+                .candidate(&final_list, frame, expected)?
+                .is_some_and(|done| done["guid"] == item["guid"] && done["path"] == item["path"])
+            {
+                return Err(error(
+                    "BROWSER.EXPORT_AMBIGUOUS",
+                    "completed download changed during file verification",
+                ));
+            }
+            check()
+        };
+        if let Err(err) = confirm() {
+            let _ = std::fs::remove_file(&path);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+            return Err(err);
+        }
         Ok(Some(
             json!({"guid":item["guid"], "frame_id":frame, "filename":expected.filename, "path":path, "bytes":bytes, "sha256":sha256,
             "expected_bytes_checked":expected.bytes.is_some(),"expected_sha256_checked":expected.sha256.is_some()}),
@@ -99,6 +124,17 @@ impl Session {
 }
 
 impl DownloadCursor {
+    pub fn require_idle(&self) -> Result<()> {
+        if self.active {
+            Err(error(
+                "BROWSER.EXPORT_BUSY",
+                "another download is already in progress; wait before verifying this task",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     fn candidate<'a>(
         &self,
         list: &'a Value,
@@ -121,11 +157,11 @@ impl DownloadCursor {
                 "download connection or history changed; association not provable",
             ));
         }
+        self.require_idle()?;
         let mut fresh = items.iter().filter(|item| {
             item["sequence"]
                 .as_u64()
                 .is_some_and(|seq| seq > self.sequence)
-                && item["frame_id"] == frame
         });
         let Some(item) = fresh.next() else {
             return Ok(None);
@@ -133,7 +169,13 @@ impl DownloadCursor {
         if fresh.next().is_some() {
             return Err(error(
                 "BROWSER.EXPORT_AMBIGUOUS",
-                "multiple downloads began in the task frame after the checkpoint",
+                "multiple downloads began in the tracked browser after the checkpoint",
+            ));
+        }
+        if item["frame_id"] != frame {
+            return Err(error(
+                "BROWSER.EXPORT_AMBIGUOUS",
+                "download did not start in the observed task frame",
             ));
         }
         if item["suggested_filename"] != expected.filename {
@@ -283,12 +325,13 @@ mod tests {
     fn fresh_download_must_be_unique_in_the_same_frame_with_intact_history() {
         let cursor = DownloadCursor {
             directory: "owned".into(),
-            sequence: 5,
+            sequence: 6,
             lost: 1,
+            active: false,
         };
         let mut list = json!({"directory":"owned","tracking":true,"sequence":7,"lost":1,"downloads":[
             {"frame_id":"main","sequence":4,"suggested_filename":"bill.csv","state":"completed"},
-            {"frame_id":"other","sequence":6,"suggested_filename":"bill.csv","state":"completed"},
+            {"frame_id":"other","sequence":5,"suggested_filename":"bill.csv","state":"completed"},
             {"frame_id":"main","sequence":7,"suggested_filename":"bill.csv","state":"in_progress"}]});
         assert!(cursor
             .candidate(&list, "main", &expected())
@@ -310,7 +353,8 @@ mod tests {
                 .code,
             "BROWSER.EXPORT_INCOMPLETE"
         );
-        list["downloads"][1]["frame_id"] = json!("main");
+        list["downloads"][1]["sequence"] = json!(8);
+        list["sequence"] = json!(8);
         assert_eq!(
             cursor
                 .candidate(&list, "main", &expected())
