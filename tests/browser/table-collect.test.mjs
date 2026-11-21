@@ -21,7 +21,7 @@ test('one CLI invocation traverses Chromium, exports CSV and compares exact amou
     const spec={table:{role:'table',name:'Bills'},columns:['ID','Amount','Note'],row_key:'ID',
       expected_rows:2,traversal:{mode:'pagination',next:{role:'button',name:'Next'}}};
     const cli=process.env.AAD_TEST_CLI || resolve('target/debug/aad');
-    const args=['table','collect','--url',page.url,'--spec','spec.json','--browser-port',String(page.port)];
+    const args=['browser','collect-table','--url',page.url,'--spec','spec.json','--browser-port',String(page.port)];
     const invoke=(...options)=>promisify(execFile)(cli,[...args,...options],{
       cwd:page.root,env:{...process.env,AAD_CONTROL_LEASE_DIR:join(page.root,'leases')}
     });

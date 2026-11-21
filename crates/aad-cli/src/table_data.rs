@@ -16,6 +16,12 @@ const MAX_DIFFERENCES: usize = 100;
 pub enum TableCommand {
     /// Traverse one Chromium table, optionally export CSV and reconcile it in this run.
     Collect(CollectArgs),
+    #[command(flatten)]
+    Csv(CsvCommand),
+}
+
+#[derive(Subcommand)]
+pub enum CsvCommand {
     /// Write a complete collection to a new UTF-8 CSV file.
     Export {
         #[arg(long)]
@@ -342,7 +348,7 @@ fn compare(data: &Dataset, expected_rows: &[Record], decimal: &[String]) -> Resu
     )
 }
 
-fn collect(args: &CollectArgs) -> Result<Value> {
+pub fn collect(args: &CollectArgs) -> Result<Value> {
     use aad_control::{
         browser::{BrowserBackend, PROVIDER},
         table::Collection,
@@ -430,11 +436,10 @@ fn collect(args: &CollectArgs) -> Result<Value> {
     Ok(result)
 }
 
-pub fn run(command: &TableCommand) -> Result<Value> {
+pub fn csv(command: &CsvCommand) -> Result<Value> {
     match command {
-        TableCommand::Collect(args) => collect(args),
-        TableCommand::Export { input, output } => export(&Dataset::load(input)?, output),
-        TableCommand::Compare {
+        CsvCommand::Export { input, output } => export(&Dataset::load(input)?, output),
+        CsvCommand::Compare {
             input,
             csv,
             decimal,
@@ -442,5 +447,16 @@ pub fn run(command: &TableCommand) -> Result<Value> {
             let data = Dataset::load(input)?;
             compare(&data, &read_csv(csv, &data.columns)?, decimal)
         }
+    }
+}
+
+pub fn outcome(result: Result<Value>) -> (Value, u8) {
+    use crate::{failure, EXIT_FAILED, EXIT_OK};
+    match result {
+        Ok(value) if value["complete"] == false || value["matches"] == false => {
+            (value, EXIT_FAILED)
+        }
+        Ok(value) => (value, EXIT_OK),
+        Err(message) => (failure("CLI.TABLE_ERROR", &message, None), EXIT_FAILED),
     }
 }

@@ -8,6 +8,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod assist;
+mod browser_command;
 mod browser_launch;
 mod browser_record;
 mod browser_script;
@@ -95,13 +96,17 @@ enum Command {
     /// anchored to one window: it follows the foreground application and
     /// reports incremental snapshot diffs rather than replayable steps.
     Watch(WatchArgs),
-    /// Record browser task evidence: actions, network, semantic changes and screenshots.
+    /// Work with browser pages, scripts, recordings, and structured page data.
     #[command(subcommand)]
+    Browser(browser_command::Command),
+    /// Write or compare CSV files from a saved collection.
+    #[command(subcommand)]
+    Csv(table_data::CsvCommand),
+    #[command(subcommand, hide = true)]
     BrowserRecord(browser_record::Command),
-    /// Run a JavaScript file against a browser page with the AAD page API.
+    #[command(hide = true)]
     BrowserScript(browser_script::Args),
-    /// Collect a Chromium table, export it as CSV, or reconcile it with a CSV file.
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Table(table_data::TableCommand),
     /// Share a browser page or the desktop with a person, who can use it remotely.
     ///
@@ -504,17 +509,15 @@ fn dispatch(command: &Command) -> (Value, u8) {
             ),
         },
         Command::Record(args) => desk::record(args),
-        Command::Table(args) => match table_data::run(args) {
-            Ok(value) if value["complete"] == false || value["matches"] == false => {
-                (value, EXIT_FAILED)
-            }
-            Ok(value) => (value, EXIT_OK),
-            Err(message) => (failure("CLI.TABLE_ERROR", &message, None), EXIT_FAILED),
-        },
-        Command::BrowserScript(args) => match browser_script::run(args) {
-            Ok(value) => (value, EXIT_OK),
-            Err(value) => (value, EXIT_FAILED),
-        },
+        Command::Browser(command) => browser_command::run(command),
+        Command::Csv(args) => table_data::outcome(table_data::csv(args)),
+        Command::Table(table_data::TableCommand::Collect(args)) => {
+            table_data::outcome(table_data::collect(args))
+        }
+        Command::Table(table_data::TableCommand::Csv(args)) => {
+            table_data::outcome(table_data::csv(args))
+        }
+        Command::BrowserScript(args) => browser_command::script(args),
         Command::Review(args) => match run_review::review(&args.file) {
             Ok(result) => (result, EXIT_OK),
             Err(message) => (failure("CLI.JOURNAL_INVALID", &message, None), EXIT_USAGE),
@@ -524,13 +527,7 @@ fn dispatch(command: &Command) -> (Value, u8) {
             Err(message) => (failure("CLI.RECIPE_INVALID", &message, None), EXIT_USAGE),
         },
         Command::Watch(args) => run_watch(args),
-        Command::BrowserRecord(command) => match browser_record::run(command) {
-            Ok(value) => (value, EXIT_OK),
-            Err(error) => (
-                failure("BROWSER.RECORDING_FAILED", &error.to_string(), None),
-                EXIT_FAILED,
-            ),
-        },
+        Command::BrowserRecord(command) => browser_command::record(command),
     }
 }
 
