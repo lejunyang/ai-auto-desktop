@@ -13,9 +13,14 @@ test('Chromium script binds one new popup and returns to its exact opener', {
 }, async t => {
   const browser = await fixture((req, res) => {
     res.setHeader('Content-Type', 'text/html');
+    if (req.url === '/provider') return res.end(`<input aria-label="Provider receipt" value="pending">
+      <button onclick="window.open('/verify')">Verify identity</button>
+      <button onclick="opener.document.querySelector('input').value=document.querySelector('input').value;window.close()">Return receipt</button>`);
+    if (req.url === '/verify') return res.end(`<button onclick="opener.document.querySelector('input').value='verified';window.close()">Confirm identity</button>`);
     if (req.url === '/consent') return res.end('<!doctype html><button onclick="opener.document.querySelector(\'input\').value=\'approved\';window.close()">Allow</button>');
     res.end(`<!doctype html><style>button,iframe{display:block}</style><input aria-label="Receipt" value="pending">
       <button onclick="setTimeout(()=>window.open('/consent','_blank'),100)">Authorize</button>
+      <button onclick="window.open('/provider')">Choose provider</button>
       <button onclick="window.open('/consent','_blank');window.open('/consent','_blank')">Ambiguous</button>
       <button onclick="window.open('/consent','_blank','noopener')">No opener</button>
       <button onclick="window.waiting=true">No popup</button>
@@ -59,6 +64,20 @@ test('Chromium script binds one new popup and returns to its exact opener', {
     return tool;
   }
   const tool=mcp();
+  await browser.cdp.call('Page.bringToFront');
+  const nested = await tool('browser_script', {url: browser.url, source: `
+    page.openPopup({name:'Choose provider'}, inputs.provider);
+    page.openPopup({name:'Verify identity'}, inputs.verify);
+    page.click({role:'button', name:'Confirm identity'});
+    page.returnToOpener();
+    const provider = page.read({name:'Provider receipt'});
+    page.click({name:'Return receipt'});
+    page.returnToOpener();
+    return [provider, page.read({name:'Receipt'})];`,
+    inputs:{provider:browser.url+'provider',verify:browser.url+'verify'}});
+  assert.deepEqual(nested.result, ['verified','verified']);
+  assert.equal(nested.completed_actions, 4);
+  assert.equal(await browser.cdp.eval('document.querySelector("input").value'), 'verified');
   const resources=(await tool('control_targets',{})).data.resources;
   const frame=resources.find(r=>r.metadata.url===browser.url+'frame');
   const main=resources.find(r=>r.metadata.url===browser.url);

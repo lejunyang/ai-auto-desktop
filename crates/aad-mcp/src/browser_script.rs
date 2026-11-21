@@ -91,7 +91,7 @@ struct Page {
     session: Arc<Session>,
     resource_id: String,
     chromium: bool,
-    opener: Option<String>,
+    openers: Vec<String>,
     stop: CancellationToken,
     deadline: Instant,
     calls: usize,
@@ -114,10 +114,10 @@ impl Page {
     }
 
     fn open_popup(&mut self, locator: Locator, url: Option<String>) -> Result<Value> {
-        if !self.chromium || self.opener.is_some() {
+        if !self.chromium {
             return Err(failure(
                 "BROWSER.SCRIPT_INVALID",
-                "openPopup requires a Chromium opener; nested popup switching is not supported",
+                "openPopup requires a Chromium opener",
             ));
         }
         if self.session.policy().resources.is_some() {
@@ -197,7 +197,8 @@ impl Page {
                     failure("BROWSER.SCRIPT_ERROR", "popup has no resource identity")
                 })?;
                 if candidate.as_deref() == Some(id) {
-                    self.opener = Some(std::mem::replace(&mut self.resource_id, id.to_owned()));
+                    self.openers
+                        .push(std::mem::replace(&mut self.resource_id, id.to_owned()));
                     return Ok(Value::Null);
                 }
                 candidate = Some(id.to_owned());
@@ -212,7 +213,7 @@ impl Page {
     }
 
     fn return_to_opener(&mut self) -> Result<Value> {
-        let origin = self.opener.as_ref().ok_or_else(|| {
+        let origin = self.openers.last().ok_or_else(|| {
             failure(
                 "BROWSER.SCRIPT_INVALID",
                 "no opener was saved by this invocation",
@@ -227,7 +228,7 @@ impl Page {
                 "the original resource is no longer available",
             ));
         }
-        self.resource_id = self.opener.take().unwrap();
+        self.resource_id = self.openers.pop().unwrap();
         Ok(Value::Null)
     }
     fn request(&self, operation: Operation) -> Result<Value> {
@@ -456,7 +457,7 @@ fn bind_page(
         session,
         resource_id: String::new(),
         chromium: provider == CDP,
-        opener: None,
+        openers: Vec::new(),
         stop: stop.clone(),
         deadline,
         calls: 0,
