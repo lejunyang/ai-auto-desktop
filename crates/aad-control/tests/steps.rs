@@ -603,6 +603,49 @@ fn a_recorded_file_selection_requires_paths_from_the_run() {
 }
 
 #[test]
+fn only_confirmed_save_as_triggers_compile_and_destinations_are_runtime_only() {
+    let row = |id, kind, trigger| {
+        json!({"id":id,"kind":"action","action":{
+            "kind":kind,"trigger":trigger,"trusted":true,"document_id":"doc","node_id":"button",
+            "url":"https://example.test/export","control":{"role":"button","name":"Export"}
+        }})
+    };
+    let rows = [
+        row(1, "save_pending", "click"),
+        row(2, "save_as", "enter"),
+        row(3, "save_failed", "click"),
+        row(4, "save_cancel", "click"),
+    ]
+    .map(|r| r.to_string())
+    .join("\n");
+    let batch = aad_control::recording::from_browser_steps(&rows, &mut 1);
+    assert_eq!(batch.steps.len(), 1);
+    assert_eq!(batch.skipped.len(), 3);
+    assert_eq!(batch.source_rows["rec1"], 2);
+    let mut step = batch.steps[0].clone();
+    let workflow = steps::workflow("export", std::slice::from_ref(&step)).unwrap();
+    assert_eq!(
+        workflow["inputs"]["rec1_destination"]["schema"],
+        json!({"type":"string"})
+    );
+    assert_eq!(
+        workflow["steps"][0]["with"]["step"]["action"],
+        json!({"type":"save_as","trigger":"enter"})
+    );
+    for action in [
+        json!({"type":"save_as","trigger":"enter","destination":"recorded.txt"}),
+        json!({"type":"save_as","trigger":"enter","allow_save_dir":"/tmp"}),
+        json!({"type":"save_as","trigger":"double_click"}),
+    ] {
+        step.action = Some(action);
+        assert!(step.validate().is_err());
+    }
+    step.action = Some(json!({"type":"save_as","trigger":"click"}));
+    step.input = None;
+    assert!(step.validate().is_err());
+}
+
+#[test]
 fn malformed_steps_are_refused_before_any_desktop_call() {
     let base = act(
         "ok",
