@@ -28,10 +28,15 @@ test(`an already-open GTK portal supports Open and new-file Save on ${desktop}`,
   assert.ok(['wayland','x11'].includes(desktop));
   const root = await mkdtemp(join(tmpdir(),'aad-picker-grant-'));
   t.after(()=>rm(root,{recursive:true,force:true}));
-  const page = await fixture((_req,res)=>{
+  const page = await fixture((req,res)=>{
     res.setHeader('Content-Type','text/html;charset=utf-8');
+    if (req.url==='/other-window') {
+      const port=new URL('http://'+req.headers.host).port;
+      res.end('<iframe src="http://localhost:'+port+'/foreign-elsewhere"></iframe>');
+      return;
+    }
     res.end('<input id=f type=file><input id=other type=file><input id=s value=untouched>');
-  }, ['--ozone-platform='+desktop], {headed:true});
+  }, ['--ozone-platform='+desktop,'--site-per-process'], {headed:true});
   t.after(()=>page.close());
   const source = join(root,'original.txt'), dest = join(root,'new 文 件.txt'), dangling = join(root,'dangling');
   await writeFile(source,'source bytes');
@@ -78,6 +83,12 @@ test(`an already-open GTK portal supports Open and new-file Save on ${desktop}`,
 
   const nativeSource=join(root,'native 文 件.txt');
   await writeFile(nativeSource,'bytes read through the native handle');
+  if (desktop==='x11') {
+    await page.cdp.call('Target.createTarget',{url:page.url+'other-window',newWindow:true,
+      left:90,top:80,width:430,height:310});
+    await waitFor(async()=>(await page.cdp.call('Target.getTargets')).targetInfos.some(target=>
+      target.type==='iframe' && target.url.endsWith('/foreign-elsewhere')));
+  }
   await clickButton('open-native',`void showOpenFilePicker({multiple:true}).then(async handles=>{
     window.handles=await Promise.all(handles.map(async h=>[h.name,await (await h.getFile()).text()]));
   }).catch(e=>window.openError=String(e))`);
@@ -105,6 +116,17 @@ test(`an already-open GTK portal supports Open and new-file Save on ${desktop}`,
     frame.onload=()=>resolve(true); frame.srcdoc='<p>Another document</p>';
     document.body.appendChild(frame);
   })`);
+  await assert.rejects(run('choose-files',nativeSource,{native:true}), err =>
+    JSON.parse(err.stdout).error.message.includes('frame'));
+  assert.deepEqual(await requests(),nativeRequest);
+  const foreign=page.url.replace('127.0.0.1','localhost')+'child';
+  await page.cdp.eval(`new Promise(resolve=>{
+    const frame=document.getElementById('peer-frame');
+    frame.onload=()=>resolve(true); frame.removeAttribute('srcdoc'); frame.src=${JSON.stringify(foreign)};
+  })`);
+  await waitFor(async()=>(await page.cdp.call('Target.getTargets')).targetInfos
+    .some(target=>target.type==='iframe' && target.url===foreign));
+  await page.cdp.eval("Object.defineProperty(window,'length',{value:0,configurable:true});true");
   await assert.rejects(run('choose-files',nativeSource,{native:true}), err =>
     JSON.parse(err.stdout).error.message.includes('frame'));
   assert.deepEqual(await requests(),nativeRequest);

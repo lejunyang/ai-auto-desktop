@@ -220,7 +220,7 @@ fn run(args: &PageArgs, selection: Selection<'_>) -> Outcome {
     let open = match selection {
         Selection::Open(open) if !open.native_file => open,
         selection => {
-            verify_page_binding(&mut browser, args, window.0, picker.process_only(), true)?;
+            verify_page_binding(&mut browser, args, window.0, picker.process_only())?;
             verify_document(args, &observed["metadata"], deadline)?;
             if page_window(&mut browser, &args.page)? != window {
                 return Err(refused(
@@ -270,7 +270,7 @@ fn run(args: &PageArgs, selection: Selection<'_>) -> Outcome {
         return Err(refused("page window changed"));
     }
     if picker.process_only() {
-        verify_page_binding(&mut browser, args, window.0, true, false)?;
+        verify_page_binding(&mut browser, args, window.0, true)?;
     }
     picker.revalidate(deadline).map_err(refused)?;
     let result = desk.call(Operation::Act {
@@ -314,6 +314,24 @@ fn verify_document(args: &PageArgs, meta: &Value, deadline: Instant) -> Result<(
         .ok_or_else(|| refused("target page closed"))?;
     let mut client = Client::attach_bare_until(page, deadline).map_err(refused)?;
     client.set_deadline(deadline);
+    // Page.getFrameTree may omit a cross-process iframe. A fresh isolated
+    // top window counts its children even when the page shadows window.length.
+    let world = client
+        .command(
+            "Page.createIsolatedWorld",
+            json!({"frameId":meta["frame_id"]}),
+        )
+        .map_err(refused)?;
+    let context = world["executionContextId"]
+        .as_i64()
+        .ok_or_else(|| refused("missing top document context"))?;
+    let checked = client
+        .command(
+            "Runtime.evaluate",
+            json!({"contextId":context,
+        "expression":"window === window.top && window.length === 0","returnByValue":true}),
+        )
+        .map_err(refused)?;
     let tree = client
         .command("Page.getFrameTree", json!({}))
         .map_err(refused)?;
@@ -327,6 +345,8 @@ fn verify_document(args: &PageArgs, meta: &Value, deadline: Instant) -> Result<(
     if tree["frameTree"]["childFrames"]
         .as_array()
         .is_some_and(|frames| !frames.is_empty())
+        || checked["result"]["value"] != true
+        || !checked["exceptionDetails"].is_null()
     {
         return Err(refused("native file selection needs a page with one frame"));
     }
@@ -340,7 +360,6 @@ fn verify_page_binding(
     args: &PageArgs,
     window: i64,
     whole_process: bool,
-    native_selection: bool,
 ) -> Result<(), (Value, u8)> {
     let targets = browser
         .command("Target.getTargets", json!({}))
@@ -348,13 +367,6 @@ fn verify_page_binding(
     let pages = targets["targetInfos"]
         .as_array()
         .ok_or_else(|| refused("missing browser target list"))?;
-    // Page.getFrameTree can omit out-of-process children. A target without
-    // a proven parent cannot be excluded as the initiator of a native dialog.
-    if native_selection && pages.iter().any(|t| t["type"] == "iframe") {
-        return Err(refused(
-            "native file selection requires a session without out-of-process frames",
-        ));
-    }
     let mut selected = false;
     for target in pages.iter().filter(|t| t["type"] == "page") {
         let id = target["targetId"]
