@@ -39,7 +39,7 @@ fn choose_files_reads_bytes_only_into_the_owned_input() {
       window.newInput = (doc=document) => {
         const input=doc.createElement('input'); input.type='file'; input.hidden=true; doc.body.append(input);
         input.oninput=input.onchange=event=>{if(event.isTrusted) trustedEvents.push(event.type)};
-        input.oncancel=()=>cancels++; pickerInputs.push(input); return input;
+        input.oncancel=()=>{cancels++; input.remove()}; pickerInputs.push(input); return input;
       };
       button.onclick=()=>{
         pickerClicks++;
@@ -79,6 +79,10 @@ fn choose_files_reads_bytes_only_into_the_owned_input() {
     assert!(selected.error.is_none(), "{selected:?}");
     let contents = "Promise.all(Array.from(pickerInputs.at(-1).files, file=>file.text()))";
     assert_eq!(page_value(&fixture, contents), json!(["first payload"]));
+    assert_eq!(
+        page_value(&fixture, "cancels===0 && pickerInputs.at(-1).isConnected"),
+        true
+    );
     let competitor = Session::new(vec![Arc::new(BrowserBackend::new(fixture.port))], policy);
     main_of(&competitor, &fixture.page_id);
     let busy = choose(&competitor, button, &[&first]);
@@ -95,6 +99,10 @@ fn choose_files_reads_bytes_only_into_the_owned_input() {
     assert_eq!(
         page_value(&fixture, "trustedEvents"),
         json!(["input", "change", "input", "change"])
+    );
+    assert_eq!(
+        page_value(&fixture, "cancels===0 && pickerInputs.at(-1).isConnected"),
+        true
     );
     let hidden = choose(&session, "Hidden upload", &[&second, &first]);
     assert!(hidden.error.is_none(), "{hidden:?}");
@@ -150,9 +158,8 @@ fn choose_files_reads_bytes_only_into_the_owned_input() {
         assert!(rejected.error.is_some(), "{mode}: {rejected:?}");
         if mode == "single" {
             assert_eq!(rejected.error.unwrap()["code"], "CONTROL.INVALID_REQUEST");
-            assert_eq!(page_value(&fixture, "cancels>0"), true);
         }
-        assert_eq!(page_value(&fixture,"pickerInputs.length>0 && pickerInputs.every(input=>input.files.length===0) && trustedEvents.length===4"),true,"{mode}");
+        assert_eq!(page_value(&fixture,"pickerInputs.length>0 && pickerInputs.every(input=>!input.matches(':open') && input.files.length===0) && trustedEvents.length===4"),true,"{mode}");
         if mode == "wrong-page" {
             assert!(peer
                 .drain_events()
@@ -204,7 +211,7 @@ fn choose_files_reads_bytes_only_into_the_owned_input() {
     assert_eq!(
         page_value(
             &fixture,
-            "pickerInputs.length===1 && pickerInputs[0].files.length===0"
+            "pickerInputs.length===1 && !pickerInputs[0].matches(':open') && pickerInputs[0].files.length===0"
         ),
         true
     );

@@ -3759,12 +3759,7 @@ fn choose_files(
     };
     let watcher = watch_session.as_deref();
     run(&mut watch, watcher, "Page.enable", json!({}))?;
-    run(
-        &mut watch,
-        watcher,
-        INTERCEPT,
-        json!({"enabled":true,"cancel":true}),
-    )?;
+    run(&mut watch, watcher, INTERCEPT, json!({"enabled":true}))?;
     let group = uuid::Uuid::new_v4().to_string();
     let result = (|| {
         let click = (|| {
