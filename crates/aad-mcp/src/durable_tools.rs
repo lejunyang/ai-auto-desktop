@@ -1391,7 +1391,7 @@ mod tests {
             .expect("create");
         let now = durable::now_seconds();
         let lease = journal
-            .claim_owner("crashed", "mcp-dead", 0.5, now)
+            .claim_owner("crashed", "mcp-dead", 300.0, now)
             .expect("claim");
         journal
             .set_status(
@@ -1437,7 +1437,13 @@ mod tests {
         assert_eq!(status["current_step"]["step_id"], json!("step1"));
         assert_eq!(status["current_step"]["phase"], json!("in_top_level_step"));
 
-        std::thread::sleep(Duration::from_millis(700));
+        // First exercise a genuinely live lease, regardless of how long the
+        // MCP call and checkpoint writes took. Age out this same token only
+        // after observing the fence, then exercise crash reconciliation.
+        journal
+            .heartbeat_owner(&lease, 0.01, durable::now_seconds())
+            .expect("short final lease");
+        std::thread::sleep(Duration::from_millis(20));
         let status = call(&runs, "workflow_run_status", json!({"run_id": "crashed"})).unwrap();
         assert_eq!(status["owner"]["lease_live"], json!(false));
         assert!(status["next"]
