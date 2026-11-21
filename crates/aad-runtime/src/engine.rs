@@ -124,6 +124,7 @@ impl RunOptions {
 
 /// The mutable state of one run.
 struct Run<'a> {
+    recovery: Option<&'a mut crate::recovery::Ledger>,
     descriptor: &'a WorkflowDescriptor,
     providers: ProviderRegistry,
     artifacts: Option<Arc<ArtifactStore>>,
@@ -499,7 +500,11 @@ only if you trust this descriptor."
             json!({"id": step.id, "uses": uses, "attempt": attempt}),
         );
         let started = Instant::now();
-        let result = if contract.has_artifacts() {
+        let result = if let Some(ledger) = &mut self.recovery {
+            ledger.dispatch(step, &scope, &args, contract, || {
+                provider.invoke(&uses, args.clone(), Some(timeout))
+            })
+        } else if contract.has_artifacts() {
             let artifacts = self.artifacts.as_deref().ok_or_else(|| {
                 AutomationError::new(
                     "ARTIFACT.STORE_UNAVAILABLE",
@@ -1557,6 +1562,7 @@ impl<'a> Segmented<'a> {
             started_at: now_rfc3339(),
             digest: plan_digest(descriptor),
             state: Run {
+                recovery: None,
                 descriptor,
                 providers: options.providers.clone(),
                 artifacts: options.artifacts.clone(),
@@ -2037,6 +2043,14 @@ fn check_requirements(
 
 /// Execute a compiled workflow to completion.
 pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
+    run_inner(descriptor, options, None)
+}
+
+pub(crate) fn run_inner(
+    descriptor: &WorkflowDescriptor,
+    options: RunOptions,
+    recovery: Option<&mut crate::recovery::Ledger>,
+) -> RunResult {
     let run_id = options
         .run_id
         .clone()
@@ -2112,6 +2126,7 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
     }
 
     let mut state = Run {
+        recovery,
         descriptor,
         providers: options.providers.clone(),
         journal,
@@ -2179,7 +2194,15 @@ pub fn run(descriptor: &WorkflowDescriptor, options: RunOptions) -> RunResult {
     }
 
     let outputs = match &outcome {
-        Ok(()) => state.workflow_outputs().unwrap_or_default(),
+        Ok(()) => match state.workflow_outputs() {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                if state.recovery.is_some() {
+                    outcome = Err(error);
+                }
+                Map::new()
+            }
+        },
         Err(_) => Map::new(),
     };
 

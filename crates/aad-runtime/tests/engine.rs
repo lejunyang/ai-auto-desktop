@@ -157,6 +157,105 @@ fn a_single_action_runs_and_reports_success() {
 }
 
 #[test]
+fn reconcile_requires_matching_evidence_and_restores_outputs_without_dispatch() {
+    use aad_runtime::recovery::{execute, review};
+    for mode in ["business", "explicit", "retry", "corrupt"] {
+        let path = std::env::temp_dir().join(format!("reconcile-{}.db", uuid::Uuid::new_v4()));
+        let provider = Fake::build(
+            "fixture",
+            actions_with_effect(&["write"], "non_idempotent"),
+            Box::new(|_, args, call| {
+                if call == 2 || call == 3 && args["stage"] == "submit" {
+                    Err(AutomationError::new("TEST.INTERRUPTED", "receipt lost")
+                        .with_effect("unknown"))
+                } else {
+                    Ok(args)
+                }
+            }),
+        );
+        let body = json!({"inputs":{"order":{"schema":{"type":"string"},"required":true}},
+            "steps":[{"id":"prefix","type":"action","uses":"fixture.write@1","with":{"value":"prefix"}},
+                     {"id":"submit","type":"action","uses":"fixture.write@1","with":{"stage":"submit"}},
+                     {"id":"suffix","type":"action","uses":"fixture.write@1","with":{"value":"${{ steps.submit.output.id }}","previous":"${{ steps.prefix.output.value }}"}}]});
+        let workflow = descriptor(body.clone());
+        let options = |order: &str| {
+            RunOptions::default()
+                .with_providers(registry(vec![provider.clone()]))
+                .with_inputs(Map::from_iter([("order".into(), json!(order))]))
+        };
+        let resume = |receipt: Option<Value>| {
+            execute(&workflow, options("ORD-1"), &path, false, None, receipt)
+        };
+        assert!(!execute(
+            &workflow,
+            options("ORD-1"),
+            &path,
+            true,
+            Some(("submit", "/inputs/order")),
+            None
+        )
+        .unwrap()
+        .status
+        .is_success());
+        let summary = review(&path).unwrap();
+        assert_eq!(summary["completed_actions"], 1);
+        assert_eq!(summary["pending"]["step"], "submit");
+        assert!(execute(&workflow, options("changed"), &path, false, None, None).is_err());
+        let mut changed = body.clone();
+        changed["steps"][2]["with"]["value"] = json!("different");
+        assert!(execute(
+            &descriptor(changed),
+            options("ORD-1"),
+            &path,
+            false,
+            None,
+            None
+        )
+        .is_err());
+        assert!(resume(None).is_err());
+        let business = json!({"step":"submit","key":"ORD-1","receipt":"upstream-42","decision":"applied","output":{"id":"42"}});
+        assert!(resume(Some(json!([]))).is_err());
+        assert!(resume(Some(json!([business, business]))).is_err());
+        let explicit = json!({"run_id":summary["run_id"],"ticket":summary["pending"]["ticket"],"step":"submit","decision":"applied","receipt":"upstream-42","output":{"id":"42"}});
+        assert_eq!(provider.calls(), 2);
+        if mode == "corrupt" {
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute(
+                "DELETE FROM entries WHERE seq=(SELECT MAX(seq) FROM entries)",
+                [],
+            )
+            .unwrap();
+            assert!(review(&path).is_err());
+            assert!(resume(Some(explicit)).is_err());
+            assert_eq!(provider.calls(), 2);
+        } else {
+            let proof = match mode {
+                "business" => json!([business]),
+                "retry" => {
+                    let mut negative = explicit.clone();
+                    negative["decision"] = json!("not_applied");
+                    negative.as_object_mut().unwrap().remove("output");
+                    assert!(!resume(Some(negative.clone())).unwrap().status.is_success());
+                    assert!(resume(Some(negative)).is_err());
+                    let mut latest = explicit;
+                    latest["ticket"] = review(&path).unwrap()["pending"]["ticket"].clone();
+                    latest
+                }
+                _ => explicit,
+            };
+            assert!(resume(Some(proof)).unwrap().status.is_success());
+            assert!(resume(None).is_err());
+            assert_eq!(provider.calls(), if mode == "retry" { 4 } else { 3 });
+            assert_eq!(
+                provider.arguments().last().unwrap(),
+                &json!({"value":"42","previous":"prefix"})
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
 fn outputs_are_resolved_from_step_results() {
     let provider = Fake::echo("fixture", &["ping"]);
     let workflow = descriptor(json!({

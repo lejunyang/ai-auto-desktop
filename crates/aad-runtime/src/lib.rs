@@ -13,6 +13,7 @@ pub mod engine;
 pub mod journal;
 pub mod provider;
 pub mod recordings;
+pub mod recovery;
 pub mod script;
 pub mod template;
 pub mod version;
