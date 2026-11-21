@@ -8,6 +8,7 @@ pub mod atspi;
 pub mod browser_picker;
 mod desktop;
 pub mod probe;
+pub mod upload_tree;
 pub mod wayland_portal;
 pub mod window_geometry;
 mod x11;

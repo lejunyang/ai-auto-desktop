@@ -17,6 +17,7 @@ aad-platform = { workspace = true }
 base64 = "0.22"
 image = { workspace = true }
 libc = { workspace = true }
+rustix = { version = "1", features = ["fs", "process"] }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 zbus = { workspace = true }

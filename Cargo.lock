@@ -141,6 +141,7 @@ dependencies = [
  "futures-core",
  "image",
  "libc",
+ "rustix",
  "serde_json",
  "sha2",
  "uuid",
