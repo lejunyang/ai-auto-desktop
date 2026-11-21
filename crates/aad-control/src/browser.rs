@@ -536,8 +536,8 @@ fn browser_input_keys(snapshot: &Value) -> Result<Vec<String>> {
     Ok(keys)
 }
 
-use aad_browser::gate_session::GateSession;
-type GateOwner = std::result::Result<Option<std::sync::Arc<GateSession>>, &'static str>;
+use aad_browser::gate_session::{GateParticipant, GateSession};
+type GateOwner = std::result::Result<GateParticipant, &'static str>;
 
 pub struct BrowserBackend {
     request_gate: Mutex<GateOwner>,
@@ -565,7 +565,7 @@ impl BrowserBackend {
     pub fn with_access(port: u16, access: crate::browser_access::BrowserAccess) -> Self {
         Self {
             access,
-            request_gate: Mutex::new(GateSession::configured(port)),
+            request_gate: Mutex::new(GateParticipant::join(port)),
             port: AtomicU16::new(port),
             pages: Mutex::new(BTreeMap::new()),
             histories: Mutex::new(BTreeMap::new()),
@@ -623,8 +623,7 @@ impl BrowserBackend {
         *self.last_context.lock().unwrap() = None;
         self.element_scopes.lock().unwrap().clear();
         let mut gate = self.request_gate.lock().unwrap();
-        *gate = Ok(None);
-        *gate = GateSession::configured(port);
+        *gate = GateParticipant::join(port);
         self.port.store(port, Ordering::SeqCst);
     }
 
@@ -633,25 +632,25 @@ impl BrowserBackend {
         Some(self.port.load(Ordering::SeqCst)).filter(|port| *port != 0)
     }
 
-    pub(crate) fn gate_configured(&self) -> bool {
-        matches!(&*self.request_gate.lock().unwrap(), Ok(Some(_)))
-    }
-    pub(crate) fn gate_tracker(&self) -> Option<aad_browser::gate_session::ActionTracker> {
+    fn current_gate(&self) -> Result<Option<std::sync::Arc<GateSession>>> {
         self.request_gate
             .lock()
             .unwrap()
             .as_ref()
-            .ok()?
-            .as_ref()
-            .map(|g| g.tracker())
+            .map_err(|e| error("BROWSER.REQUEST_GATE", *e))?
+            .current()
+            .map_err(|e| error("BROWSER.REQUEST_GATE", e))
+    }
+
+    pub(crate) fn gate_configured(&self) -> bool {
+        matches!(self.current_gate(), Ok(Some(_)))
+    }
+    pub(crate) fn gate_tracker(&self) -> Option<aad_browser::gate_session::ActionTracker> {
+        self.current_gate().ok().flatten().map(|g| g.tracker())
     }
     fn port(&self) -> Result<u16> {
-        match &*self.request_gate.lock().unwrap() {
-            Err(e) => return Err(error("BROWSER.REQUEST_GATE", *e)),
-            Ok(Some(g)) if !g.healthy() => {
-                return Err(error("BROWSER.REQUEST_GATE", "request gate disconnected"))
-            }
-            _ => {}
+        if self.current_gate()?.is_some_and(|g| !g.healthy()) {
+            return Err(error("BROWSER.REQUEST_GATE", "request gate disconnected"));
         }
         match self.port.load(Ordering::SeqCst) {
             0 => Err(error(
@@ -2057,7 +2056,7 @@ impl Backend for BrowserBackend {
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.port.store(0, Ordering::SeqCst);
-        *self.request_gate.lock().unwrap() = Ok(None);
+        *self.request_gate.lock().unwrap() = Ok(GateParticipant::default());
         self.element_scopes.lock().unwrap().clear();
         self.release_downloads();
         if let Ok(mut pages) = self.pages.try_lock() {
@@ -2974,7 +2973,7 @@ impl BrowserBackend {
             }
             // Summarize only the returned window; never infer authentication
             // failure from a URL containing "login" or from a redirect alone.
-            if let Ok(Some(gate))=&*self.request_gate.lock().unwrap(){
+            if let Some(gate)=self.current_gate()?{
                 for blocked in gate.records(page_id,0){
                     if let Some(entry)=requests.iter_mut().rev().find(|r|r["request_id"]==blocked["request_id"] && r["state"]=="failed"){
                         entry["request_gate"]=blocked;

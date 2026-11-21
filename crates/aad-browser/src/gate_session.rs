@@ -35,24 +35,68 @@ enum Owner {
     Peer(peer::Peer),
 }
 
-impl GateSession {
-    pub fn configured(port: u16) -> Result<Option<Arc<Self>>, &'static str> {
+/// Membership lasts until the caller detaches, even if policy arrives later.
+#[derive(Default)]
+pub struct GateParticipant(Participation);
+
+#[derive(Default)]
+enum Participation {
+    #[default]
+    Detached,
+    Local(Arc<GateSession>),
+    Shared {
+        port: u16,
+        _membership: std::fs::File,
+        active: Mutex<Option<Arc<GateSession>>>,
+    },
+}
+
+impl GateParticipant {
+    pub fn join(port: u16) -> Result<Self, &'static str> {
         if port == 0 {
-            return Ok(None);
+            return Ok(Self::default());
         }
-        let Some(gate) = Gate::from_environment()? else {
-            if peer::enabled() {
-                return Ok(peer::Peer::existing(port)?.map(|p| Arc::new(Self(Owner::Peer(p)))));
+        let gate = Gate::from_environment()?;
+        let participant = if peer::enabled() {
+            let membership = peer::participate(port)?;
+            let active = match gate {
+                Some(gate) => Some(Arc::new(GateSession(Owner::Peer(peer::Peer::join(
+                    port, &gate,
+                )?)))),
+                None => None,
+            };
+            Participation::Shared {
+                port,
+                _membership: membership,
+                active: Mutex::new(active),
             }
-            return Ok(None);
-        };
-        let owner = if peer::enabled() {
-            Owner::Peer(peer::Peer::join(port, &gate)?)
+        } else if let Some(gate) = gate {
+            Participation::Local(Arc::new(GateSession(Owner::Local(Local::start(
+                port, gate,
+            )?))))
         } else {
-            Owner::Local(Local::start(port, gate)?)
+            Participation::Detached
         };
-        Ok(Some(Arc::new(Self(owner))))
+        Ok(Self(participant))
     }
+
+    pub fn current(&self) -> Result<Option<Arc<GateSession>>, &'static str> {
+        match &self.0 {
+            Participation::Detached => Ok(None),
+            Participation::Local(gate) => Ok(Some(gate.clone())),
+            Participation::Shared { port, active, .. } => {
+                let mut active = active.lock().unwrap();
+                if active.is_none() {
+                    *active =
+                        peer::Peer::existing(*port)?.map(|p| Arc::new(GateSession(Owner::Peer(p))));
+                }
+                Ok(active.clone())
+            }
+        }
+    }
+}
+
+impl GateSession {
     pub fn healthy(&self) -> bool {
         match &self.0 {
             Owner::Local(l) => l.healthy(),

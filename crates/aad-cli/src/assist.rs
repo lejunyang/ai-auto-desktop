@@ -592,10 +592,8 @@ pub fn run(args: &AssistArgs) -> Result<Value> {
         max_viewers: args.max_viewers.clamp(1, 32),
         limits: transfer::Limits::new(args.clipboard_max_mb),
     };
-    let _request_gate = match args.browser_port {
-        Some(port) => aad_browser::gate_session::GateSession::configured(port)?,
-        None => None,
-    };
+    let _request_gate =
+        aad_browser::gate_session::GateParticipant::join(args.browser_port.unwrap_or_default())?;
     let first = config.first();
     let mut source: Box<dyn Source> = match (args.browser_port, args.desktop) {
         (Some(port), false) => Box::new(browser::Page::start(

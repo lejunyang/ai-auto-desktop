@@ -86,6 +86,22 @@ fn directory(create: bool) -> io::Result<PathBuf> {
     }
     Ok(dir)
 }
+fn membership(port: u16) -> io::Result<fs::File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory(true)?.join(format!("{port}.members")))
+}
+
+// A caller can keep a future owner alive without starting one or attaching CDP.
+pub(super) fn participate(port: u16) -> Result<fs::File, &'static str> {
+    let file = membership(port).map_err(|_| OFFLINE)?;
+    fs2::FileExt::lock_shared(&file).map_err(|_| OFFLINE)?;
+    Ok(file)
+}
+
 pub(super) struct Peer(Mutex<TcpStream>);
 impl Peer {
     pub fn existing(port: u16) -> Result<Option<Self>, &'static str> {
@@ -246,6 +262,7 @@ fn serve_peer(
     }
 }
 pub fn serve_owner(port: u16) -> io::Result<()> {
+    let members = membership(port)?;
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let address = Arc::new(Address {
         port: listener.local_addr()?.port(),
@@ -276,16 +293,19 @@ pub fn serve_owner(port: u16) -> io::Result<()> {
         }
         if peers.load(Ordering::Acquire) == 0 && (used || start.elapsed() > Duration::from_secs(5))
         {
+            // Joining callers take their shared membership before owner discovery.
+            // Hold the exclusive lock through cleanup so the next owner starts cleanly.
+            match fs2::FileExt::try_lock_exclusive(&members) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
             drop(listener);
             drop(state.lock().unwrap().take());
-            // A newer owner can already have replaced this registration.
-            let dir = directory(false)?;
-            let lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(dir.join(format!("{port}.lock")))?;
-            fs2::FileExt::lock_exclusive(&lock)?;
-            let path = dir.join(format!("{port}.json"));
+            let path = directory(false)?.join(format!("{port}.json"));
             if fs::read(&path)
                 .ok()
                 .and_then(|v| serde_json::from_slice::<Address>(&v).ok())

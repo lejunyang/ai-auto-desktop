@@ -280,3 +280,56 @@ test('cached scope survives a refused connection', {
   assert.ok(arrivals.includes('/ordinary'));
   assert.ok(!arrivals.includes('/protected'));
 });
+
+test('an unconfigured MCP session retains policy from a short-lived CLI', {
+  skip: !process.env.AAD_TEST_CHROME, timeout: 30000
+}, async t => {
+  let writes = 0, decisions = 0;
+  const page = await fixture((req, res) => {
+    if (req.method === 'POST') writes++;
+    res.setHeader('Content-Type', 'text/html');
+    res.end('<button onclick="fetch(\'/save\',{method:\'POST\'}).catch(()=>{})">Save</button>');
+  });
+  t.after(() => page.close());
+  const gate = createServer((req, res) => {
+    assert.equal(req.headers.authorization, 'Bearer fixture-token');
+    const scope = {revision:'1', watch:[{host:'127.0.0.1', methods:['POST']}]};
+    if (req.method === 'POST') decisions++;
+    res.end(JSON.stringify(req.method === 'GET' ? scope : {decision:'deny', message:'Saving is restricted'}));
+  });
+  await new Promise(resolve => gate.listen(0, '127.0.0.1', resolve));
+  t.after(() => gate.close());
+  const cli = process.env.AAD_TEST_CLI || resolve('target/debug/aad');
+  const env = {...process.env, HOME:page.root, LOCALAPPDATA:page.root,
+    AAD_CDP_PORT:String(page.port), AAD_CONTROL_LEASE_DIR:join(page.root, 'leases')};
+  for (const key of ['OMEM_URL','OMEM_TOKEN','AAD_REQUEST_GATE_URL','AAD_REQUEST_GATE_TOKEN']) delete env[key];
+  const mcp = spawn(cli, ['mcp','--browser-port',String(page.port),'--allow-input'], {env});
+  t.after(() => mcp.kill());
+  const lines = createInterface({input:mcp.stdout})[Symbol.asyncIterator]();
+  let id = 0;
+  async function save() {
+    const params = {name:'browser_script', arguments:{url:page.url, source:'page.click({role:"button",name:"Save"}); return true;'}};
+    mcp.stdin.write(JSON.stringify({id:++id, jsonrpc:'2.0', method:'tools/call', params})+'\n');
+    const response = JSON.parse((await lines.next()).value);
+    assert.equal(response.id, id);
+    return JSON.parse(response.result.content[0].text);
+  }
+  const initial = await save();
+  assert.equal(initial.result, true, JSON.stringify(initial));
+  assert.equal(writes, 1);
+
+  await promisify(execFile)(cli, ['apps'], {env:{...env,
+    AAD_REQUEST_GATE_URL:'http://127.0.0.1:'+gate.address().port+'/policy',
+    AAD_REQUEST_GATE_TOKEN:'fixture-token'}});
+  // The idle MCP has had no opportunity to discover the owner in another action.
+  await delay(100);
+  assert.equal(await page.cdp.eval('fetch("/save",{method:"POST"}).then(()=>true,()=>false)'), false);
+  const {error} = await save();
+  assert.equal(error.code, 'BROWSER.REQUEST_BLOCKED');
+  const [record] = error.details.blocked_requests;
+  assert.equal(record.decision, 'deny');
+  assert.equal(record.message, 'Saving is restricted');
+  assert.match(record.hint, /Do not try another route/);
+  assert.equal(decisions, 2);
+  assert.equal(writes, 1);
+});

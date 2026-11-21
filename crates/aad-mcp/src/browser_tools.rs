@@ -708,7 +708,7 @@ impl Browsers {
         // Install the policy on the blank candidate before its first navigation.
         // Publication acquires the same owner while this reference is alive.
         let request_gate =
-            aad_browser::gate_session::GateSession::configured(started.port).map_err(failed)?;
+            aad_browser::gate_session::GateParticipant::join(started.port).map_err(failed)?;
         let mut answer = json!({
             "browser": browser,
             "port": started.port,
@@ -750,7 +750,7 @@ impl Browsers {
             }
         }
         if let Some(url) = url {
-            let tracker = request_gate.as_ref().map(|g| g.tracker());
+            let tracker = request_gate.current().map_err(failed)?.map(|g| g.tracker());
             let navigation = started.open_url_guarded(url, &Guard(session, context));
             if let Some(tracker) = tracker {
                 let end = tracker.end();
