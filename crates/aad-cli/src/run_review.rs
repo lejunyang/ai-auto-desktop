@@ -4,9 +4,16 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 pub fn review(path: &Path) -> Result<Value, String> {
-    inspect(BufReader::new(
-        File::open(path).map_err(|err| err.to_string())?,
-    ))
+    let mut reader = BufReader::new(File::open(path).map_err(|err| err.to_string())?);
+    if reader
+        .fill_buf()
+        .map_err(|err| err.to_string())?
+        .starts_with(b"SQLite format 3\0")
+    {
+        aad_runtime::recovery::review(path).map_err(|err| err.message)
+    } else {
+        inspect(reader)
+    }
 }
 
 fn inspect(mut input: impl BufRead) -> Result<Value, String> {

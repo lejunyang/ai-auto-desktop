@@ -16,6 +16,7 @@ mod cdp_watch;
 mod control;
 mod desk;
 mod recipe;
+mod run_recovery;
 mod run_review;
 mod table_data;
 
@@ -335,6 +336,8 @@ struct WorkflowsArgs {
 
 #[derive(Args)]
 struct RunArgs {
+    #[command(flatten)]
+    recovery: run_recovery::RecoveryArgs,
     /// A descriptor file in YAML or JSON, or the name of a saved workflow.
     ///
     /// A path is tried first, so a local file is never passed over in favour of a
@@ -1620,7 +1623,10 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
         }
     }
 
-    let result = aad_runtime::run(&workflow, options);
+    let result = match args.recovery.run(&workflow, options) {
+        Ok(result) => result,
+        Err(error) => return (automation_failure(&error), EXIT_FAILED),
+    };
     let code = match result.status {
         aad_runtime::RunStatus::Succeeded => EXIT_OK,
         _ => EXIT_FAILED,
@@ -2148,6 +2154,7 @@ mod tests {
         assert_eq!(from_validate["error"]["code"], "CLI.NOT_A_WORKFLOW");
 
         let (from_explain, _) = super::run_workflow(&RunArgs {
+            recovery: Default::default(),
             file: path.clone(),
             inputs: None,
             journal: None,
@@ -2451,6 +2458,7 @@ mod tests {
         );
 
         let (payload, code) = dispatch(&Command::Run(RunArgs {
+            recovery: Default::default(),
             file: path.clone(),
             inputs: None,
             journal: None,
@@ -2481,6 +2489,7 @@ mod tests {
         );
 
         let (payload, code) = dispatch(&Command::Run(RunArgs {
+            recovery: Default::default(),
             file: path.clone(),
             inputs: Some(r#"{"who":"agent"}"#.to_string()),
             journal: None,
@@ -2510,6 +2519,7 @@ mod tests {
 
         for bad in ["not json", "[1,2,3]"] {
             let (payload, code) = dispatch(&Command::Run(RunArgs {
+                recovery: Default::default(),
                 file: path.clone(),
                 inputs: Some(bad.to_string()),
                 journal: None,
@@ -2539,6 +2549,7 @@ mod tests {
         let _ = std::fs::remove_file(&journal);
 
         let (_, code) = dispatch(&Command::Run(RunArgs {
+            recovery: Default::default(),
             file: path.clone(),
             inputs: None,
             journal: Some(journal.clone()),
@@ -2573,6 +2584,7 @@ mod tests {
         );
 
         let (payload, code) = dispatch(&Command::Run(RunArgs {
+            recovery: Default::default(),
             file: path.clone(),
             inputs: None,
             journal: None,
