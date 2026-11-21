@@ -25,6 +25,12 @@ func report(_ name: String, _ value: Any) {
 
 let panel = mode == "save" ? NSSavePanel() : NSOpenPanel()
 panel.directoryURL = directory
+if mode == "directory", let open = panel as? NSOpenPanel {
+    open.canChooseFiles = false
+    open.canChooseDirectories = true
+    open.message = "Select a folder this site can view"
+    open.prompt = "Choose"
+}
 if mode == "save" {
     panel.nameFieldStringValue = "suggestion.txt"
     panel.isExtensionHidden = false
@@ -47,6 +53,10 @@ DispatchQueue.main.async {
         }
         do {
             if let open = panel as? NSOpenPanel {
+                if mode == "directory" {
+                    report("result", ["selected": open.urls.map(\.path)])
+                    return
+                }
                 report("result", ["selected": open.urls.map(\.path), "contents": try String(contentsOf: url, encoding: .utf8)])
                 return
             }

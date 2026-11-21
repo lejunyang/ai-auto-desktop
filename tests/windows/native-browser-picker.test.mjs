@@ -87,9 +87,9 @@ test('bind the Windows Open and Save dialogs and verify the selected bytes', {
   t.after(() => page.close());
   const cli = process.env.AAD_TEST_CLI || resolve('target/debug/aad.exe');
   function select(kind, id, path, ...flags) {
-    const grant = kind === 'choose-files' ? '--allow-upload-dir' : '--allow-save-dir';
+    const grant = {'choose-files':'--allow-upload-dir','choose-directory':'--allow-directory','save-as':'--allow-save-dir'}[kind];
     return run(cli, ['browser', kind, '--cdp-port', String(page.port), '--page', page.target.id,
-      '--allow-input', '--window', id, grant, root, '--file', path, ...flags],
+      '--allow-input', '--window', id, grant, root, kind === 'choose-directory' ? '--directory' : '--file', path, ...flags],
       {windowsHide:true, timeout:35000});
   }
   async function click(id) {
@@ -141,4 +141,8 @@ test('bind the Windows Open and Save dialogs and verify the selected bytes', {
   const folder = await click('folder');
   await assert.rejects(select('choose-files', folder, source, '--native-file'));
   assert.equal(await foregroundDialog(), folder);
+  await assert.rejects(select('choose-directory', folder, source));
+  const chosen = JSON.parse((await select('choose-directory', folder, root)).stdout);
+  assert.equal(chosen.directory_selected, true);
+  assert.equal(chosen.picker_closed, true);
 });

@@ -7,6 +7,7 @@ import {test} from 'node:test';
 import {setTimeout as delay} from 'node:timers/promises';
 import {promisify} from 'node:util';
 import {clickPickerButton, fixture} from './fixture.mjs';
+import {verifyDirectory} from './portal-directory.mjs';
 
 const exec = promisify(execFile);
 const desktop = process.env.XDG_SESSION_TYPE;
@@ -158,4 +159,6 @@ test(`an already-open GTK portal supports Open and new-file Save on ${desktop}`,
   const folderRequest=await requests();
   await assert.rejects(run('choose-files',nativeSource,{native:true}));
   assert.deepEqual(await requests(),folderRequest);
+  await verifyDirectory(page, root, folderRequest[0], t);
+  assert.deepEqual(await requests(),[]);
 });

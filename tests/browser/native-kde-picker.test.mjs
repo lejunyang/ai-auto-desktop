@@ -7,6 +7,7 @@ import {test} from 'node:test';
 import {setTimeout as delay} from 'node:timers/promises';
 import {promisify} from 'node:util';
 import {clickPickerButton, fixture} from './fixture.mjs';
+import {verifyDirectory} from './portal-directory.mjs';
 
 const exec=promisify(execFile);
 const kde='org.freedesktop.impl.portal.desktop.kde',front='org.freedesktop.portal.Desktop';
@@ -93,5 +94,10 @@ test('Chromium reads and saves files through an already-open KDE Wayland portal'
   assert.equal(native.native_file_selected,true);assert.equal(native.file_count,1);assert.equal(native.picker_closed,true);
   await until(()=>p.cdp.eval('window.handles||window.error'));
   assert.deepEqual(await p.cdp.eval('window.handles'),[['source 文 件.txt','KDE source bytes']]);
+  assert.deepEqual(await requests(),[]);
+  await clickPickerButton(p,'directory',`void showDirectoryPicker().then(h=>window.directory=h.name).catch(e=>window.error=String(e))`);
+  const folder=await observedRequest(t);
+  await assert.rejects(run('choose-files',source,{native:true}));
+  await verifyDirectory(p, root, folder.handle, t);
   assert.deepEqual(await requests(),[]);
 });

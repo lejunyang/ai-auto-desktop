@@ -85,18 +85,22 @@ fn inspect_and_operate_real_appkit_file_panels() {
         .unwrap()
         .success());
 
-    for mode in ["open", "save", "replace", "select"] {
+    for mode in ["open", "save", "replace", "select", "directory"] {
         let dir = root.0.join(mode);
         fs::create_dir(&dir).unwrap();
         let file = dir.join("native selection.txt");
         if mode == "select" {
             fs::write(&file, b"the caller granted this file").unwrap();
+        } else if mode == "directory" {
+            fs::create_dir(dir.join("reports")).unwrap();
         }
         let app = Fixture(Command::new(&fixture).arg(mode).arg(&dir).spawn().unwrap());
         let pid = app.0.id();
         let bounds: [i32; 4] = serde_json::from_value(report(&dir.join("ready"))).unwrap();
         let kind = if mode == "save" {
             Kind::Save
+        } else if mode == "directory" {
+            Kind::Directory
         } else {
             Kind::Open
         };
@@ -114,6 +118,15 @@ fn inspect_and_operate_real_appkit_file_panels() {
         let wrong = [bounds[0] + 10, bounds[1], bounds[2], bounds[3]];
         assert!(FilePicker::observe(pid, None, wrong, kind, deadline()).is_err());
         match mode {
+            "directory" => {
+                let selected = dir.join("reports");
+                assert!(picker.open_file(&selected, deadline()).is_err());
+                picker.choose_directory(&selected, deadline()).unwrap();
+                assert_eq!(
+                    report(&dir.join("result"))["selected"],
+                    serde_json::json!([selected])
+                );
+            }
             "save" => {
                 assert!(picker.dismiss(deadline()).is_err());
                 let occupied = dir.join("kept.txt");
