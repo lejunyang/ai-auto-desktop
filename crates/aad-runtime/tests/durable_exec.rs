@@ -91,13 +91,9 @@ struct TempDir {
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "aad-durable-{label}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("create directory");
+        let path =
+            std::env::temp_dir().join(format!("aad-durable-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).expect("create directory");
         Self { path }
     }
 

@@ -22,14 +22,9 @@ struct TempJournal {
 
 impl TempJournal {
     fn open() -> Self {
-        let unique = format!(
-            "aad-journal-test-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        );
+        let unique = format!("aad-journal-test-{}", uuid::Uuid::new_v4());
         let directory = std::env::temp_dir().join(unique);
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("create test directory");
+        std::fs::create_dir(&directory).expect("create test directory");
         let store = JournalStore::open(directory.join("journal.sqlite3")).expect("open journal");
         Self { directory, store }
     }
@@ -152,6 +147,25 @@ fn open_a_current_journal_while_another_connection_is_writing() {
 
     let reader = JournalStore::open_with_timeout(journal.path(), 0).expect("open without writing");
     assert_eq!(reader.list_events("run-1", 0, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn a_busy_writer_times_out_without_appending_and_can_try_again() {
+    let journal = TempJournal::open();
+    let lease = seed_running(&journal, "run-1");
+    let locker = journal.raw();
+    for timeout in [0, 25] {
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let writer = JournalStore::open_with_timeout(journal.path(), timeout).unwrap();
+        let append = || writer.append_event(&lease, "worker.tick", &json!(timeout), now_seconds());
+        assert_eq!(append().unwrap_err().code(), "JOURNAL.STORAGE_FAILED");
+        locker.execute_batch("ROLLBACK").unwrap();
+        append().unwrap();
+    }
+    let events = journal.store.list_events("run-1", 2, 10).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!((events[0].seq, &events[0].payload), (3, &json!(0)));
+    assert_eq!((events[1].seq, &events[1].payload), (4, &json!(25)));
 }
 
 // ---------------------------------------------------------------- create & read
@@ -1494,13 +1508,18 @@ fn concurrent_appends_from_many_threads_produce_no_gaps_or_duplicates() {
 
     // Allocating the sequence inside the INSERT, under the writer lock, is what
     // stops two appends choosing the same number.
+    const THREADS: usize = 12;
+    const APPENDS: usize = 24;
+    let start = std::sync::Barrier::new(THREADS);
     std::thread::scope(|scope| {
-        for thread in 0..4 {
+        for thread in 0..THREADS {
             let path = path.clone();
             let lease = lease.clone();
+            let start = &start;
             scope.spawn(move || {
+                start.wait();
                 let store = JournalStore::open(&path).expect("open per-thread store");
-                for index in 0..5 {
+                for index in 0..APPENDS {
                     store
                         .append_event(
                             &lease,
@@ -1518,8 +1537,107 @@ fn concurrent_appends_from_many_threads_produce_no_gaps_or_duplicates() {
         .store
         .list_events("run-1", 0, 1_000)
         .expect("events");
-    assert_eq!(events.len(), 22, "2 seeded + 20 appended");
+    assert_eq!(events.len(), 2 + THREADS * APPENDS);
     let sequence: Vec<i64> = events.iter().map(|event| event.seq).collect();
-    let expected: Vec<i64> = (1..=22).collect();
+    let expected: Vec<i64> = (1..=events.len() as i64).collect();
     assert_eq!(sequence, expected, "contiguous with no duplicates");
+    let mut next = [0; THREADS];
+    for event in &events[2..] {
+        let thread = event.payload["thread"].as_u64().unwrap() as usize;
+        assert_eq!(event.event_type, "step.completed");
+        assert_eq!(
+            event.payload,
+            json!({"thread": thread, "index": next[thread]})
+        );
+        next[thread] += 1;
+    }
+    assert_eq!(next, [APPENDS; THREADS]);
+}
+
+#[test]
+fn simultaneous_first_open_from_processes_preserves_each_event_stream() {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    const CHILD_PATH: &str = "AAD_TEST_FIRST_OPEN_DB";
+    const WRITERS: usize = 12;
+    const APPENDS: i64 = 24;
+    if let Some(path) = std::env::var_os(CHILD_PATH) {
+        let run = std::env::var("AAD_TEST_WRITER").unwrap();
+        std::io::stdin().read_exact(&mut [0]).unwrap();
+        let store = JournalStore::open(path).expect("race to open the fresh database");
+        store
+            .create_run(
+                &run,
+                "demo",
+                &json!({}),
+                &empty_descriptor(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let lease = store
+            .claim_owner(&run, "worker", 60.0, now_seconds())
+            .unwrap();
+        for index in 1..=APPENDS {
+            store
+                .append_event(&lease, "worker.tick", &json!([run, index]), now_seconds())
+                .unwrap();
+        }
+        return;
+    }
+
+    let temp = TempJournal::open();
+    let path = temp.directory.join("fresh.sqlite3");
+    let mut children: Vec<_> = (0..WRITERS)
+        .map(|writer| {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "simultaneous_first_open_from_processes_preserves_each_event_stream",
+                ])
+                .env(CHILD_PATH, &path)
+                .env("AAD_TEST_WRITER", writer.to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for child in &mut children {
+        child.stdin.take().unwrap().write_all(&[1]).unwrap();
+    }
+    let outputs: Vec<_> = children
+        .into_iter()
+        .map(|child| child.wait_with_output().unwrap())
+        .collect();
+    for output in outputs {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    let raw = Connection::open(&path).unwrap();
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    let mut stmt = raw
+        .prepare("SELECT seq, event_type, payload_json FROM events WHERE run_id = ?1 ORDER BY seq")
+        .unwrap();
+    for writer in 0..WRITERS {
+        let run = writer.to_string();
+        let rows: Vec<_> = stmt
+            .query_map([&run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let expected: Vec<_> = (1..=APPENDS)
+            .map(|i| (i, String::from("worker.tick"), json!([run, i]).to_string()))
+            .collect();
+        assert_eq!(rows, expected);
+    }
 }

@@ -24,11 +24,17 @@
 //! `pause`, so a cancel cannot be lost to a racing resume.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{
+    params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+mod writers;
+use writers::Writers;
 
 /// The run store used when none is named.
 ///
@@ -400,6 +406,8 @@ pub fn durable_descriptor_eligible(descriptor: &Value) -> bool {
 /// `BEGIN IMMEDIATE` serialises their writes.
 pub struct JournalStore {
     connection: Connection,
+    writers: Arc<Writers>,
+    busy_timeout: Duration,
     pub path: PathBuf,
 }
 
@@ -428,8 +436,22 @@ impl JournalStore {
             })?;
         }
         let connection = Connection::open(&path)?;
-        let store = Self { connection, path };
-        store.configure(busy_timeout_ms)?;
+        // SQLite resolves URI and relative filenames. Use the underlying file
+        // for admission, independently of the name a caller used to open it.
+        let filename = connection.path().map(Path::new).unwrap_or(&path);
+        let writers = Writers::for_file(
+            &filename
+                .canonicalize()
+                .unwrap_or_else(|_| filename.to_owned()),
+        );
+        let busy_timeout = Duration::from_millis(busy_timeout_ms.min(i32::MAX as u32) as u64);
+        let store = Self {
+            connection,
+            writers,
+            busy_timeout,
+            path,
+        };
+        store.configure()?;
         store.migrate()?;
         Ok(store)
     }
@@ -440,15 +462,20 @@ impl JournalStore {
     /// honour, and a journal running without WAL or without `synchronous=FULL`
     /// looks fine until a crash loses the last commit. Refusing to open is far
     /// better than durability that is quietly absent.
-    fn configure(&self, busy_timeout_ms: u32) -> Result<()> {
-        self.connection
-            .busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64))?;
-        self.connection
-            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")?;
-
-        let mode: String = self
-            .connection
-            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    fn configure(&self) -> Result<()> {
+        let mode: String = self.retry_busy(Instant::now() + self.busy_timeout, || {
+            self.connection
+                .execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")?;
+            let mode: String = self
+                .connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+            if mode.eq_ignore_ascii_case("wal") {
+                Ok(mode)
+            } else {
+                self.connection
+                    .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            }
+        })?;
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(JournalError::Storage(format!(
                 "SQLite refused WAL mode and reported {mode:?}; concurrent runners \
@@ -487,20 +514,21 @@ impl JournalStore {
         if version == SCHEMA_VERSION {
             return Ok(());
         }
-        let transaction = self.begin()?;
-        let current: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if current > SCHEMA_VERSION {
-            return Err(JournalError::Storage(format!(
-                "journal schema {current} is newer than the supported {SCHEMA_VERSION}"
-            )));
-        }
-        if current == SCHEMA_VERSION {
-            return Ok(());
-        }
-        transaction.execute_batch(&schema_ddl())?;
-        transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
-        transaction.commit()?;
-        Ok(())
+        self.write(|transaction| {
+            let current: i64 =
+                transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if current > SCHEMA_VERSION {
+                return Err(JournalError::Storage(format!(
+                    "journal schema {current} is newer than the supported {SCHEMA_VERSION}"
+                )));
+            }
+            if current == SCHEMA_VERSION {
+                return Ok(());
+            }
+            transaction.execute_batch(&schema_ddl())?;
+            transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+            Ok(())
+        })
     }
 
     /// Begin an immediate transaction, taking the writer lock up front.
@@ -508,14 +536,40 @@ impl JournalStore {
     /// `IMMEDIATE` rather than deferred: a read-then-write sequence that upgrades
     /// midway can fail with `SQLITE_BUSY` after its reads, which is exactly the
     /// race every compare-and-set here is trying to avoid.
-    fn begin(&self) -> Result<Transaction<'_>> {
-        Ok(self
-            .connection
-            .unchecked_transaction()
-            .and_then(|transaction| {
-                transaction.execute_batch("ROLLBACK; BEGIN IMMEDIATE")?;
-                Ok(transaction)
-            })?)
+    fn write<T>(&self, body: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        let deadline = Instant::now() + self.busy_timeout;
+        let _turn = self.writers.enter(deadline)?;
+        let transaction = self.retry_busy(deadline, || {
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+        })?;
+        let result = body(&transaction)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// WAL setup can return BUSY without invoking SQLite's busy handler. During
+    /// lock acquisition use short polls so external contenders get frequent
+    /// chances between commits. Never replay the body of a writer transaction.
+    fn retry_busy<T>(
+        &self,
+        deadline: Instant,
+        mut attempt: impl FnMut() -> rusqlite::Result<T>,
+    ) -> Result<T> {
+        self.connection.busy_timeout(Duration::ZERO)?;
+        let result = loop {
+            let result = attempt();
+            if !matches!(&result, Err(e) if e.sqlite_error_code() == Some(ErrorCode::DatabaseBusy))
+            {
+                break result;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break result;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        };
+        self.connection.busy_timeout(self.busy_timeout)?;
+        Ok(result?)
     }
 
     /// Create a run, plus its first event, atomically.
@@ -549,31 +603,31 @@ impl JournalStore {
         let inputs_json = encode_json(inputs, "inputs")?;
         let now = utc_now();
 
-        let transaction = self.begin()?;
-        let inserted = transaction.execute(
-            "INSERT OR IGNORE INTO runs (
+        self.write(|transaction| {
+            let inserted = transaction.execute(
+                "INSERT OR IGNORE INTO runs (
                  run_id, workflow_name, workflow_version, plan_digest,
                  status, desired_state, inputs_json, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, 'pending', 'run', ?5, ?6, ?6)",
-            params![
-                run_id,
-                workflow_name,
-                workflow_version,
-                plan_digest,
-                inputs_json,
-                now
-            ],
-        )?;
-        if inserted != 1 {
-            return Err(JournalError::Conflict(format!(
-                "run already exists: {run_id}"
-            )));
-        }
-        if let Some((event_type, payload)) = first_event {
-            append_event(&transaction, run_id, event_type, payload)?;
-        }
-        transaction.commit()?;
-        self.get_run(run_id)
+                params![
+                    run_id,
+                    workflow_name,
+                    workflow_version,
+                    plan_digest,
+                    inputs_json,
+                    now
+                ],
+            )?;
+            if inserted != 1 {
+                return Err(JournalError::Conflict(format!(
+                    "run already exists: {run_id}"
+                )));
+            }
+            if let Some((event_type, payload)) = first_event {
+                append_event(transaction, run_id, event_type, payload)?;
+            }
+            read_run(transaction, run_id)
+        })
     }
 
     pub fn get_run(&self, run_id: &str) -> Result<RunRecord> {
@@ -647,34 +701,34 @@ impl JournalStore {
                 desired.as_str()
             )));
         }
-        let transaction = self.begin()?;
-        let changed = transaction.execute(
-            &format!(
-                "UPDATE runs SET desired_state = ?1, updated_at = ?2
+        self.write(|transaction| {
+            let changed = transaction.execute(
+                &format!(
+                    "UPDATE runs SET desired_state = ?1, updated_at = ?2
                  WHERE run_id = ?3 AND desired_state = ?4
                    AND status NOT IN ({TERMINAL_SQL})"
-            ),
-            params![desired.as_str(), utc_now(), run_id, expected.as_str()],
-        )?;
-        if changed != 1 {
-            let run = read_run(&transaction, run_id)?;
-            return Err(if run.is_terminal() {
-                JournalError::InvalidTransition(format!(
-                    "terminal run {run_id} cannot change desired state"
-                ))
-            } else {
-                JournalError::Conflict(format!(
-                    "desired state changed concurrently: expected {}, found {}",
-                    expected.as_str(),
-                    run.desired_state.as_str()
-                ))
-            });
-        }
-        if let Some((event_type, payload)) = event {
-            append_event(&transaction, run_id, event_type, payload)?;
-        }
-        transaction.commit()?;
-        self.get_run(run_id)
+                ),
+                params![desired.as_str(), utc_now(), run_id, expected.as_str()],
+            )?;
+            if changed != 1 {
+                let run = read_run(transaction, run_id)?;
+                return Err(if run.is_terminal() {
+                    JournalError::InvalidTransition(format!(
+                        "terminal run {run_id} cannot change desired state"
+                    ))
+                } else {
+                    JournalError::Conflict(format!(
+                        "desired state changed concurrently: expected {}, found {}",
+                        expected.as_str(),
+                        run.desired_state.as_str()
+                    ))
+                });
+            }
+            if let Some((event_type, payload)) = event {
+                append_event(transaction, run_id, event_type, payload)?;
+            }
+            read_run(transaction, run_id)
+        })
     }
 
     /// Take ownership of an unowned or expired run.
@@ -701,45 +755,45 @@ impl JournalStore {
         }
         let token = new_token();
 
-        let transaction = self.begin()?;
-        let claimed = transaction.execute(
-            &format!(
-                "UPDATE runs
+        self.write(|transaction| {
+            let claimed = transaction.execute(
+                &format!(
+                    "UPDATE runs
                  SET owner_id = ?1, lease_token_hash = ?2, lease_expires_at = ?3,
                      updated_at = ?4
                  WHERE run_id = ?5
                    AND status NOT IN ({TERMINAL_SQL})
                    AND (owner_id IS NULL OR lease_expires_at <= ?6)"
-            ),
-            params![
-                owner_id,
-                token_hash(&token),
+                ),
+                params![
+                    owner_id,
+                    token_hash(&token),
+                    expires_at,
+                    utc_now(),
+                    run_id,
+                    now
+                ],
+            )?;
+            if claimed != 1 {
+                let run = read_run(transaction, run_id)?;
+                return Err(if run.is_terminal() {
+                    JournalError::InvalidTransition(format!(
+                        "terminal run {run_id} cannot be claimed ({})",
+                        run.status.as_str()
+                    ))
+                } else {
+                    JournalError::LeaseConflict(format!(
+                        "run {run_id} has a live lease owned by {:?}",
+                        run.owner_id.unwrap_or_default()
+                    ))
+                });
+            }
+            Ok(OwnerLease {
+                run_id: run_id.to_string(),
+                owner_id: owner_id.to_string(),
+                token,
                 expires_at,
-                utc_now(),
-                run_id,
-                now
-            ],
-        )?;
-        if claimed != 1 {
-            let run = read_run(&transaction, run_id)?;
-            return Err(if run.is_terminal() {
-                JournalError::InvalidTransition(format!(
-                    "terminal run {run_id} cannot be claimed ({})",
-                    run.status.as_str()
-                ))
-            } else {
-                JournalError::LeaseConflict(format!(
-                    "run {run_id} has a live lease owned by {:?}",
-                    run.owner_id.unwrap_or_default()
-                ))
-            });
-        }
-        transaction.commit()?;
-        Ok(OwnerLease {
-            run_id: run_id.to_string(),
-            owner_id: owner_id.to_string(),
-            token,
-            expires_at,
+            })
         })
     }
 
@@ -756,57 +810,57 @@ impl JournalStore {
             ));
         }
         let expires_at = now + ttl_seconds;
-        let transaction = self.begin()?;
-        let extended = transaction.execute(
-            &format!(
-                "UPDATE runs SET lease_expires_at = ?1, updated_at = ?2
+        self.write(|transaction| {
+            let extended = transaction.execute(
+                &format!(
+                    "UPDATE runs SET lease_expires_at = ?1, updated_at = ?2
                  WHERE run_id = ?3 AND owner_id = ?4 AND lease_token_hash = ?5
                    AND lease_expires_at > ?6
                    AND status NOT IN ({TERMINAL_SQL})"
-            ),
-            params![
+                ),
+                params![
+                    expires_at,
+                    utc_now(),
+                    lease.run_id,
+                    lease.owner_id,
+                    token_hash(&lease.token),
+                    now
+                ],
+            )?;
+            if extended != 1 {
+                return Err(lease_lost(transaction, &lease.run_id));
+            }
+            Ok(OwnerLease {
+                run_id: lease.run_id.clone(),
+                owner_id: lease.owner_id.clone(),
+                token: lease.token.clone(),
                 expires_at,
-                utc_now(),
-                lease.run_id,
-                lease.owner_id,
-                token_hash(&lease.token),
-                now
-            ],
-        )?;
-        if extended != 1 {
-            return Err(lease_lost(&transaction, &lease.run_id));
-        }
-        transaction.commit()?;
-        Ok(OwnerLease {
-            run_id: lease.run_id.clone(),
-            owner_id: lease.owner_id.clone(),
-            token: lease.token.clone(),
-            expires_at,
+            })
         })
     }
 
     /// Give up a lease so another runner can claim the run immediately.
     pub fn release_owner(&self, lease: &OwnerLease, now: f64) -> Result<RunRecord> {
-        let transaction = self.begin()?;
-        let released = transaction.execute(
-            "UPDATE runs
+        self.write(|transaction| {
+            let released = transaction.execute(
+                "UPDATE runs
              SET owner_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL,
                  updated_at = ?1
              WHERE run_id = ?2 AND owner_id = ?3 AND lease_token_hash = ?4
                AND lease_expires_at > ?5",
-            params![
-                utc_now(),
-                lease.run_id,
-                lease.owner_id,
-                token_hash(&lease.token),
-                now
-            ],
-        )?;
-        if released != 1 {
-            return Err(lease_lost(&transaction, &lease.run_id));
-        }
-        transaction.commit()?;
-        self.get_run(&lease.run_id)
+                params![
+                    utc_now(),
+                    lease.run_id,
+                    lease.owner_id,
+                    token_hash(&lease.token),
+                    now
+                ],
+            )?;
+            if released != 1 {
+                return Err(lease_lost(transaction, &lease.run_id));
+            }
+            read_run(transaction, &lease.run_id)
+        })
     }
 
     /// Append an event under a live lease.
@@ -817,11 +871,11 @@ impl JournalStore {
         payload: &Value,
         now: f64,
     ) -> Result<EventRecord> {
-        let transaction = self.begin()?;
-        require_live_lease(&transaction, lease, now)?;
-        let event = append_event(&transaction, &lease.run_id, event_type, payload)?;
-        transaction.commit()?;
-        Ok(event)
+        self.write(|transaction| {
+            require_live_lease(transaction, lease, now)?;
+            let event = append_event(transaction, &lease.run_id, event_type, payload)?;
+            Ok(event)
+        })
     }
 
     /// Replace the checkpoint and append its event atomically.
@@ -843,36 +897,36 @@ impl JournalStore {
         now: f64,
     ) -> Result<EventRecord> {
         let checkpoint_json = encode_json(checkpoint, "checkpoint")?;
-        let transaction = self.begin()?;
-        require_live_lease(&transaction, lease, now)?;
-        require_expected_state(
-            &transaction,
-            &lease.run_id,
-            expected_status,
-            expected_desired_state,
-        )?;
-        let event = append_event(&transaction, &lease.run_id, event_type, payload)?;
-        let saved = transaction.execute(
-            &format!(
-                "UPDATE runs SET checkpoint_json = ?1, updated_at = ?2
+        self.write(|transaction| {
+            require_live_lease(transaction, lease, now)?;
+            require_expected_state(
+                transaction,
+                &lease.run_id,
+                expected_status,
+                expected_desired_state,
+            )?;
+            let event = append_event(transaction, &lease.run_id, event_type, payload)?;
+            let saved = transaction.execute(
+                &format!(
+                    "UPDATE runs SET checkpoint_json = ?1, updated_at = ?2
                  WHERE run_id = ?3 AND owner_id = ?4 AND lease_token_hash = ?5
                    AND lease_expires_at > ?6
                    AND status NOT IN ({TERMINAL_SQL})"
-            ),
-            params![
-                checkpoint_json,
-                utc_now(),
-                lease.run_id,
-                lease.owner_id,
-                token_hash(&lease.token),
-                now
-            ],
-        )?;
-        if saved != 1 {
-            return Err(lease_lost(&transaction, &lease.run_id));
-        }
-        transaction.commit()?;
-        Ok(event)
+                ),
+                params![
+                    checkpoint_json,
+                    utc_now(),
+                    lease.run_id,
+                    lease.owner_id,
+                    token_hash(&lease.token),
+                    now
+                ],
+            )?;
+            if saved != 1 {
+                return Err(lease_lost(transaction, &lease.run_id));
+            }
+            Ok(event)
+        })
     }
 
     /// Move a run to a new status, fenced by the lease and by the expected value.
@@ -899,20 +953,20 @@ impl JournalStore {
         let releases_lease = status == RunStatus::Paused || status.is_terminal();
         let finished_at = status.is_terminal().then(utc_now);
 
-        let transaction = self.begin()?;
-        require_live_lease(&transaction, lease, now)?;
-        require_expected_state(
-            &transaction,
-            &lease.run_id,
-            Some(expected),
-            expected_desired_state,
-        )?;
-        if let Some((event_type, payload)) = event {
-            append_event(&transaction, &lease.run_id, event_type, payload)?;
-        }
-        let updated = transaction.execute(
-            &format!(
-                "UPDATE runs
+        self.write(|transaction| {
+            require_live_lease(transaction, lease, now)?;
+            require_expected_state(
+                transaction,
+                &lease.run_id,
+                Some(expected),
+                expected_desired_state,
+            )?;
+            if let Some((event_type, payload)) = event {
+                append_event(transaction, &lease.run_id, event_type, payload)?;
+            }
+            let updated = transaction.execute(
+                &format!(
+                    "UPDATE runs
                  SET status = ?1, output_json = ?2, error_json = ?3, finished_at = ?4,
                      updated_at = ?5,
                      owner_id = CASE WHEN ?6 THEN NULL ELSE owner_id END,
@@ -921,39 +975,39 @@ impl JournalStore {
                  WHERE run_id = ?7 AND status = ?8 AND owner_id = ?9
                    AND lease_token_hash = ?10 AND lease_expires_at > ?11
                    AND status NOT IN ({TERMINAL_SQL})"
-            ),
-            params![
-                status.as_str(),
-                output_json,
-                error_json,
-                finished_at,
-                utc_now(),
-                releases_lease,
-                lease.run_id,
-                expected.as_str(),
-                lease.owner_id,
-                token_hash(&lease.token),
-                now
-            ],
-        )?;
-        if updated != 1 {
-            let run = read_run(&transaction, &lease.run_id)?;
-            return Err(if run.is_terminal() {
-                JournalError::InvalidTransition(format!(
-                    "terminal run {} is immutable ({})",
+                ),
+                params![
+                    status.as_str(),
+                    output_json,
+                    error_json,
+                    finished_at,
+                    utc_now(),
+                    releases_lease,
                     lease.run_id,
-                    run.status.as_str()
-                ))
-            } else {
-                JournalError::Conflict(format!(
-                    "run status changed concurrently: expected {}, found {}",
                     expected.as_str(),
-                    run.status.as_str()
-                ))
-            });
-        }
-        transaction.commit()?;
-        self.get_run(&lease.run_id)
+                    lease.owner_id,
+                    token_hash(&lease.token),
+                    now
+                ],
+            )?;
+            if updated != 1 {
+                let run = read_run(transaction, &lease.run_id)?;
+                return Err(if run.is_terminal() {
+                    JournalError::InvalidTransition(format!(
+                        "terminal run {} is immutable ({})",
+                        lease.run_id,
+                        run.status.as_str()
+                    ))
+                } else {
+                    JournalError::Conflict(format!(
+                        "run status changed concurrently: expected {}, found {}",
+                        expected.as_str(),
+                        run.status.as_str()
+                    ))
+                });
+            }
+            read_run(transaction, &lease.run_id)
+        })
     }
 
     /// Events in order, for following or replaying a run's history.
@@ -1026,10 +1080,10 @@ impl JournalStore {
 
     /// Confirm a lease is still live, for use at a safe point before continuing.
     pub fn ensure_live_lease(&self, lease: &OwnerLease, now: f64) -> Result<RunRecord> {
-        let transaction = self.begin()?;
-        require_live_lease(&transaction, lease, now)?;
-        transaction.commit()?;
-        self.get_run(&lease.run_id)
+        self.write(|transaction| {
+            require_live_lease(transaction, lease, now)?;
+            read_run(transaction, &lease.run_id)
+        })
     }
 }
 
