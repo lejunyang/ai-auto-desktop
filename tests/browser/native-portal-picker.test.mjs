@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
-import {mkdtemp, readFile, rm, symlink, writeFile} from 'node:fs/promises';
+import {mkdir, mkdtemp, readFile, rm, symlink, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import {test} from 'node:test';
@@ -37,9 +37,9 @@ test(`an already-open GTK portal supports Open and new-file Save on ${desktop}`,
   await writeFile(source,'source bytes');
   await symlink(join(root,'missing'),dangling);
   const cli=process.env.AAD_TEST_CLI || resolve('target/debug/aad');
-  const run=(command,file,...extra)=>exec(cli,['--compact','browser',command,'--page',page.target.id,
+  const run=(command,file,{grant=root,native=false}={})=>exec(cli,['--compact','browser',command,'--page',page.target.id,
     '--cdp-port',String(page.port),'--allow-input',command==='save-as'?'--allow-save-dir':'--allow-upload-dir',
-    root,'--file',file,...extra],{env:{...process.env,AAD_CONTROL_LEASE_DIR:join(root,'leases')}});
+    grant,'--file',file,...(native?['--native-file']:[])],{env:{...process.env,AAD_CONTROL_LEASE_DIR:join(root,'leases')}});
   const gesture=expression=>page.cdp.call('Runtime.evaluate',{expression,userGesture:true});
   await gesture('f.oncancel=()=>window.cancelled=true; f.click()');
   await waitFor(async()=>(await requests()).length===1 && await page.cdp.eval('f.matches(":open")'));
@@ -62,6 +62,35 @@ test(`an already-open GTK portal supports Open and new-file Save on ${desktop}`,
   assert.deepEqual(await page.cdp.eval('(async()=>[await f.files[0].text(),other.files.length,s.value,!!window.cancelled])()'),
     ['source bytes',0,'untouched',false]);
 
+  const nativeSource=join(root,'native 文 件.txt');
+  await writeFile(nativeSource,'bytes read through the native handle');
+  await gesture(`void showOpenFilePicker({multiple:true}).then(async handles=>{
+    window.handles=await Promise.all(handles.map(async h=>[h.name,await (await h.getFile()).text()]));
+  }).catch(e=>window.openError=String(e))`);
+  await waitFor(async()=>(await requests()).length===1);
+  const nativeRequest=await requests();
+  assert.equal(await page.cdp.eval('document.querySelector("input:open")===null'),true);
+  const denied=join(root,'empty-grant');
+  await mkdir(denied);
+  await assert.rejects(run('choose-files',nativeSource,{native:true,grant:denied}));
+  assert.deepEqual(await requests(),nativeRequest);
+  const {targetId}=await page.cdp.call('Target.createTarget',{url:'about:blank',background:true});
+  try {
+    await assert.rejects(run('choose-files',nativeSource,{native:true}));
+    assert.deepEqual(await requests(),nativeRequest);
+    assert.equal(await page.cdp.eval('window.handles===undefined'),true);
+  } finally {
+    await page.cdp.call('Target.closeTarget',{targetId});
+  }
+  const native=JSON.parse((await run('choose-files',nativeSource,{native:true})).stdout);
+  assert.equal(native.native_file_selected,true);
+  assert.equal(native.file_count,1);
+  assert.equal(native.picker_closed,true);
+  assert.deepEqual(await requests(),[]);
+  await waitFor(()=>page.cdp.eval('!!(window.handles || window.openError)'));
+  assert.deepEqual(await page.cdp.eval('[window.handles,window.openError,s.value]'),
+    [[['native 文 件.txt','bytes read through the native handle']],null,'untouched']);
+
   await gesture(`void showSaveFilePicker({suggestedName:'proposed.txt'}).then(async handle=>{
     window.chosen=handle.name;
     const output=await handle.createWritable(); await output.write('bytes written by the page'); await output.close();
@@ -83,4 +112,10 @@ test(`an already-open GTK portal supports Open and new-file Save on ${desktop}`,
   assert.deepEqual(await page.cdp.eval('[window.chosen,window.saved,window.saveError,s.value]'),
     ['new 文 件.txt',true,null,'untouched']);
   assert.equal(await readFile(dest,'utf8'),'bytes written by the page');
+
+  await gesture('void showDirectoryPicker().catch(()=>{})');
+  await waitFor(async()=>(await requests()).length===1);
+  const folderRequest=await requests();
+  await assert.rejects(run('choose-files',nativeSource,{native:true}));
+  assert.deepEqual(await requests(),folderRequest);
 });
