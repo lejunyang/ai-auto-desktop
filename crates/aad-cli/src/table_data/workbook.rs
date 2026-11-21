@@ -190,6 +190,40 @@ pub(super) fn export(path: &Path, sheet: &str, range: &str, output: &Path) -> Re
     Ok(json!({"output":output,"sheet":sheet,"range":range,"rows":area.height,"columns":area.width}))
 }
 
+pub(super) fn export_live(
+    hwnd: u64,
+    book: &str,
+    sheet: &str,
+    range: &str,
+    output: &Path,
+) -> Result<Value> {
+    let area = Area::parse(range)?;
+    #[cfg(windows)]
+    {
+        let cells = aad_windows::excel::read_range(
+            hwnd,
+            book,
+            sheet,
+            [area.top, area.left, area.height, area.width],
+        )?;
+        write_csv(output, |writer| {
+            for row in cells.chunks_exact(area.width) {
+                writer.write_record(row).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })?;
+        Ok(
+            json!({"source":"excel_window","window":hwnd,"book":book,"sheet":sheet,"range":range,
+            "rows":area.height,"columns":area.width,"output":output}),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (hwnd, book, sheet, area, output);
+        Err("live Excel window export requires Windows desktop Excel".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,6 +10,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod com;
 mod desktop;
+pub mod excel;
 pub mod input;
 pub mod ocr;
 pub mod probe;

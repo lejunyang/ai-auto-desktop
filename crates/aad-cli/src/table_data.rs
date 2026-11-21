@@ -24,19 +24,25 @@ pub enum TableCommand {
 
 #[derive(Subcommand)]
 pub enum CsvCommand {
-    /// Write a complete collection or a rectangular XLSX range to a new UTF-8 CSV file.
+    /// Write a collection, local XLSX range, or live Windows Excel range to a new CSV.
     Export {
         #[arg(
             long,
-            required_unless_present = "workbook",
-            conflicts_with = "workbook"
+            required_unless_present_any = ["workbook", "excel_window"],
+            conflicts_with_all = ["workbook", "excel_window", "sheet", "range"]
         )]
         input: Option<PathBuf>,
-        #[arg(long, requires_all = ["sheet","range"])]
+        #[arg(long, requires_all = ["sheet","range"], conflicts_with = "excel_window")]
         workbook: Option<PathBuf>,
-        #[arg(long, requires = "workbook")]
+        /// HWND of the open desktop Excel workbook window (decimal or 0x hex).
+        #[arg(long, value_parser = excel_hwnd, requires_all = ["book_name","sheet","range"])]
+        excel_window: Option<u64>,
+        /// Exact workbook Name from the selected live Excel window.
+        #[arg(long, requires = "excel_window")]
+        book_name: Option<String>,
+        #[arg(long)]
         sheet: Option<String>,
-        #[arg(long, requires = "workbook")]
+        #[arg(long)]
         range: Option<String>,
         #[arg(long)]
         output: PathBuf,
@@ -51,6 +57,15 @@ pub enum CsvCommand {
         #[arg(long, value_name = "COLUMN")]
         decimal: Vec<String>,
     },
+}
+
+fn excel_hwnd(raw: &str) -> Result<u64> {
+    let raw = raw.strip_prefix("hwnd:").unwrap_or(raw);
+    raw.strip_prefix("0x")
+        .map_or_else(|| raw.parse(), |n| u64::from_str_radix(n, 16))
+        .ok()
+        .filter(|&n| n != 0 && n <= u64::from(u32::MAX))
+        .ok_or_else(|| "expected a nonzero Windows HWND in decimal or hex".into())
 }
 
 #[derive(clap::Args)]
@@ -489,15 +504,20 @@ pub fn csv(command: &CsvCommand) -> Result<Value> {
         CsvCommand::Export {
             input,
             workbook,
+            excel_window,
+            book_name,
             sheet,
             range,
             output,
-        } => match (input, workbook, sheet, range) {
-            (Some(input), None, None, None) => export(&Dataset::load(input)?, output),
-            (None, Some(book), Some(sheet), Some(range)) => {
+        } => match (input, workbook, excel_window, book_name, sheet, range) {
+            (Some(input), None, None, None, None, None) => export(&Dataset::load(input)?, output),
+            (None, Some(book), None, None, Some(sheet), Some(range)) => {
                 workbook::export(book, sheet, range, output)
             }
-            _ => Err("provide --input or --workbook with --sheet and --range".into()),
+            (None, None, Some(hwnd), Some(book), Some(sheet), Some(range)) => {
+                workbook::export_live(*hwnd, book, sheet, range, output)
+            }
+            _ => Err("choose exactly one collection, workbook or live Excel window source".into()),
         },
         CsvCommand::Compare {
             input,
