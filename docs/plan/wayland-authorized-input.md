@@ -4,9 +4,11 @@
 
 ## 已验证的 Qt 5 Widgets 输入
 
-启用目标侧插件后，`aad do key` 在已聚焦控件上发送 Qt 按键事件，`aad do click` 在通过窗口内命中检查的控件中心发送一次左键按下和释放。控制端重新观察元素，核对原窗口、AT-SPI 唯一总线名与进程，并将请求发往同一应用连接。应用 GUI 线程把目标和窗口路径还原成实际 QWidget，校验当前窗口、焦点或命中后同步派发，释放前复核。Qt 5 自身的 AT-SPI 适配器使用同一套对象 ID 和 D-Bus 连接。[Qt 对象路径解析](https://raw.githubusercontent.com/qt/qtbase/5.15/src/platformsupport/linuxaccessibility/atspiadaptor.cpp) · [Qt 辅助功能连接](https://raw.githubusercontent.com/qt/qtbase/5.15/src/platformsupport/linuxaccessibility/dbusconnection.cpp)
+启用目标侧插件后，`aad do key` 在已聚焦控件上发送 Qt 按键事件，`aad do click` 支持在通过窗口内命中检查的位置单击、双击左键、中键或右键。控制端重新观察元素，核对原窗口、AT-SPI 唯一总线名与进程，并将请求发往同一应用连接。应用 GUI 线程把目标和窗口路径还原成实际 QWidget，校验当前窗口、焦点或命中后同步派发，释放前复核。Qt 5 自身的 AT-SPI 适配器使用同一套对象 ID 和 D-Bus 连接。[Qt 对象路径解析](https://raw.githubusercontent.com/qt/qtbase/5.15/src/platformsupport/linuxaccessibility/atspiadaptor.cpp) · [Qt 辅助功能连接](https://raw.githubusercontent.com/qt/qtbase/5.15/src/platformsupport/linuxaccessibility/dbusconnection.cpp)
 
 私有 KWin 5.27.5、Qt 5.15.8、无 DISPLAY 环境下，Qt 表单记录了两对键盘事件及一对鼠标事件。Ctrl+A 选中了完整发票号，后续按键替换了文本，点击触发一次提交。相同 PID 且标题相同的非活动窗口、被子控件覆盖的按钮、密码输入框以及未加载插件的应用均未收到所请求的事件。发行版 KDialog 22.12.3 的输入框经键盘替换和点击确认后，进程以状态 0 退出并输出替换后的字符。
+
+新增手势通过独立的插件能力查询协商。双轴四方向滚轮各发送两格，Qt 滚动条收到对应的 ±240 角度增量，每次值均发生变化。右键双击的四个阶段保留 Ctrl+Shift，悬停事件到达指定边缘位置；同控件拖拽保留 Alt 修饰键，普通 QLineEdit 从头到尾拖动后实际选中了整段文本。端点被子控件覆盖、直线路径中间有遮挡、终点位于另一控件时均在按下前拒绝，接收端状态和事件记录保持原值。命中证据限于当前应用窗口的控件树。
 
 GNU Linux 发布包提供预编译插件，各 Linux 包均提供可用目标应用的 Qt 重编译的源码。启动示例、支持的键名与手势范围见[插件使用文档](../../crates/aad-linux/qt-wayland-input/README.md)。
 
@@ -30,7 +32,7 @@ $pluginRoot = Join-Path (Resolve-Path target).Path 'wayland-input-qt5'
 | 会话生命周期 | 每个公共会话读取/FD 获取前轮询 Closed 与 portal owner 变化；失效增加 generation，关闭拥有的 FD；Drop 关闭会话及独立客户端连接 | Closed、portal 消失、FD EOF 和失败清理通过；当前没有后台通知线程，调用者必须持续 refresh |
 | FD 传输 | 每会话至多一次 ConnectToEIS 和 OpenPipeWireRemote，FD 由会话持有 | fake portal 的 Unix FD 传递及回收通过；未启动 libei 握手或 PipeWire 视频消费 |
 | 坐标映射 | 仅接受唯一 mapping_id、相同逻辑 origin/size、非零稳定 pipewire-serial、未裁剪/旋转的帧；旧 generation、变化帧和越界比例拒绝 | 纯映射单测通过；实际多屏、缩放、旋转和热插拔 **[待真机验收]** |
-| Portal 输入 | RemoteDesktop 只做授权与生命周期管理 | 已验证的按键和点击通过上文所述的应用侧 Qt 接口派发 |
+| Portal 输入 | RemoteDesktop 只做授权与生命周期管理 | 按键、点击、滚轮、悬停及同控件拖拽通过上文所述的应用侧 Qt 接口派发 |
 
 `e1e2d47` 提交授权与清理，`df4de21` 提供独立私有 D-Bus 验证入口；`117c599` 进一步将映射绑定到随机会话身份与 revision。即使新会话返回相同 stream serial 和 mapping_id，也不能复用旧映射；每次映射调用还必须比较当前 EI region，位置或大小变化即拒绝。跨会话重放和 region 移动负例均通过。
 

@@ -1,6 +1,6 @@
 # Window-addressed input for Qt 5 Widgets on Wayland
 
-Start the target application with the `aad-wayland-input` generic plugin. The Linux AT-SPI backend then offers `key_chord` (`aad do key`) on its focused widget and `pointer_click` (`aad do click`) at the center of a widget whose hit can be confirmed. The app must run on native Wayland with Qt 5 Widgets and the Qt AT-SPI bridge. The CLI and app must share the accessibility bus.
+Start the target application with the `aad-wayland-input` generic plugin to enable focused keys, clicks, wheel scrolling, hover and same-widget drags. The app must run on native Wayland with Qt 5 Widgets and the Qt AT-SPI bridge. The CLI and app must share the accessibility bus.
 
 ## Launch an application
 
@@ -40,8 +40,31 @@ pwsh -NoProfile -File ./build.ps1 -BuildDirectory $qtPlugins
 
 Use this `$qtPlugins` in the launch command above. Each target process opts in at startup. The GNU local release builder also accepts `-BuildQtWaylandPlugin` to bundle the binary.
 
-## Delivery and limits
+## Actions on an observed widget
 
-The provider resolves the observed widget and its top-level window on the application's unique accessibility-bus owner. The plugin resolves both Qt accessibility IDs on the GUI thread and requires the same active, exposed Wayland window. Keyboard delivery requires that exact focused widget. A click requires both the AT-SPI hit test and the window's own widget hit test. The app receives a Qt press and release, with chord modifiers attached to the key event. A change of receiver, focus or hit after the press yields an unknown effect.
+Use `aad snapshot $resourceId` to find widget names and their current capabilities. Pointer capabilities require a clear center when observed. Each requested endpoint must also pass a fresh AT-SPI hit test and the target window's exact QWidget hit test. Fractions run from 0 to 1 along each widget axis. Omitting the fraction uses the center. The following examples use widget names from the qualification form.
 
-The plugin supports letters, digits, F1–F35, editing/navigation keys and Ctrl, Shift, Alt or Meta chords. Pointer support is a single left click at center. Other buttons, double clicks, off-center positions, drags, hover, scroll, bounded holds, IME typing and seat-wide keyboard or pointer injection are outside this backend. Independent windows can share a coordinate origin on Wayland. Hit verification applies within the addressed window and does not establish compositor-wide visibility.
+| Action | Qt delivery and limits |
+|---|---|
+| `key` | Press and release on the focused widget. Supports ASCII letters and digits, F1–F35, editing/navigation keys and Ctrl, Shift, Alt or Meta chords. |
+| `click` | Left, middle or right button, single or double click, at an optional fraction. Clicks and drags accept Ctrl, Shift, Alt and Meta through the control API. |
+| `scroll` | One wheel event at the requested fraction, with 1–30 detents along one of four directions. The widget decides how far to scroll. |
+| `hover` | One widget-local hover move with optional dwell. During dwell the backend rechecks the hit. The system cursor stays in place. |
+| `drag` | A press, one held-button move and a release. Use the same observed widget for both endpoints. The plugin checks the straight path for covering children before press and again before move. The longer axis may span up to 8192 logical pixels. |
+
+```powershell
+aad do scroll $resourceId --name 'Invoice scroll' --direction down --notches 2 --fx .78 --fy .5
+aad do hover $resourceId --name 'Invoice scroll' --fx 1 --fy 1 --ms 120
+aad do click $resourceId --name 'Mouse pad' --button right --count 2 --fx 1 --fy 0
+aad do drag $resourceId --name 'Drag selection' --to-name 'Drag selection' --fx 0 --fy .5 --to-fx 1 --to-fy .5
+```
+
+For a modified click, use the following `action` in a control `act` request with the target handle from that session's `observe` response.
+
+```json
+{"type":"click","button":"right","count":2,"fraction":{"fx":1,"fy":0},"modifiers":["ctrl","shift"]}
+```
+
+The provider pins the widget and window to the observed application's unique AT-SPI bus owner. The GUI thread checks that the same top-level window is active and exposed, and revalidates the receiver between event phases. Loss of proof after dispatch begins yields an unknown effect. Hit testing covers the addressed window's own widget hierarchy. Independent Wayland windows can share a coordinate origin, so this check cannot establish compositor-wide visibility.
+
+The control actions for wheel and hover carry no modifier field. The Qt drag call carries one widget ID and two endpoints, so it can verify a straight path within that widget. It has no field for waypoints or a second receiver. Timed holds would need a cancellable target-side release while the GUI thread continues processing focus and geometry changes. The plugin handles press, move and release synchronously. IME composition and seat-wide input are outside its capabilities.
