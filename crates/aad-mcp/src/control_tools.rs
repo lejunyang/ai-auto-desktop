@@ -242,10 +242,9 @@ pub(crate) fn saved_action_schema() -> Value {
         variants.retain(|variant| variant["properties"]["type"]["const"] != "secret_input");
     }
     for variant in schema["oneOf"].as_array_mut().into_iter().flatten() {
-        // The text may come from the step's `input` instead.
         if matches!(
             variant["properties"]["type"]["const"].as_str(),
-            Some("fill" | "type_text" | "paste")
+            Some("fill" | "type_text" | "paste" | "upload" | "choose_files")
         ) {
             variant["required"] = json!(["type"]);
         }
@@ -262,8 +261,8 @@ pub(crate) fn saved_action_schema() -> Value {
         }
     }
     schema["description"] = json!(
-        "The control_act action you performed, without its target. For fill and \
-    type_text with an `input`, leave the text out."
+        "The control_act action you performed, without its target. When using an input, \
+    omit the text or file paths it supplies."
     );
     schema
 }

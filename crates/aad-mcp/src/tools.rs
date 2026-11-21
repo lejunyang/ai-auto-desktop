@@ -179,10 +179,9 @@ fn steps_schema(max_steps: usize) -> Value {
                 },
                 "input": {
                     "type": "object",
-                    "description": "For fill and type_text: take the \
-    text from this workflow input when it runs instead of storing it. Use it for a \
-    credential or anything else that must not be written down; the text in the \
-    action is then dropped, and whoever runs the workflow supplies it.",
+                    "description": "Take the value from this workflow input instead of storing it. \
+    For fill, type_text or paste, supply a string (for example a credential). For upload or \
+    choose_files, supply an array of absolute paths under the server's allowed upload directories.",
                     "properties": {
                         "name": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
                         "sensitive": {
@@ -314,7 +313,8 @@ memory, unless fallback_in_memory is true.",
                     "inputs": {
                         "type": "object",
                         "description": "Values for the workflow's declared inputs, as \
-            reported by describe_workflow."
+            reported by describe_workflow. File selection requires aad mcp --allow-input and \
+            --allow-upload-dir DIR at server startup; a caller cannot grant a directory."
                     },
                     "durable": {
                         "type": "boolean",
@@ -504,11 +504,16 @@ instead, narrowed with within, near or nth if several match.",
                 ),
             ));
         }
-        // Text that comes from an input is not written down, whatever was typed.
         if step.get("input").is_some() {
             if let Some(action) = step.get_mut("action").and_then(Value::as_object_mut) {
                 action.remove("value");
                 action.remove("text");
+                if matches!(
+                    action.get("type").and_then(Value::as_str),
+                    Some("upload" | "choose_files")
+                ) {
+                    action.remove("files");
+                }
             }
         }
         let step: Step = serde_json::from_value(step).map_err(|error| {
@@ -1654,6 +1659,18 @@ pub(crate) mod tests {
             .iter()
             .find(|variant| variant["properties"]["type"]["const"] == "drag")
             .unwrap();
+        for variant in variants.iter().filter(|v| {
+            matches!(
+                v["properties"]["type"]["const"].as_str(),
+                Some("upload" | "choose_files")
+            )
+        }) {
+            assert_eq!(
+                variant["required"],
+                json!(["type"]),
+                "a saved step may bind files at run time"
+            );
+        }
         assert!(
             drag["properties"].get("to").is_none(),
             "a saved drag names its destination by locator, in the step's `to`"
