@@ -118,13 +118,27 @@ fn download(args: &Args) -> Result<Value, Value> {
     session
         .download_cursor(std::time::Duration::from_secs(2))
         .map_err(|err| err.to_json())?;
-    browser
-        .open_url(&args.url)
-        .map_err(|err| json!({"code":"BROWSER.NAVIGATION_FAILED","message":err.to_string()}))?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(args.timeout_ms);
+    let pending_navigation = match browser.open_url(&args.url) {
+        Ok(()) => None,
+        Err(err)
+            if matches!(err.downcast_ref::<aad_browser::cdp::CdpError>(),
+            Some(aad_browser::cdp::CdpError::Protocol(message)) if message == "command deadline elapsed") =>
+        {
+            Some(err)
+        }
+        Err(err) => {
+            return Err(json!({"code":"BROWSER.NAVIGATION_FAILED","message":err.to_string()}))
+        }
+    };
     let id = loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
+            if let Some(err) = pending_navigation {
+                return Err(
+                    json!({"code":"BROWSER.NAVIGATION_FAILED","message":format!("navigation did not acknowledge or reach the exact task URL: {err}")}),
+                );
+            }
             return Err(
                 json!({"code":"BROWSER.PAGE_NOT_FOUND","message":"the launched main frame did not reach the exact requested URL"}),
             );
@@ -152,6 +166,8 @@ fn download(args: &Args) -> Result<Value, Value> {
                 row["metadata"]["page_id"] == browser.page
                     && row["metadata"]["main_frame"] == true
                     && row["metadata"]["url"] == args.url
+                    && row["metadata"]["access_error"].is_null()
+                    && row["metadata"]["responsive"] != false
             })
             .and_then(|row| row["resource_id"].as_str())
         {

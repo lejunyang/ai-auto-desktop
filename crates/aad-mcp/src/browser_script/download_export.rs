@@ -34,6 +34,55 @@ impl Named {
 }
 
 impl Page {
+    fn ready_export_target(&self, scope: &Named, spec: &Spec) -> Result<Option<(String, Target)>> {
+        let find = |seen: &Value, locator: Locator| {
+            self.request(Operation::Find {
+                observation_id: seen["observation_id"].as_str().unwrap_or_default().into(),
+                locator: Box::new(locator),
+                expect: Expect::Optional,
+            })
+        };
+        let seen = self.observe(aad_control::ViewMode::Nodes)?;
+        let row = find(&seen, scope.locator())?;
+        if row["found"] != true {
+            return Ok(None);
+        }
+        let row = serde_json::from_value(row["target"].clone())
+            .map_err(|err| failure("BROWSER.BAD_RESULT", err))?;
+        let seen = self.request(Operation::Observe {
+            resource_id: self.resource_id.clone(),
+            max_nodes: aad_control::MAX_NODES,
+            view: View {
+                scope_target: Some(row),
+                ..View::default()
+            },
+        })?;
+        for name in std::iter::once(&spec.task_id).chain(&spec.required_names) {
+            if scope.name != *name
+                && find(
+                    &seen,
+                    Locator {
+                        name: Some(name.clone()),
+                        ..Default::default()
+                    },
+                )?["found"]
+                    != true
+            {
+                return Ok(None);
+            }
+        }
+        let found = find(&seen, spec.trigger.locator())?;
+        if found["found"] != true || found["node"]["states"]["enabled"] != true {
+            return Ok(None);
+        }
+        let frame = seen["metadata"]["frame_id"]
+            .as_str()
+            .ok_or_else(|| failure("BROWSER.BAD_RESULT", "no observed Chromium frame"))?;
+        let target = serde_json::from_value(found["target"].clone())
+            .map_err(|err| failure("BROWSER.BAD_RESULT", err))?;
+        Ok(Some((frame.to_owned(), target)))
+    }
+
     pub(super) fn download_export(&mut self, spec: Spec) -> Result<Value> {
         if !self.session.policy().allow_input {
             return Err(failure(
@@ -44,10 +93,11 @@ impl Page {
         let valid = |text: &str| {
             !text.trim().is_empty() && text.len() <= 256 && !text.chars().any(char::is_control)
         };
-        let scope = spec.scope.unwrap_or_else(|| Named {
+        let default_scope = Named {
             role: "row".into(),
             name: spec.task_id.clone(),
-        });
+        };
+        let scope = spec.scope.as_ref().unwrap_or(&default_scope);
         if !self.chromium
             || !valid(&spec.task_id)
             || !valid(&scope.name)
@@ -74,61 +124,20 @@ impl Page {
         self.session
             .download_cursor(remaining("waiting for task")?)
             .map_err(|err| err.to_json())?;
-        let find = |seen: &Value, locator: Locator| {
-            self.request(Operation::Find {
-                observation_id: seen["observation_id"].as_str().unwrap_or_default().into(),
-                locator: Box::new(locator),
-                expect: Expect::Optional,
-            })
-        };
         let mut interval = Duration::from_millis(125);
         let (frame, target) = loop {
             remaining(
                 "task ID, conditions or ready download control not observed before deadline",
             )?;
-            let seen = self.observe(aad_control::ViewMode::Nodes)?;
-            let row = find(&seen, scope.locator())?;
-            if row["found"] == true {
-                let row: Target = serde_json::from_value(row["target"].clone())
-                    .map_err(|err| failure("BROWSER.BAD_RESULT", err))?;
-                let seen = self.request(Operation::Observe {
-                    resource_id: self.resource_id.clone(),
-                    max_nodes: aad_control::MAX_NODES,
-                    view: View {
-                        scope_target: Some(row),
-                        ..Default::default()
-                    },
-                })?;
-                let mut matches = true;
-                for name in std::iter::once(&spec.task_id).chain(&spec.required_names) {
-                    if scope.name != *name
-                        && find(
-                            &seen,
-                            Locator {
-                                name: Some(name.clone()),
-                                ..Default::default()
-                            },
-                        )?["found"]
-                            != true
-                    {
-                        matches = false;
-                        break;
-                    }
-                }
-                if matches {
-                    let found = find(&seen, spec.trigger.locator())?;
-                    if found["found"] == true && found["node"]["states"]["enabled"] == true {
-                        let frame = seen["metadata"]["frame_id"]
-                            .as_str()
-                            .ok_or_else(|| {
-                                failure("BROWSER.BAD_RESULT", "no observed Chromium frame")
-                            })?
-                            .to_owned();
-                        let target: Target = serde_json::from_value(found["target"].clone())
-                            .map_err(|err| failure("BROWSER.BAD_RESULT", err))?;
-                        break (frame, target);
-                    }
-                }
+            match self.ready_export_target(scope, &spec) {
+                Ok(Some(ready)) => break ready,
+                Ok(None) => {}
+                Err(err)
+                    if matches!(
+                        err["code"].as_str(),
+                        Some("CONTROL.STALE_TARGET" | "BROWSER.CONTEXT_LOST")
+                    ) => {}
+                Err(err) => return Err(err),
             }
             std::thread::sleep(interval.min(remaining("waiting for ready task")?));
             interval = (interval * 2).min(Duration::from_secs(1));

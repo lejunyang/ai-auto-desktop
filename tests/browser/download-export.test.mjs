@@ -14,18 +14,23 @@ test('download-export waits for the right ready row, verifies the new file and r
 },async t=>{
   const files={old:'date,total\n2026-11-18,9\n',current:'id,date,total,tax\nA1,2026-11-19,7,0.10\nA2,2026-11-19,-2,0.20\n'};
   const downloads=[];
-  const server=createServer((req,res)=>{
+  let navigations=0;
+  const server=createServer(async(req,res)=>{
     if(req.url.startsWith('/file/')){
       const task=req.url.slice(6);
       downloads.push(task);
       res.writeHead(200,{'Content-Type':'text/csv','Content-Disposition':'attachment; filename="bill.csv"'});
       return res.end(files[task]);
     }
+    if(req.url!=='/'){res.writeHead(404).end();return;}
+    if(++navigations===1) await new Promise(resolve=>setTimeout(resolve,9000));
     res.setHeader('Content-Type','text/html; charset=utf-8');
     res.end(`<title>Export jobs</title><table>
       <tr aria-label="JOB-01"><td>2026-11-18</td><td><a href="/file/old">Get bill</a></td></tr>
       <tr aria-label="JOB-02"><td aria-label="2026-11-19">2026-11-19</td><td id="status">Queued</td></tr></table>
-      <script>document.querySelector('a').click();setTimeout(()=>{document.querySelector('#status').innerHTML='<a href="/file/current">Get bill</a>'},700)</script>`);
+      <script>document.querySelector('a').click();
+      const refresh=setInterval(()=>{const row=document.querySelector('#status').parentNode;row.replaceWith(row.cloneNode(true))},20);
+      setTimeout(()=>{clearInterval(refresh);document.querySelector('#status').innerHTML='<a href="/file/current">Get bill</a>'},700)</script>`);
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   t.after(()=>new Promise(resolve=>server.close(resolve)));
@@ -67,17 +72,17 @@ test('download-export waits for the right ready row, verifies the new file and r
   for(const changed of [{...spec.expected,sha256:'0'.repeat(64)},{...spec.expected,filename:'wrong.csv'}]){
     const failed=await invoke({...spec,expected:changed});
     assert.equal(failed.ok,false,JSON.stringify(failed));
-    assert.equal(failed.report.error.code,'BROWSER.EXPORT_MISMATCH');
+    assert.equal(failed.report.error?.code,'BROWSER.EXPORT_MISMATCH',JSON.stringify(failed.report));
     assert.equal(failed.report.completed_actions,1);
   }
   const wrongDate=await invoke({...spec,required_names:['2026-11-18']},1500);
   assert.equal(wrongDate.ok,false);
-  assert.equal(wrongDate.report.completed_actions,0);
+  assert.equal(wrongDate.report.completed_actions,0,JSON.stringify(wrongDate.report));
   const compareCurrent=async()=>await invoke({...spec,expected:{filename:'bill.csv'}},10000,compare);
   files.current='id,date,total,tax\nA1,2026-11-18,8.50,0.10\nX9,2026-11-19,1,0\n';
   const mismatch=await compareCurrent();
   assert.equal(mismatch.ok,false);
-  assert.equal(mismatch.report.error.code,'BROWSER.EXPORT_CONTENT_MISMATCH');
+  assert.equal(mismatch.report.error?.code,'BROWSER.EXPORT_CONTENT_MISMATCH',JSON.stringify(mismatch.report));
   assert.equal(mismatch.report.completed_actions,1);
   assert.equal(mismatch.report.result.verified,true);
   assert.equal(await readFile(mismatch.report.result.file.path,'utf8'),files.current);
@@ -95,9 +100,10 @@ test('download-export waits for the right ready row, verifies the new file and r
   files.current='id,total\nA1,7\n';
   const malformed=await compareCurrent();
   assert.equal(malformed.ok,false);
-  assert.equal(malformed.report.error.code,'BROWSER.EXPORT_COMPARISON_FAILED');
+  assert.equal(malformed.report.error?.code,'BROWSER.EXPORT_COMPARISON_FAILED',JSON.stringify(malformed.report));
   assert.match(malformed.report.error.message,/header/);
   assert.equal(malformed.report.completed_actions,1);
   assert.equal(await readFile(malformed.report.result.file.path,'utf8'),files.current);
   assert.deepEqual(downloads,['old','current','old','current','old','current','old','old','current','old','current']);
+  assert.equal(navigations,6);
 });
