@@ -64,10 +64,15 @@ test(`an already-open GTK portal supports Open and new-file Save on ${desktop}`,
 
   const nativeSource=join(root,'native 文 件.txt');
   await writeFile(nativeSource,'bytes read through the native handle');
+  await page.cdp.call('Page.bringToFront');
   await gesture(`void showOpenFilePicker({multiple:true}).then(async handles=>{
     window.handles=await Promise.all(handles.map(async h=>[h.name,await (await h.getFile()).text()]));
   }).catch(e=>window.openError=String(e))`);
-  await waitFor(async()=>(await requests()).length===1);
+  await waitFor(async()=>{
+    const error=await page.cdp.eval('window.openError ?? null');
+    assert.equal(error,null);
+    return (await requests()).length===1;
+  });
   const nativeRequest=await requests();
   assert.equal(await page.cdp.eval('document.querySelector("input:open")===null'),true);
   const denied=join(root,'empty-grant');
@@ -82,6 +87,15 @@ test(`an already-open GTK portal supports Open and new-file Save on ${desktop}`,
   } finally {
     await page.cdp.call('Target.closeTarget',{targetId});
   }
+  await page.cdp.eval(`new Promise(resolve=>{
+    const frame=document.createElement('iframe'); frame.id='peer-frame';
+    frame.onload=()=>resolve(true); frame.srcdoc='<p>Another document</p>';
+    document.body.appendChild(frame);
+  })`);
+  await assert.rejects(run('choose-files',nativeSource,{native:true}), err =>
+    JSON.parse(err.stdout).error.message.includes('frame'));
+  assert.deepEqual(await requests(),nativeRequest);
+  await page.cdp.eval('document.getElementById("peer-frame").remove()');
   const native=JSON.parse((await run('choose-files',nativeSource,{native:true})).stdout);
   assert.equal(native.native_file_selected,true);
   assert.equal(native.file_count,1);
