@@ -34,8 +34,26 @@ MCP 使用同名参数。在一次 `browser_script` 调用中传 `source`（上�
 | `page.collect({table, columns, row_key, traversal, expected_rows})` | 跨页或滚动收集同一张表。用 `traversal: {mode:"pagination", next:{name:"下一页"}}` 指定翻页按钮；虚拟列表使用 `mode:"virtual_scroll"` 和 `container` 定位器。结果包含 `records`、`complete` 和 `stop_reason`。 |
 | `page.wait(locator, condition, states)` | 等待 `appears`、`disappears` 或 `state`。最后一种传期望状态，例如 `{enabled:true}`。 |
 | `page.fill(locator, text)`、`page.click(locator)`、`page.key(locator, keys)`、`page.scroll(locator, direction, notches)` | 在脚本绑定的页面上重新观察、定位，然后通过驱动执行。 |
+| `page.chooseFiles(locator, files)` | 给 Chromium 的上传按钮选文件。传入一个或多个绝对路径；单选控件传一个。脚本负责点击按钮并处理它打开的文件选择器。 |
+| `page.upload(locator, files)` | 已经知道网页文件输入框的位置时，可直接给这个输入框选文件。 |
 | `page.act(locator, action)` | 同样的定位方式，可执行 `select`、`check`、`hover`、`navigate`、`back` 等动作。页面导航使用驱动提供的页面元素作为目标。 |
 
 脚本在独立的 JS 环境中运行，通过 `page` 访问浏览器。它没有网页的 `window`、`document`、原始 CDP 会话、Node 模块或宿主文件接口。文件内容是函数体，使用 `return` 返回 JSON。输入和源码各限 64 KiB，每次最多 500 次 `page` 调用，默认 30 秒，可用 `timeout_ms` 或 CLI 的 `--timeout-ms` 调至 120 秒。
 
 成功时返回 `result`、`page_calls`、`completed_actions` 和 `elapsed_ms`。页面调用出错后整段停止，报告保留之前已完成的动作数，以及驱动报告的错误和动作效果。读状态失败时，可以先用 `page.present` 判断可选字段是否存在。
+
+## 给报销单添加附件
+
+把以下代码存为 `attach.js`。“添加附件”是网页上的上传按钮，点下后由网页打开文件选择器。脚本一次完成点击和选文件。网站若另外要求点“提交报销”，可在收到附件回显后继续写该步骤。
+
+```javascript
+return page.chooseFiles({role: "button", name: "添加附件"}, inputs.files);
+```
+
+```powershell
+$dir = (Resolve-Path ./invoices).Path
+$files = @{files = @((Join-Path $dir '本月发票.pdf'))} | ConvertTo-Json -Compress
+aad browser-script ./attach.js --url 'http://localhost:8080/expenses' --allow-input --allow-upload-dir $dir --inputs $files
+```
+
+文件放在运行浏览器的机器上。使用 MCP 时，在启动 `aad mcp` 时传 `--allow-input --allow-upload-dir <目录>`，调用 `browser_script` 时只传脚本、页面和业务输入。需要从多个目录选文件，可以重复传 `--allow-upload-dir`。

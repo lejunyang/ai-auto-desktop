@@ -11,7 +11,7 @@
 | `desktop.windows_uia` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | UIA + 原生输入；click 带 button/count/fraction 时走原生手势；节点必须暴露对应能力。指针动作先对落点做 UIA 命中检查，键盘动作先证明窗口在前台、焦点在元素内（见下文）。另有只读的 capture / read_text，以及需单独授权的 launch、clipboard_read、global_key |
 | `desktop.linux_atspi` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | AT-SPI；指针/键盘经 X11 XTest helper，本机 KDE/X11 已验收，GNOME/XFCE X11 待真机验收，Wayland 输入尚未实现；派发前核对焦点、PID 与落点，drag 起止两点都核对；窗口动作只在顶层窗口节点上、需要 EWMH 窗口管理器。另有只读 capture / read_text（Tesseract），以及需单独授权的 launch、clipboard_read、global_key（见下文“其他平台”） |
 | `desktop.macos_ax` | focus, invoke, click, fill, type_text, key, scroll, hover, drag, paste, minimize, maximize, restore, close_window, activate | AX helper；需要同一登录用户的辅助功能权限；指针动作要求目标应用在前台并经 AX 命中检查，事件只投递给目标进程；key 名称按字面（`ctrl` 是 Control，`cmd` 是 Command）；窗口动作只在 AXWindow 节点上，maximize 即全屏。另有 capture（需屏幕录制权限）、read_text、launch、clipboard_read、global_key。[待验证] 全部新增项需 macOS 真机 |
-| `browser.cdp` | focus, click, fill, type_text, key, scroll, hover, drag, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page, accept, dismiss, upload, emulate, clear_site_data | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover、drag 为可信 CDP Input（任何 frame，含跨进程 OOPIF），落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；type_text/key 为发给焦点元素的可信 CDP 键盘输入；navigate/back/forward/reload、标签页动作 open_tab/activate_page/close_page 以及 emulate/clear_site_data 在 body 节点上，只限主 frame；accept/dismiss 只在 JavaScript 对话框节点上；upload 只在文件框上，路径受 `--allow-upload-dir` 限制 |
+| `browser.cdp` | focus, click, fill, type_text, key, scroll, hover, drag, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page, accept, dismiss, upload, choose_files, emulate, clear_site_data | 普通 click 为 `HTMLElement.click()` 的 DOM 激活；带 button/count/fraction 的 click、scroll、hover、drag 为可信 CDP Input（任何 frame，含跨进程 OOPIF），落点先在页面里命中检查；fill/select 为 DOM 值及 input/change 事件；check 已是目标状态时不点击；type_text/key 为发给焦点元素的可信 CDP 键盘输入；navigate/back/forward/reload、标签页动作 open_tab/activate_page/close_page 以及 emulate/clear_site_data 在 body 节点上，只限主 frame；accept/dismiss 只在 JavaScript 对话框节点上；upload 用于文件框，choose_files 可操作上传按钮，两者的文件路径受 `--allow-upload-dir` 限制 |
 | `browser.firefox_bidi` | focus, invoke, fill, click, hover, scroll, key, type_text, select, check, navigate, back, forward, reload, open_tab, activate_page, close_page | Firefox WebDriver BiDi；主文档写操作，子 frame 只读；click/hover/scroll/key/keys 文本使用可信输入，invoke/fill/check/select 使用 DOM 语义。key/单击支持有界长按。支持安全局部 capture 和锚定 body 的导航/标签页操作；历史只支持可证明目标的连续同源 HTTP(S) 片段。双击、指针修饰键尚未实现，参数范围见下文 Firefox 专节 |
 
 以 `capabilities` 和观察节点的 `capabilities` 为准。可列出 provider 不表示当前 OS 已授予
@@ -150,8 +150,9 @@ JavaScript 对话框（alert/confirm/prompt/beforeunload）：会话连接每个
 页面读到答案，confirm dismiss 得 false，计时器弹出的 alert 使 fill 在 3 秒内被拒且未写入，会话前已打开的 alert 被标为无响应。
 [待验证] Edge 与有界面（非 headless）浏览器的对话框行为；beforeunload 对话框只按同一事件路径处理，没有专门的 fixture。
 
-文件上传：`<input type=file>` 只提供 `upload`（要 `files`，1..32 个绝对路径），不提供 fill/click，不会弹出文件选择框；
-被页面用 `display:none` 藏在样式按钮后面的文件框也会出现在观察里（`states.hidden: true`），节点的 `files` 列出已选文件名。
+给网页选文件有两个入口。对已观察的文件框可以执行 `upload`，对上传按钮可以执行 `choose_files`。两者的 `files` 参数都是数组，含 1 至 32 个绝对路径。按钮可以在点击时才创建文件框；Chromium 驱动将本次点击打开的选择器与同一 frame 内的文件框核对后，才把文件交给网页。这个按钮入口支持同步点击已连接到页面的 HTML 文件框。通过定时器打开选择器、只调用 `showPicker()` 或调用文件系统访问 API 的按钮，目前需要另行处理。
+
+普通文件框可直接使用 `choose_files`。被页面用 `display:none` 藏在样式按钮后面的文件框也会出现在观察里（`states.hidden: true`），节点的 `files` 列出已选文件名。
 路径由会话在服务端授权下解析：服务启动时用 `--allow-upload-dir <DIR>`（可重复，`aad mcp` 与 `aad control serve` 都有，
 `--connect` 远程时只能在远端配置）给出允许的目录，没给时一律 `POLICY.DENIED`；每个文件必须存在且是普通文件，
 按解析后的真实路径（符号链接、`..` 都先展开）判断是否落在允许目录下，否则 `POLICY.DENIED`，相对路径 `CONTROL.INVALID_REQUEST`，
