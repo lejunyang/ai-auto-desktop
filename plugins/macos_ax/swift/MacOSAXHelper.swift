@@ -2886,6 +2886,9 @@ private extension AXService {
             if paths == [Data(path.utf8)] { matches.append(row) }
         }
         guard matches.count == 1 else { throw pickerError("no unique visible file row exposes the exact local path") }
+        guard boolAttribute(matches[0], kAXEnabledAttribute as CFString) == true else {
+            throw pickerError("the requested native file row is disabled or unreadable")
+        }
         return (list, matches[0])
     }
 
@@ -2953,15 +2956,17 @@ private extension AXService {
         } while true
     }
 
-    func verifyNewPath(_ path: String, _ held: BrowserPicker) throws -> String {
+    func verifyNewPath(_ path: String, in held: BrowserPicker? = nil) throws -> String {
         let url = URL(fileURLWithPath: path)
         let parent = url.deletingLastPathComponent()
         let name = url.lastPathComponent
         guard path.hasPrefix("/"), !name.isEmpty, !name.contains(":"),
               !path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
               parent.appendingPathComponent(name).path.utf8.elementsEqual(path.utf8),
-              parent.resolvingSymlinksInPath().standardizedFileURL.path.utf8.elementsEqual(parent.path.utf8),
-              try saveDirectory(held).utf8.elementsEqual(parent.path.utf8) else {
+              parent.resolvingSymlinksInPath().standardizedFileURL.path.utf8.elementsEqual(parent.path.utf8) else {
+            throw pickerError("expected a resolved absolute destination and local filename")
+        }
+        if let held, try !saveDirectory(held).utf8.elementsEqual(parent.path.utf8) {
             throw pickerError("the observed save directory does not match the resolved destination")
         }
         var entry = stat()
@@ -2998,8 +3003,7 @@ private extension AXService {
             guard held.saving, let field = held.controls.filename, let path = try args.string("path") else {
                 throw pickerError("expected an observed Save panel")
             }
-            try navigateSaveDirectory(held, path, deadline, requestID)
-            let name = try verifyNewPath(path, held)
+            let name = try verifyNewPath(path)
             // AppKit may append the document type's extension automatically.
             // Require the full suggested extension to remain visible and unchanged.
             let ext = (name as NSString).pathExtension
@@ -3007,6 +3011,8 @@ private extension AXService {
                   (initial as NSString).pathExtension.utf8.elementsEqual(ext.utf8) else {
                 throw pickerError("the full suggested filename extension must remain unchanged")
             }
+            try navigateSaveDirectory(held, path, deadline, requestID)
+            _ = try verifyNewPath(path, in: held)
             try configureTimeout(field, deadlineMS: deadline)
             emit(["id": requestID, "progress": ["native_dispatch_started": true]])
             try requireSuccess(AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, name as CFString),
@@ -3014,7 +3020,7 @@ private extension AXService {
             try checkPanel(held, deadline)
             guard let actual = copyAttribute(field, kAXValueAttribute as CFString) as? String,
                   actual.utf8.elementsEqual(name.utf8) else { throw pickerError("Save As name did not match exactly") }
-            _ = try verifyNewPath(path, held)
+            _ = try verifyNewPath(path, in: held)
             target = held.controls.accept
         } else if op == "picker_open_file" {
             guard !held.saving, let path = try args.string("path") else { throw pickerError("expected an Open panel") }
