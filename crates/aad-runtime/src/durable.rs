@@ -804,39 +804,7 @@ impl JournalStore {
         ttl_seconds: f64,
         now: f64,
     ) -> Result<OwnerLease> {
-        if !(ttl_seconds.is_finite() && ttl_seconds > 0.0) {
-            return Err(JournalError::invalid(
-                "ttl_seconds must be a positive finite number",
-            ));
-        }
-        let expires_at = now + ttl_seconds;
-        self.write(|transaction| {
-            let extended = transaction.execute(
-                &format!(
-                    "UPDATE runs SET lease_expires_at = ?1, updated_at = ?2
-                 WHERE run_id = ?3 AND owner_id = ?4 AND lease_token_hash = ?5
-                   AND lease_expires_at > ?6
-                   AND status NOT IN ({TERMINAL_SQL})"
-                ),
-                params![
-                    expires_at,
-                    utc_now(),
-                    lease.run_id,
-                    lease.owner_id,
-                    token_hash(&lease.token),
-                    now
-                ],
-            )?;
-            if extended != 1 {
-                return Err(lease_lost(transaction, &lease.run_id));
-            }
-            Ok(OwnerLease {
-                run_id: lease.run_id.clone(),
-                owner_id: lease.owner_id.clone(),
-                token: lease.token.clone(),
-                expires_at,
-            })
-        })
+        self.with_owner(lease, now, |owned| owned.heartbeat(ttl_seconds))
     }
 
     /// Give up a lease so another runner can claim the run immediately.
@@ -896,36 +864,25 @@ impl JournalStore {
         expected_desired_state: Option<DesiredState>,
         now: f64,
     ) -> Result<EventRecord> {
-        let checkpoint_json = encode_json(checkpoint, "checkpoint")?;
+        self.with_owner(lease, now, |owned| {
+            owned.expect(expected_status, expected_desired_state)?;
+            owned.checkpoint(event_type, payload, checkpoint)
+        })
+    }
+
+    pub(crate) fn with_owner<T>(
+        &self,
+        lease: &OwnerLease,
+        now: f64,
+        body: impl FnOnce(&OwnedRun<'_>) -> Result<T>,
+    ) -> Result<T> {
         self.write(|transaction| {
             require_live_lease(transaction, lease, now)?;
-            require_expected_state(
+            body(&OwnedRun {
                 transaction,
-                &lease.run_id,
-                expected_status,
-                expected_desired_state,
-            )?;
-            let event = append_event(transaction, &lease.run_id, event_type, payload)?;
-            let saved = transaction.execute(
-                &format!(
-                    "UPDATE runs SET checkpoint_json = ?1, updated_at = ?2
-                 WHERE run_id = ?3 AND owner_id = ?4 AND lease_token_hash = ?5
-                   AND lease_expires_at > ?6
-                   AND status NOT IN ({TERMINAL_SQL})"
-                ),
-                params![
-                    checkpoint_json,
-                    utc_now(),
-                    lease.run_id,
-                    lease.owner_id,
-                    token_hash(&lease.token),
-                    now
-                ],
-            )?;
-            if saved != 1 {
-                return Err(lease_lost(transaction, &lease.run_id));
-            }
-            Ok(event)
+                lease,
+                now,
+            })
         })
     }
 
@@ -948,65 +905,9 @@ impl JournalStore {
         now: f64,
     ) -> Result<RunRecord> {
         validate_status_transition(expected, status, output, error)?;
-        let output_json = output.map(|v| encode_json(v, "output")).transpose()?;
-        let error_json = error.map(|v| encode_json(v, "error")).transpose()?;
-        let releases_lease = status == RunStatus::Paused || status.is_terminal();
-        let finished_at = status.is_terminal().then(utc_now);
-
-        self.write(|transaction| {
-            require_live_lease(transaction, lease, now)?;
-            require_expected_state(
-                transaction,
-                &lease.run_id,
-                Some(expected),
-                expected_desired_state,
-            )?;
-            if let Some((event_type, payload)) = event {
-                append_event(transaction, &lease.run_id, event_type, payload)?;
-            }
-            let updated = transaction.execute(
-                &format!(
-                    "UPDATE runs
-                 SET status = ?1, output_json = ?2, error_json = ?3, finished_at = ?4,
-                     updated_at = ?5,
-                     owner_id = CASE WHEN ?6 THEN NULL ELSE owner_id END,
-                     lease_token_hash = CASE WHEN ?6 THEN NULL ELSE lease_token_hash END,
-                     lease_expires_at = CASE WHEN ?6 THEN NULL ELSE lease_expires_at END
-                 WHERE run_id = ?7 AND status = ?8 AND owner_id = ?9
-                   AND lease_token_hash = ?10 AND lease_expires_at > ?11
-                   AND status NOT IN ({TERMINAL_SQL})"
-                ),
-                params![
-                    status.as_str(),
-                    output_json,
-                    error_json,
-                    finished_at,
-                    utc_now(),
-                    releases_lease,
-                    lease.run_id,
-                    expected.as_str(),
-                    lease.owner_id,
-                    token_hash(&lease.token),
-                    now
-                ],
-            )?;
-            if updated != 1 {
-                let run = read_run(transaction, &lease.run_id)?;
-                return Err(if run.is_terminal() {
-                    JournalError::InvalidTransition(format!(
-                        "terminal run {} is immutable ({})",
-                        lease.run_id,
-                        run.status.as_str()
-                    ))
-                } else {
-                    JournalError::Conflict(format!(
-                        "run status changed concurrently: expected {}, found {}",
-                        expected.as_str(),
-                        run.status.as_str()
-                    ))
-                });
-            }
-            read_run(transaction, &lease.run_id)
+        self.with_owner(lease, now, |owned| {
+            owned.expect(Some(expected), expected_desired_state)?;
+            owned.set_status(expected, status, event, output, error)
         })
     }
 
@@ -1084,6 +985,187 @@ impl JournalStore {
             require_live_lease(transaction, lease, now)?;
             read_run(transaction, &lease.run_id)
         })
+    }
+}
+
+/// Operations on a run after validating its bearer token under BEGIN IMMEDIATE.
+pub(crate) struct OwnedRun<'a> {
+    transaction: &'a Transaction<'a>,
+    lease: &'a OwnerLease,
+    now: f64,
+}
+
+impl OwnedRun<'_> {
+    pub(crate) fn heartbeat(&self, ttl_seconds: f64) -> Result<OwnerLease> {
+        let Self {
+            transaction,
+            lease,
+            now,
+        } = *self;
+        if !(ttl_seconds.is_finite() && ttl_seconds > 0.0) {
+            return Err(JournalError::invalid(
+                "ttl_seconds must be a positive finite number",
+            ));
+        }
+        let expires_at = now + ttl_seconds;
+        let extended = transaction.execute(
+            &format!(
+                "UPDATE runs SET lease_expires_at = ?1, updated_at = ?2
+                 WHERE run_id = ?3 AND owner_id = ?4 AND lease_token_hash = ?5
+                   AND lease_expires_at > ?6
+                   AND status NOT IN ({TERMINAL_SQL})"
+            ),
+            params![
+                expires_at,
+                utc_now(),
+                lease.run_id,
+                lease.owner_id,
+                token_hash(&lease.token),
+                now
+            ],
+        )?;
+        if extended != 1 {
+            return Err(lease_lost(transaction, &lease.run_id));
+        }
+        Ok(OwnerLease {
+            run_id: lease.run_id.clone(),
+            owner_id: lease.owner_id.clone(),
+            token: lease.token.clone(),
+            expires_at,
+        })
+    }
+
+    pub(crate) fn clear_pause(&self) -> Result<()> {
+        let changed = self.transaction.execute(
+            "UPDATE runs SET desired_state = 'run', updated_at = ?1 WHERE run_id = ?2 AND desired_state = 'pause'",
+            params![utc_now(), self.lease.run_id],
+        )?;
+        if changed != 1 {
+            return Err(JournalError::Conflict(
+                "resume requires a standing pause".into(),
+            ));
+        }
+        append_event(
+            self.transaction,
+            &self.lease.run_id,
+            "run.resume_requested",
+            &serde_json::json!({"fromDesiredState": "pause", "toDesiredState": "run"}),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn record(&self) -> Result<RunRecord> {
+        read_run(self.transaction, &self.lease.run_id)
+    }
+
+    pub(crate) fn expect(
+        &self,
+        status: Option<RunStatus>,
+        desired: Option<DesiredState>,
+    ) -> Result<DesiredState> {
+        require_expected_state(self.transaction, &self.lease.run_id, status, desired)
+    }
+
+    pub(crate) fn checkpoint(
+        &self,
+        event_type: &str,
+        payload: &Value,
+        checkpoint: &Value,
+    ) -> Result<EventRecord> {
+        let checkpoint_json = encode_json(checkpoint, "checkpoint")?;
+        let Self {
+            transaction,
+            lease,
+            now,
+        } = *self;
+        let event = append_event(transaction, &lease.run_id, event_type, payload)?;
+        let saved = transaction.execute(
+            &format!(
+                "UPDATE runs SET checkpoint_json = ?1, updated_at = ?2
+                 WHERE run_id = ?3 AND owner_id = ?4 AND lease_token_hash = ?5
+                   AND lease_expires_at > ?6
+                   AND status NOT IN ({TERMINAL_SQL})"
+            ),
+            params![
+                checkpoint_json,
+                utc_now(),
+                lease.run_id,
+                lease.owner_id,
+                token_hash(&lease.token),
+                now
+            ],
+        )?;
+        if saved != 1 {
+            return Err(lease_lost(transaction, &lease.run_id));
+        }
+        Ok(event)
+    }
+
+    pub(crate) fn set_status(
+        &self,
+        expected: RunStatus,
+        status: RunStatus,
+        event: Option<(&str, &Value)>,
+        output: Option<&Value>,
+        error: Option<&Value>,
+    ) -> Result<RunRecord> {
+        let Self {
+            transaction,
+            lease,
+            now,
+        } = *self;
+        validate_status_transition(expected, status, output, error)?;
+        let output_json = output.map(|v| encode_json(v, "output")).transpose()?;
+        let error_json = error.map(|v| encode_json(v, "error")).transpose()?;
+        let releases_lease = status == RunStatus::Paused || status.is_terminal();
+        let finished_at = status.is_terminal().then(utc_now);
+
+        if let Some((event_type, payload)) = event {
+            append_event(transaction, &lease.run_id, event_type, payload)?;
+        }
+        let updated = transaction.execute(
+            &format!(
+                "UPDATE runs
+                 SET status = ?1, output_json = ?2, error_json = ?3, finished_at = ?4,
+                     updated_at = ?5,
+                     owner_id = CASE WHEN ?6 THEN NULL ELSE owner_id END,
+                     lease_token_hash = CASE WHEN ?6 THEN NULL ELSE lease_token_hash END,
+                     lease_expires_at = CASE WHEN ?6 THEN NULL ELSE lease_expires_at END
+                 WHERE run_id = ?7 AND status = ?8 AND owner_id = ?9
+                   AND lease_token_hash = ?10 AND lease_expires_at > ?11
+                   AND status NOT IN ({TERMINAL_SQL})"
+            ),
+            params![
+                status.as_str(),
+                output_json,
+                error_json,
+                finished_at,
+                utc_now(),
+                releases_lease,
+                lease.run_id,
+                expected.as_str(),
+                lease.owner_id,
+                token_hash(&lease.token),
+                now
+            ],
+        )?;
+        if updated != 1 {
+            let run = read_run(transaction, &lease.run_id)?;
+            return Err(if run.is_terminal() {
+                JournalError::InvalidTransition(format!(
+                    "terminal run {} is immutable ({})",
+                    lease.run_id,
+                    run.status.as_str()
+                ))
+            } else {
+                JournalError::Conflict(format!(
+                    "run status changed concurrently: expected {}, found {}",
+                    expected.as_str(),
+                    run.status.as_str()
+                ))
+            });
+        }
+        read_run(transaction, &lease.run_id)
     }
 }
 
@@ -1271,7 +1353,7 @@ fn require_expected_state(
     run_id: &str,
     status: Option<RunStatus>,
     desired_state: Option<DesiredState>,
-) -> Result<()> {
+) -> Result<DesiredState> {
     let row: Option<(String, String)> = transaction
         .query_row(
             "SELECT status, desired_state FROM runs WHERE run_id = ?1",
@@ -1298,7 +1380,7 @@ fn require_expected_state(
             )));
         }
     }
-    Ok(())
+    DesiredState::parse(&actual_desired)
 }
 
 /// Distinguish a lost lease from an immutable terminal run.

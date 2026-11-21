@@ -104,12 +104,6 @@ impl TempDir {
     fn open(&self) -> JournalStore {
         JournalStore::open(self.journal_path()).expect("open journal")
     }
-
-    /// Open with an explicit busy timeout, for tests that deliberately contend
-    /// for the write lock and need to control who loses.
-    fn open_with_timeout(&self, busy_timeout_ms: u32) -> JournalStore {
-        JournalStore::open_with_timeout(self.journal_path(), busy_timeout_ms).expect("open journal")
-    }
 }
 
 impl Drop for TempDir {
@@ -947,95 +941,46 @@ fn storm_round(round: usize) -> bool {
         )
         .expect("create");
 
-    // Open every connection this test needs *before* the storm starts. Opening
-    // a journal validates its pragmas, which needs the write lock; doing that
-    // under a write storm fails on lock contention and says nothing about
-    // intent handling.
-    // The runner waits far longer for the write lock than the storm does. A
-    // storm that starves the runner *inside* a segment leaves the run
-    // genuinely unrecoverable -- a dispatched step whose outcome is unknown is
-    // correctly refused rather than silently repeated -- and no retry can undo
-    // that. Losing those races must fall on the storm, which is scenery, not on
-    // the runner, which is the subject. The flips still land in the same
-    // microsecond windows either way.
-    let executor = DurableExecutor::new(temp.open_with_timeout(30_000));
-    let control = temp.open_with_timeout(50);
-
+    let executor = DurableExecutor::new(temp.open());
+    let control = temp.open();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flipping = {
         let stop = stop.clone();
         std::thread::spawn(move || {
-            // Both directions, as fast as the journal will take them. Every
-            // outcome is legitimate here -- the run may be terminal, or the
-            // intent may already be what we are asking for -- so failures are
-            // deliberately ignored; the runner's behaviour is what is on test.
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = control.compare_and_set_desired_state(
-                    "run-1",
-                    DesiredState::Run,
-                    DesiredState::Pause,
-                    None,
-                );
-                let _ = control.compare_and_set_desired_state(
-                    "run-1",
-                    DesiredState::Pause,
-                    DesiredState::Run,
-                    None,
-                );
-                // Yield rather than sleep: the window being aimed at is only a
-                // few microseconds wide, and sleeping steps right over it.
+                for (from, to) in [
+                    (DesiredState::Run, DesiredState::Pause),
+                    (DesiredState::Pause, DesiredState::Run),
+                ] {
+                    match control.compare_and_set_desired_state("run-1", from, to, None) {
+                        Ok(record) => assert_eq!(record.desired_state, to),
+                        Err(aad_runtime::durable::JournalError::Conflict(_)) => {}
+                        Err(aad_runtime::durable::JournalError::InvalidTransition(_)) => {
+                            assert!(control.get_run("run-1").unwrap().is_terminal());
+                            return;
+                        }
+                        Err(error) => panic!("control write failed: {error}"),
+                    }
+                }
                 std::thread::yield_now();
             }
         })
     };
 
-    // Drive to a terminal state, resuming through every pause the storm causes.
-    //
-    // The storm is deliberately more aggressive than any real operator, so it
-    // can also exhaust SQLite's own write locks. That is this harness competing
-    // with itself, not the behaviour under test, so it is retried. What is never
-    // tolerated is `JOURNAL.CONFLICT`: that would mean a request the journal
-    // granted came back to the caller as an error.
-    let attempt = |first: bool| {
-        // A storage failure is not necessarily a failure to *start*: the
-        // attempt may have moved the run out of `pending` before losing the
-        // write lock. Retrying `execute` then reports the run is already
-        // running -- a harness bug that looks like a product failure. So once
-        // the run has started, retries resume instead.
-        let mut starting = first;
-        loop {
-            let result = if starting {
-                executor.execute(&descriptor, "run-1", DurableOptions::default())
-            } else {
-                executor.resume(&descriptor, "run-1", DurableOptions::default())
-            };
-            match result {
-                Ok(outcome) => return outcome,
-                Err(error) => {
-                    assert_ne!(
-                        error.code, "JOURNAL.CONFLICT",
-                        "a granted pause must stop the run, not fail it: {error:?}"
-                    );
-                    if starting && error.code == "DURABLE.INVALID_STATE" {
-                        starting = false;
-                        continue;
-                    }
-                    assert_eq!(
-                        error.code, "JOURNAL.STORAGE_FAILED",
-                        "unexpected failure: {error:?}"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-            }
-        }
-    };
-
-    let mut outcome = attempt(true);
+    let mut outcome = executor
+        .execute(&descriptor, "run-1", DurableOptions::default())
+        .expect("execute under contention");
     let mut legs = 1;
     while outcome.stopped == Stopped::Paused {
-        assert!(legs < 200, "resuming should make progress, not spin");
+        assert!(
+            legs < 200,
+            "resuming should make progress, not spin: {:?}",
+            store.list_recent_events("run-1", 12)
+        );
         legs += 1;
-        outcome = attempt(false);
+        outcome = executor
+            .resume(&descriptor, "run-1", DurableOptions::default())
+            .expect("resume under contention");
     }
 
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1063,23 +1008,40 @@ fn storm_round(round: usize) -> bool {
         outcome.run.output.as_ref().expect("output")["total"],
         json!(40)
     );
-    let entered: Vec<String> = store
-        .list_events("run-1", 0, 5000)
-        .expect("events")
-        .into_iter()
-        .filter(|event| event.event_type == "run.segment_entered")
-        .map(|event| {
-            event.payload["stepId"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()
+    // Independent readback of the complete ordered dispatch/exit stream.
+    let raw = rusqlite::Connection::open(temp.journal_path()).unwrap();
+    let mut statement = raw.prepare("SELECT event_type, payload_json FROM events
+        WHERE run_id = 'run-1' AND event_type IN ('run.segment_entered','run.segment_exited') ORDER BY seq").unwrap();
+    let observed: Vec<(String, String)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let expected: Vec<_> = (0..40)
+        .flat_map(|index| {
+            ["run.segment_entered", "run.segment_exited"].map(|kind| {
+                (
+                    kind.to_owned(),
+                    json!({"stepId": format!("step{index}")}).to_string(),
+                )
+            })
         })
         .collect();
-    let mut unique = entered.clone();
-    unique.sort();
-    unique.dedup();
-    assert_eq!(entered.len(), 40, "every step ran");
-    assert_eq!(unique.len(), 40, "and none ran twice: {entered:?}");
+    assert_eq!(observed, expected);
+    assert_eq!(
+        store
+            .list_recent_events("run-1", 4)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.event_type)
+            .collect::<Vec<_>>(),
+        [
+            "run.finalization_intent",
+            "run.finalization_started",
+            "run.finalization_completed",
+            "run.finished"
+        ]
+    );
 
     legs > 1
 }

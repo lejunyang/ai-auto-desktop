@@ -151,6 +151,13 @@ struct FinalizedRun {
     executed_steps: u64,
 }
 
+/// Decision made under the same lease and writer lock as dispatch.
+enum Dispatch {
+    Authorized,
+    Paused(Box<RunRecord>),
+    Cancelled,
+}
+
 impl Default for DurableOptions {
     fn default() -> Self {
         Self {
@@ -424,6 +431,8 @@ impl DurableExecutor {
         // stops two runners from both deciding what to do with the same run.
         let lease = self.claim(run_id, &options)?;
 
+        let run = self.journal.get_run(run_id).map_err(journal_error)?;
+
         // Record the takeover before deciding anything, so the audit trail names
         // the new owner even when the decision is "this cannot be continued".
         // Writing it only on the resumable path would leave the most alarming
@@ -456,7 +465,7 @@ impl DurableExecutor {
         // runner or provider is needed, and cleanup must not be replayed.
         if finalization == Some(FinalizationStage::Result) {
             let result = decode_finalized_run(&raw, state.executed_steps)?;
-            return self.commit_finalized(run_id, lease, result);
+            return self.commit_finalized(lease, result);
         }
         // Once cleanup may have started, its effect is as unknowable as an
         // interrupted body step. A concurrent cancel must not disguise that.
@@ -478,36 +487,6 @@ impl DurableExecutor {
             return self.finalize_cancelled(run_id, lease, "cancelled before resuming");
         }
 
-        // Asking to resume is asking to run, so clear a standing pause request.
-        let run = if run.desired_state == DesiredState::Pause {
-            match self.journal.compare_and_set_desired_state(
-                run_id,
-                DesiredState::Pause,
-                DesiredState::Run,
-                Some((
-                    "run.resume_requested",
-                    &json!({
-                        "fromDesiredState": DesiredState::Pause.as_str(),
-                        "toDesiredState": DesiredState::Run.as_str(),
-                    }),
-                )),
-            ) {
-                Ok(run) => run,
-                // Losing this CAS means somebody else cleared the pause between
-                // the read above and this write. The point was for the run not
-                // to be paused, and it is not paused -- so failing here would
-                // report an error for the state the caller asked for and got.
-                // Re-read and carry on; a cancel that arrived instead is still
-                // honoured at the next boundary, where it is checked anyway.
-                Err(JournalError::Conflict(_)) => {
-                    self.journal.get_run(run_id).map_err(journal_error)?
-                }
-                Err(error) => return Err(journal_error(error)),
-            }
-        } else {
-            run
-        };
-
         let run_options = RunOptions::default()
             .with_inputs(as_map(&run.inputs))
             .with_base_directory(options.base_directory.clone())
@@ -516,24 +495,28 @@ impl DurableExecutor {
         preflight_actions(descriptor, &options)?;
         let mut segmented = Segmented::restore(descriptor, &run_options, deadline, state)?;
 
-        let running = if run.status == RunStatus::Paused {
-            self.journal
-                .set_status(
-                    &lease,
-                    RunStatus::Paused,
-                    RunStatus::Running,
-                    Some(("run.resumed", &json!({"ownerId": options.owner_id}))),
-                    None,
-                    None,
-                    None,
-                    durable::now_seconds(),
-                )
-                .map_err(journal_error)?
-        } else {
-            // Already `running` on paper: its previous runner died without
-            // releasing the lease, which we took over above.
-            self.journal.get_run(run_id).map_err(journal_error)?
-        };
+        // Clear a standing pause and resume from the validated checkpoint as
+        // one fenced transition. An intervening cancel remains absorbing.
+        let running = self
+            .journal
+            .with_owner(&lease, durable::now_seconds(), |owned| {
+                let current = owned.record()?;
+                if current.desired_state == DesiredState::Pause {
+                    owned.clear_pause()?;
+                }
+                if current.status == RunStatus::Paused {
+                    owned.set_status(
+                        RunStatus::Paused,
+                        RunStatus::Running,
+                        Some(("run.resumed", &json!({"ownerId": options.owner_id}))),
+                        None,
+                        None,
+                    )
+                } else {
+                    owned.record()
+                }
+            })
+            .map_err(journal_error)?;
 
         if finalization == Some(FinalizationStage::Intent) {
             let intent = decode_finalization_intent(&raw)?;
@@ -543,14 +526,7 @@ impl DurableExecutor {
                     "successful finalization intent still has unexecuted steps",
                 ));
             }
-            return self.finalize_prepared(
-                &digest,
-                &running.run_id,
-                lease,
-                &mut segmented,
-                deadline,
-                intent,
-            );
+            return self.finalize_prepared(&digest, lease, &mut segmented, deadline, intent);
         }
         if running.desired_state == DesiredState::Cancel {
             return self.finalize_body(
@@ -623,41 +599,39 @@ impl DurableExecutor {
         &self,
         digest: &str,
         mut run: RunRecord,
-        mut lease: OwnerLease,
+        lease: OwnerLease,
         segmented: &mut Segmented<'_>,
         deadline: f64,
         options: &DurableOptions,
     ) -> Result<DurableOutcome, AutomationError> {
         loop {
-            // Renew before each segment. If the lease has gone the run belongs
-            // to somebody else now and this process must stop writing.
-            lease = self
-                .journal
-                .heartbeat_owner(&lease, options.lease_ttl_seconds, durable::now_seconds())
-                .map_err(journal_error)?;
-
-            // Re-read intent at the boundary. This is the only place a pause or
-            // cancel can be honoured while the state is known and recorded.
-            let current = self.journal.get_run(&run.run_id).map_err(journal_error)?;
-            match current.desired_state {
-                DesiredState::Pause => {
-                    return self.honour_pause(digest, lease, segmented, deadline);
+            // A dispatch checks control intent in its checkpoint transaction.
+            // Empty bodies and action preparation also need a safe point before
+            // finalization or preparing a provider invocation.
+            if segmented
+                .next_step()
+                .is_none_or(|step| step.step_type == aad_core::model::StepType::Action)
+            {
+                let current = self.journal.get_run(&run.run_id).map_err(journal_error)?;
+                match current.desired_state {
+                    DesiredState::Pause => {
+                        return self.honour_pause(digest, lease, segmented, deadline);
+                    }
+                    DesiredState::Cancel => {
+                        // Nothing is in flight here. Preserve ordinary runtime
+                        // semantics by running workflow-level cleanup durably.
+                        return self.finalize_body(
+                            digest,
+                            lease,
+                            segmented,
+                            deadline,
+                            Err(cancelled_error("cancelled at a segment boundary")),
+                        );
+                    }
+                    DesiredState::Run => {}
                 }
-                DesiredState::Cancel => {
-                    // Nothing is in flight here. Preserve ordinary runtime
-                    // semantics by running workflow-level cleanup durably.
-                    return self.finalize_body(
-                        digest,
-                        lease,
-                        segmented,
-                        deadline,
-                        Err(cancelled_error("cancelled at a segment boundary")),
-                    );
-                }
-                DesiredState::Run => {}
+                run = current;
             }
-            run = current;
-
             let Some(step_id) = segmented.next_step_id().map(str::to_string) else {
                 return self.finalize_body(digest, lease, segmented, deadline, Ok(()));
             };
@@ -676,40 +650,33 @@ impl DurableExecutor {
             // Requiring `desired_state = run` here is what makes this write the
             // dispatch authorisation: a pause or cancel that arrived since the
             // read above must not be overtaken by a step going out anyway.
-            let dispatched = self.journal.append_event_with_checkpoint(
+            match self.authorize_dispatch(
                 &lease,
                 "run.segment_entered",
                 &json!({"stepId": step_id}),
                 &encode_checkpoint(digest, Phase::InStep, deadline, &segmented.snapshot()),
-                Some(RunStatus::Running),
-                Some(DesiredState::Run),
-                durable::now_seconds(),
-            );
-            if let Err(JournalError::Conflict(_)) = &dispatched {
-                // Losing that CAS is the mechanism working, not a fault: an
-                // operator asked to stop in the window between the read above and
-                // this write. Route into the control path rather than failing the
-                // run -- the request was granted, so reporting an error would be a
-                // lie, and no step has been dispatched.
-                let current = self.journal.get_run(&run.run_id).map_err(journal_error)?;
-                match current.desired_state {
-                    DesiredState::Pause => {
-                        return self.honour_pause(digest, lease, segmented, deadline);
-                    }
-                    DesiredState::Cancel => {
-                        return self.finalize_cancelled(
-                            &run.run_id,
-                            lease,
+                &step_id,
+                options.lease_ttl_seconds,
+            )? {
+                Dispatch::Authorized => {}
+                Dispatch::Paused(run) => {
+                    return Ok(DurableOutcome {
+                        run: *run,
+                        stopped: Stopped::Paused,
+                    })
+                }
+                Dispatch::Cancelled => {
+                    return self.finalize_body(
+                        digest,
+                        lease,
+                        segmented,
+                        deadline,
+                        Err(cancelled_error(
                             "cancelled before the next segment was dispatched",
-                        );
-                    }
-                    // Intent is unchanged, so the conflict was about something
-                    // else -- a status this process no longer agrees with. Not
-                    // ours to absorb.
-                    DesiredState::Run => {}
+                        )),
+                    )
                 }
             }
-            dispatched.map_err(journal_error)?;
 
             let outcome = segmented.run_segment();
             let progressed = match outcome {
@@ -745,6 +712,41 @@ impl DurableExecutor {
         }
     }
 
+    /// Decide once under the write lock. On pause the previous boundary (or
+    /// persisted action intent) is already the correct recovery checkpoint.
+    fn authorize_dispatch(
+        &self,
+        lease: &OwnerLease,
+        event_type: &str,
+        payload: &Value,
+        checkpoint: &Value,
+        step_id: &str,
+        ttl_seconds: f64,
+    ) -> Result<Dispatch, AutomationError> {
+        self.journal
+            .with_owner(lease, durable::now_seconds(), |owned| {
+                match owned.expect(Some(RunStatus::Running), None)? {
+                    DesiredState::Run => {
+                        owned.heartbeat(ttl_seconds)?;
+                        owned.checkpoint(event_type, payload, checkpoint)?;
+                        Ok(Dispatch::Authorized)
+                    }
+                    DesiredState::Pause => {
+                        let run = owned.set_status(
+                            RunStatus::Running,
+                            RunStatus::Paused,
+                            Some(("run.paused", &json!({"nextStepId": step_id}))),
+                            None,
+                            None,
+                        )?;
+                        Ok(Dispatch::Paused(Box::new(run)))
+                    }
+                    DesiredState::Cancel => Ok(Dispatch::Cancelled),
+                }
+            })
+            .map_err(journal_error)
+    }
+
     fn dispatch_read_only_action(
         &self,
         digest: &str,
@@ -771,32 +773,31 @@ impl DurableExecutor {
         let state = segmented.reserve_action_attempt()?;
         let operation_id = uuid::Uuid::new_v4().simple().to_string();
         let checkpoint = encode_action_intent(digest, deadline, &state, &prepared, &operation_id);
-        let persisted = self.journal.append_event_with_checkpoint(
+        match self.authorize_dispatch(
             &lease,
             "run.action_intent",
             &json!({"stepId": prepared.step.id, "operationId": operation_id}),
             &checkpoint,
-            Some(RunStatus::Running),
-            Some(DesiredState::Run),
-            durable::now_seconds(),
-        );
-        if let Err(JournalError::Conflict(_)) = persisted {
-            segmented.release_action_attempt()?;
-            let current = self.journal.get_run(&run.run_id).map_err(journal_error)?;
-            return match current.desired_state {
-                DesiredState::Pause => self.honour_pause(digest, lease, segmented, deadline),
-                DesiredState::Cancel => self.finalize_cancelled(
+            &prepared.step.id,
+            options.lease_ttl_seconds,
+        )? {
+            Dispatch::Authorized => {}
+            Dispatch::Paused(run) => {
+                segmented.release_action_attempt()?;
+                return Ok(DurableOutcome {
+                    run: *run,
+                    stopped: Stopped::Paused,
+                });
+            }
+            Dispatch::Cancelled => {
+                segmented.release_action_attempt()?;
+                return self.finalize_cancelled(
                     &run.run_id,
                     lease,
                     "cancelled before a read-only action was dispatched",
-                ),
-                DesiredState::Run => Err(durable_error(
-                    "DURABLE.STATE_CONFLICT",
-                    "action dispatch authorization lost its expected state",
-                )),
-            };
+                );
+            }
         }
-        persisted.map_err(journal_error)?;
         self.authorize_and_run_action(
             digest, run, lease, segmented, deadline, options, prepared, checkpoint,
         )
@@ -815,49 +816,29 @@ impl DurableExecutor {
         checkpoint: Value,
     ) -> Result<DurableOutcome, AutomationError> {
         let operation_id = checkpoint["actionIntent"]["operationId"].clone();
-        let authorized = self.journal.append_event_with_checkpoint(
+        match self.authorize_dispatch(
             &lease,
             "run.action_dispatch_authorized",
             &json!({"stepId": prepared.step.id, "operationId": operation_id}),
             &checkpoint,
-            Some(RunStatus::Running),
-            Some(DesiredState::Run),
-            durable::now_seconds(),
-        );
-        if let Err(JournalError::Conflict(_)) = authorized {
-            let current = self.journal.get_run(&run.run_id).map_err(journal_error)?;
-            return match current.desired_state {
-                DesiredState::Pause => {
-                    let paused = self
-                        .journal
-                        .set_status(
-                            &lease,
-                            RunStatus::Running,
-                            RunStatus::Paused,
-                            Some(("run.paused", &json!({"nextStepId": prepared.step.id}))),
-                            None,
-                            None,
-                            Some(DesiredState::Pause),
-                            durable::now_seconds(),
-                        )
-                        .map_err(journal_error)?;
-                    Ok(DurableOutcome {
-                        run: paused,
-                        stopped: Stopped::Paused,
-                    })
-                }
-                DesiredState::Cancel => self.finalize_cancelled(
+            &prepared.step.id,
+            options.lease_ttl_seconds,
+        )? {
+            Dispatch::Authorized => {}
+            Dispatch::Paused(run) => {
+                return Ok(DurableOutcome {
+                    run: *run,
+                    stopped: Stopped::Paused,
+                })
+            }
+            Dispatch::Cancelled => {
+                return self.finalize_cancelled(
                     &run.run_id,
                     lease,
                     "cancelled before a read-only action was dispatched",
-                ),
-                DesiredState::Run => Err(durable_error(
-                    "DURABLE.STATE_CONFLICT",
-                    "action dispatch authorization lost its expected state",
-                )),
-            };
+                )
+            }
         }
-        authorized.map_err(journal_error)?;
 
         let result = self.invoke_with_lease_heartbeat(segmented, &prepared, &lease, options);
         lease = self
@@ -1072,14 +1053,12 @@ impl DurableExecutor {
         body: Result<(), AutomationError>,
     ) -> Result<DurableOutcome, AutomationError> {
         let intent = segmented.prepare_finalization(body);
-        let run_id = lease.run_id.clone();
-        self.finalize_prepared(digest, &run_id, lease, segmented, deadline, intent)
+        self.finalize_prepared(digest, lease, segmented, deadline, intent)
     }
 
     fn finalize_prepared(
         &self,
         digest: &str,
-        run_id: &str,
         lease: OwnerLease,
         segmented: &mut Segmented<'_>,
         deadline: f64,
@@ -1128,103 +1107,66 @@ impl DurableExecutor {
         let finalized = finalized_run(&result);
         let result_checkpoint =
             encode_finalization_result(digest, deadline, &segmented.snapshot(), &finalized);
-        let completed = self.journal.append_event_with_checkpoint(
-            &lease,
-            "run.finalization_completed",
-            &json!({"status": finalized.status.as_str()}),
-            &result_checkpoint,
-            Some(RunStatus::Running),
-            Some(DesiredState::Run),
-            durable::now_seconds(),
-        );
-        if let Err(JournalError::Conflict(_)) = completed {
-            // A pause/cancel can arrive after cleanup has completed. Persist the
-            // definitive result before applying that intent, so a later resume
-            // never repeats cleanup.
-            self.journal
-                .append_event_with_checkpoint(
-                    &lease,
-                    "run.finalization_completed",
-                    &json!({"status": finalized.status.as_str()}),
-                    &result_checkpoint,
-                    Some(RunStatus::Running),
-                    None,
-                    durable::now_seconds(),
-                )
-                .map_err(journal_error)?;
-        } else {
-            completed.map_err(journal_error)?;
-        }
-        self.commit_finalized(run_id, lease, finalized)
+        self.journal
+            .append_event_with_checkpoint(
+                &lease,
+                "run.finalization_completed",
+                &json!({"status": finalized.status.as_str()}),
+                &result_checkpoint,
+                Some(RunStatus::Running),
+                None,
+                durable::now_seconds(),
+            )
+            .map_err(journal_error)?;
+        self.commit_finalized(lease, finalized)
     }
 
     fn commit_finalized(
         &self,
-        run_id: &str,
         lease: OwnerLease,
         finalized: FinalizedRun,
     ) -> Result<DurableOutcome, AutomationError> {
-        for _ in 0..16 {
-            let current = self.journal.get_run(run_id).map_err(journal_error)?;
-            if current.is_terminal() {
-                return Err(durable_error(
-                    "DURABLE.ALREADY_TERMINAL",
-                    format!(
-                        "run {run_id} already finished as {}",
-                        current.status.as_str()
-                    ),
-                ));
-            }
-
-            let (status, output, error, event_type, payload) = if current.desired_state
-                == DesiredState::Cancel
-                && finalized.status == RunStatus::Succeeded
-            {
-                let error =
-                    cancelled_error("cancelled after workflow finalization completed").to_json();
-                (
-                    RunStatus::Cancelled,
-                    None,
-                    Some(error),
-                    "run.cancelled",
-                    json!({"reason": "cancelled after workflow finalization completed"}),
-                )
-            } else {
-                (
-                    finalized.status,
-                    finalized.output.clone(),
-                    finalized.error.clone(),
-                    "run.finished",
-                    json!({
-                        "status": finalized.status.as_str(),
-                        "executedSteps": finalized.executed_steps,
-                    }),
-                )
-            };
-            match self.journal.set_status(
-                &lease,
-                current.status,
-                status,
-                Some((event_type, &payload)),
-                output.as_ref(),
-                error.as_ref(),
-                Some(current.desired_state),
-                durable::now_seconds(),
-            ) {
-                Ok(run) => {
-                    return Ok(DurableOutcome {
-                        run,
-                        stopped: Stopped::Finished,
-                    });
-                }
-                Err(JournalError::Conflict(_)) => continue,
-                Err(error) => return Err(journal_error(error)),
-            }
-        }
-        Err(durable_error(
-            "DURABLE.STATE_CONFLICT",
-            "control state did not stabilize during terminal commit",
-        ))
+        self.journal
+            .with_owner(&lease, durable::now_seconds(), |owned| {
+                let current = owned.record()?;
+                let (status, output, error, event_type, payload) = if current.desired_state
+                    == DesiredState::Cancel
+                    && finalized.status == RunStatus::Succeeded
+                {
+                    let error = cancelled_error("cancelled after workflow finalization completed")
+                        .to_json();
+                    (
+                        RunStatus::Cancelled,
+                        None,
+                        Some(error),
+                        "run.cancelled",
+                        json!({"reason": "cancelled after workflow finalization completed"}),
+                    )
+                } else {
+                    (
+                        finalized.status,
+                        finalized.output.clone(),
+                        finalized.error.clone(),
+                        "run.finished",
+                        json!({
+                            "status": finalized.status.as_str(),
+                            "executedSteps": finalized.executed_steps,
+                        }),
+                    )
+                };
+                let run = owned.set_status(
+                    current.status,
+                    status,
+                    Some((event_type, &payload)),
+                    output.as_ref(),
+                    error.as_ref(),
+                )?;
+                Ok(DurableOutcome {
+                    run,
+                    stopped: Stopped::Finished,
+                })
+            })
+            .map_err(journal_error)
     }
 
     /// Finalise a run whose in-flight effect cannot be established.
