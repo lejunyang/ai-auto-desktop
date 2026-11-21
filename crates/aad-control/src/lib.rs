@@ -185,6 +185,18 @@ pub trait Backend: Send + Sync {
         ))
     }
     fn resources(&self, timeout: Duration) -> Result<Vec<BackendResource>>;
+    fn live_popup_opener(
+        &self,
+        _child: &Value,
+        _opener: &Value,
+        _url: Option<&str>,
+        _context: &Context,
+    ) -> Result<bool> {
+        Err(error(
+            "CONTROL.ACTION_UNSUPPORTED",
+            "this provider cannot verify a live popup opener",
+        ))
+    }
     fn observe(&self, selector: &Value, max_nodes: usize, timeout: Duration) -> Result<Value>;
     fn observe_scope(
         &self,
@@ -836,6 +848,30 @@ impl Session {
             self.backends[&item.resource.provider].clone(),
             item.selector,
         ))
+    }
+
+    /// Confirm a discovered popup against the two listed, granted resources.
+    pub fn live_popup_opener(
+        &self,
+        child: &str,
+        opener: &str,
+        url: Option<&str>,
+        deadline: Instant,
+        stop: &aad_runtime::CancellationToken,
+    ) -> Result<bool> {
+        let (backend, child) = self.readable(child)?;
+        let (parent_backend, opener) = self.readable(opener)?;
+        if backend.name() != parent_backend.name() || self.policy.resources.is_some() {
+            return Err(error(
+                "POLICY.DENIED",
+                "popup is outside this session's grant",
+            ));
+        }
+        let context = Context {
+            cancellation: stop.clone(),
+            ..Context::new(deadline.saturating_duration_since(Instant::now()), false)
+        };
+        backend.live_popup_opener(&child, &opener, url, &context)
     }
 
     /// Cookies (values only under the operator's grant) and localStorage keys

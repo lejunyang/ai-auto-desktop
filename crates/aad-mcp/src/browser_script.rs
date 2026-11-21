@@ -37,7 +37,7 @@ pub struct Script {
 pub fn tool() -> Tool {
     Tool {
         name: NAME,
-        description: "Run synchronous JavaScript starting on one observed resource selected by resource_id or exact url. Use page.observe, present, read, fields, table, collect, wait, click, fill, key, scroll and act. In Chromium, page.openPopup(locator, exactUrl?) clicks and binds to one new popup opened by the bound frame; page.returnToOpener() restores that frame. Popup switching is unavailable with explicit resource grants. page.chooseFiles(locator, files) selects files through an upload button; page.upload sets a file input directly. In a session-launched Chromium, page.downloadExport({task_id,trigger,expected}) verifies a task download and returns its preserved file path and digest. Pass JSON in inputs and return JSON. Writes need the server's input grant; file selection also needs an allowed upload directory.",
+        description: "Run synchronous JavaScript starting on one observed resource selected by resource_id or exact url. Use page.observe, present, read, fields, table, collect, wait, click, fill, key, scroll and act. In Chromium and Firefox, page.openPopup(locator, exactUrl?) clicks and binds to one new popup opened by the bound frame; page.returnToOpener() restores that frame. Popup switching is unavailable with explicit resource grants. page.chooseFiles(locator, files) selects files through an upload button; page.upload sets a file input directly. In a session-launched Chromium, page.downloadExport({task_id,trigger,expected}) verifies a task download and returns its preserved file path and digest. Pass JSON in inputs and return JSON. Writes need the server's input grant; file selection also needs an allowed upload directory.",
         schema: json!({"type":"object","additionalProperties":false,"required":["source"],
             "oneOf":[{"required":["resource_id"]},{"required":["url"]}],
             "properties":{"source":{"type":"string","maxLength":SOURCE_LIMIT},
@@ -101,10 +101,11 @@ struct Page {
 
 impl Page {
     fn pages(&self) -> Result<Vec<Value>> {
+        let provider = if self.chromium { CDP } else { BIDI };
         let listing = self.request(Operation::Targets {
-            provider: Some(CDP.into()),
+            provider: Some(provider.into()),
         })?;
-        if let Some(error) = listing["unavailable"].get(CDP) {
+        if let Some(error) = listing["unavailable"].get(provider) {
             return Err(error.clone());
         }
         listing["resources"]
@@ -114,12 +115,6 @@ impl Page {
     }
 
     fn open_popup(&mut self, locator: Locator, url: Option<String>) -> Result<Value> {
-        if !self.chromium {
-            return Err(failure(
-                "BROWSER.SCRIPT_INVALID",
-                "openPopup requires a Chromium opener",
-            ));
-        }
         if self.session.policy().resources.is_some() {
             return Err(failure(
                 "POLICY.DENIED",
@@ -175,7 +170,7 @@ impl Page {
         let mut candidate = None;
         loop {
             let available = self.pages()?;
-            let mut matches = available.iter().filter(|item| {
+            let matches = available.iter().filter(|item| {
                 let child = &item["metadata"];
                 child["main_frame"] == true
                     && child["access_error"].is_null()
@@ -186,16 +181,34 @@ impl Page {
                         .is_some_and(|id| !existing.contains(id))
                     && url.as_ref().is_none_or(|url| child["url"] == *url)
             });
-            if let Some(child) = matches.next() {
-                if matches.next().is_some() || child["metadata"]["page_list_complete"] != true {
+            let mut matched = None;
+            for child in matches {
+                let id = child["resource_id"].as_str().ok_or_else(|| {
+                    failure("BROWSER.SCRIPT_ERROR", "popup has no resource identity")
+                })?;
+                if !self.chromium
+                    && !self
+                        .session
+                        .live_popup_opener(
+                            id,
+                            &self.resource_id,
+                            url.as_deref(),
+                            self.deadline,
+                            &self.stop,
+                        )
+                        .map_err(|e| e.to_json())?
+                {
+                    continue;
+                }
+                if matched.is_some() || child["metadata"]["page_list_complete"] != true {
                     return Err(failure(
                         "BROWSER.PAGE_AMBIGUOUS",
                         "cannot identify exactly one new matching popup",
                     ));
                 }
-                let id = child["resource_id"].as_str().ok_or_else(|| {
-                    failure("BROWSER.SCRIPT_ERROR", "popup has no resource identity")
-                })?;
+                matched = Some(id);
+            }
+            if let Some(id) = matched {
                 if candidate.as_deref() == Some(id) {
                     self.openers
                         .push(std::mem::replace(&mut self.resource_id, id.to_owned()));

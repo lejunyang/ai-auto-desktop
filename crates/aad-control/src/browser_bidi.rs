@@ -49,6 +49,8 @@ const FRAME_ACTIONS: &[&str] = &[
 struct Frame {
     id: String,
     parent: Option<String>,
+    page_id: String,
+    original_opener: Option<String>,
     url: String,
 }
 
@@ -204,32 +206,48 @@ impl Request<'_> {
 
 fn frames(client: &mut Client, request: &Request<'_>) -> Result<BTreeMap<String, Frame>> {
     let tree = request.command(client, "browsingContext.getTree", json!({}))?;
+    parse_tree(&tree)
+}
+
+fn parse_tree(tree: &Value) -> Result<BTreeMap<String, Frame>> {
     let mut frames = BTreeMap::new();
-    let mut pending: VecDeque<(Value, Option<String>)> = tree["contexts"]
+    let mut pending: VecDeque<_> = tree["contexts"]
         .as_array()
-        .into_iter()
-        .flatten()
-        .cloned()
-        .map(|v| (v, None))
+        .filter(|contexts| contexts.len() <= MAX_FRAMES)
+        .ok_or_else(unsupported)?
+        .iter()
+        .map(|entry| (entry, None, None))
         .collect();
-    while let Some((entry, parent)) = pending.pop_front() {
-        if frames.len() >= MAX_FRAMES {
-            return Err(unsupported());
-        }
+    while let Some((entry, parent, page)) = pending.pop_front() {
         let id = entry["context"]
             .as_str()
-            .ok_or_else(unsupported)?
-            .to_owned();
-        for child in entry["children"].as_array().into_iter().flatten() {
-            pending.push_back((child.clone(), Some(id.clone())));
+            .filter(|s| !s.is_empty())
+            .ok_or_else(unsupported)?;
+        let page_id = page.unwrap_or(id);
+        if entry
+            .get("parent")
+            .is_some_and(|stated| stated != &json!(parent))
+        {
+            return Err(unsupported());
+        }
+        // A getTree without maxDepth returns [] for leaves. Null children
+        // would hide contexts and cannot establish a complete popup baseline.
+        let children = entry["children"].as_array().ok_or_else(unsupported)?;
+        if frames.len() + 1 + pending.len() + children.len() > MAX_FRAMES {
+            return Err(unsupported());
+        }
+        for child in children {
+            pending.push_back((child, Some(id), Some(page_id)));
         }
         if frames
             .insert(
-                id.clone(),
+                id.to_owned(),
                 Frame {
-                    id,
-                    parent,
-                    url: entry["url"].as_str().unwrap_or_default().into(),
+                    id: id.to_owned(),
+                    parent: parent.map(str::to_owned),
+                    page_id: page_id.to_owned(),
+                    original_opener: entry["originalOpener"].as_str().map(str::to_owned),
+                    url: entry["url"].as_str().ok_or_else(unsupported)?.into(),
                 },
             )
             .is_some()
@@ -756,9 +774,46 @@ impl Backend for FirefoxBackend {
                 }
                 (true, false) => self.capabilities(),
             };
+            let opener=frame.original_opener.as_ref().and_then(|id|tree.get(id));
             BackendResource{resource:Resource{resource_id:resource_id(PROVIDER,&selector),provider:PROVIDER.into(),kind:"browser".into(),name:frame.url.clone(),capabilities,
-                metadata:json!({"context":frame.id,"parent":frame.parent,"main_frame":frame.parent.is_none(),"url":frame.url,"access_error":access.err().map(|e|json!({"code":e.code,"message":e.message}))})},selector}
+                metadata:json!({"context":frame.id,"parent":frame.parent,"main_frame":frame.parent.is_none(),"url":frame.url,
+                    "page_id":frame.page_id,"frame_id":frame.id,"page_list_complete":true,
+                    "opener_page_id":opener.map(|o|&o.page_id),"opener_frame_id":opener.map(|o|&o.id),
+                    "access_error":access.err().map(|e|json!({"code":e.code,"message":e.message}))})},selector}
         }).collect())
+    }
+    fn live_popup_opener(
+        &self,
+        child: &Value,
+        opener: &Value,
+        url: Option<&str>,
+        context: &Context,
+    ) -> Result<bool> {
+        let request = Request {
+            deadline: Instant::now() + context.remaining()?,
+            action: Some(context),
+        };
+        let mut state = self.lock(&request)?;
+        let client = state.as_mut().unwrap();
+        let tree = frames(client, &request)?;
+        let child = self.authorized(&tree, child["context"].as_str().ok_or_else(unsupported)?)?;
+        let opener = self.authorized(&tree, opener["context"].as_str().ok_or_else(unsupported)?)?;
+        if child.parent.is_some()
+            || child.original_opener.as_ref() != Some(&opener.id)
+            || url.is_some_and(|expected| expected != child.url)
+        {
+            return Ok(false);
+        }
+        // Firefox retains originalOpener even for noopener. Read the native
+        // Window getter in a private realm and compare the protocol's context ID.
+        let authorized_url = json!(child.url);
+        let result = request.script(
+            client,
+            json!({"context":child.id,"sandbox":self.world}),
+            &format!("location.href === {authorized_url} ? Object.getOwnPropertyDescriptor(window, 'opener')?.get?.call(window) : null"),
+        )?;
+        Ok(result["result"]["type"] == "window"
+            && result["result"]["value"]["context"] == opener.id)
     }
     fn observe(&self, selector: &Value, max_nodes: usize, timeout: Duration) -> Result<Value> {
         self.observe_inner(selector, None, None, max_nodes, timeout)
@@ -1053,10 +1108,21 @@ impl Backend for FirefoxBackend {
                 match result {
                     Err(e) => Err(e.with_detail("residual_state_cleared", json!(cleared))),
                     Ok(v) if cleared => Ok(v),
+                    // A click handler may synchronously close its popup. All
+                    // pointerUp commands succeeded, and a complete fresh tree
+                    // must confirm destruction of the input's top-level context.
+                    Ok(v)
+                        if matches!(action, Action::Click { .. })
+                            && frames(client, &request)
+                                .is_ok_and(|tree| !tree.contains_key(input_context)) =>
+                    {
+                        Ok(v)
+                    }
                     Ok(_) => Err(error(
                         "CONTROL.INPUT_RELEASE_FAILED",
                         "Firefox input release was not confirmed",
-                    )),
+                    )
+                    .with_effect("unknown")),
                 }
             }
             Action::Key { .. } | Action::TypeText { .. } => {
@@ -1211,6 +1277,24 @@ fn validate_action(action: &Action) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn popup_baseline_requires_a_complete_bounded_context_tree() {
+        let leaf = json!({"context":"frame","url":"about:blank","children":[]});
+        let root = json!({"context":"top","url":"about:blank","children":[leaf]});
+        let popup =
+            json!({"context":"popup","url":"about:blank","originalOpener":"frame","children":[]});
+        let tree = parse_tree(&json!({"contexts":[root,popup]})).unwrap();
+        assert_eq!(tree["frame"].page_id, "top");
+        assert_eq!(tree["popup"].original_opener.as_deref(), Some("frame"));
+        let mut truncated = root.clone();
+        truncated["children"][0]["children"] = Value::Null;
+        assert!(parse_tree(&json!({"contexts":[truncated]})).is_err());
+        assert!(parse_tree(&json!({"contexts":[root,leaf]})).is_err());
+        let many: Vec<_> = (0..=MAX_FRAMES)
+            .map(|i| json!({"context":i.to_string(),"url":"about:blank","children":[]}))
+            .collect();
+        assert!(parse_tree(&json!({"contexts":many})).is_err());
+    }
+    #[test]
     fn unsupported_parameters_are_rejected_before_dispatch() {
         let double: Action = serde_json::from_value(json!({"type":"click","count":2})).unwrap();
         assert!(validate_action(&double).is_err());
@@ -1254,6 +1338,8 @@ mod tests {
                 Frame {
                     id: "main".into(),
                     parent: None,
+                    page_id: "main".into(),
+                    original_opener: None,
                     url: "file:///ungranted/fixture.html".into(),
                 },
             ),
@@ -1262,6 +1348,8 @@ mod tests {
                 Frame {
                     id: "child".into(),
                     parent: Some("main".into()),
+                    page_id: "main".into(),
+                    original_opener: None,
                     url: "about:srcdoc".into(),
                 },
             ),
