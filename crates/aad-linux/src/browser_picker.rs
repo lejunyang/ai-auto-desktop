@@ -1,5 +1,11 @@
-//! Lifetime of an observed, mapped GTK file dialog on the local X11 server.
-use crate::{atspi::Gtk4Picker, window_geometry};
+//! Observe and revalidate a local GTK file dialog and its browser owner.
+use crate::{
+    atspi::{Gtk4Picker, GtkFileDialog},
+    window_geometry,
+};
+use aad_platform::picker::{Kind, NewFile};
+use std::cell::Cell;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt as _};
@@ -20,6 +26,159 @@ enum Chooser {
     Portal(GtkPortal),
 }
 
+enum Surface {
+    X11(Box<OpenPicker>),
+    Wayland(GtkPortal),
+}
+
+pub struct FilePicker {
+    surface: Surface,
+    controls: Option<GtkFileDialog>,
+    kind: Kind,
+}
+
+impl FilePicker {
+    pub fn observe(
+        pid: u32,
+        expected: Option<u64>,
+        bounds: [i32; 4],
+        kind: Kind,
+        deadline: Instant,
+    ) -> Result<Self> {
+        let (surface, controls) = match std::env::var("XDG_SESSION_TYPE").as_deref() {
+            Ok("x11") => {
+                let expected = expected.map(u32::try_from).transpose()?;
+                let window = OpenPicker::observe_kind(pid, expected, bounds, kind, deadline)?;
+                let controls = if kind == Kind::Save {
+                    let owner = match &window.chooser {
+                        Chooser::Portal(portal) => portal.picker_pid,
+                        _ => pid,
+                    };
+                    Some(GtkFileDialog::observe(owner, kind, deadline)?)
+                } else {
+                    None
+                };
+                (Surface::X11(Box::new(window)), controls)
+            }
+            Ok("wayland") => {
+                if expected.is_some_and(|id| id != 0) {
+                    return Err("Wayland file portals have no numeric XID".into());
+                }
+                let portal = GtkPortal::for_browser(pid, deadline)?;
+                let controls = GtkFileDialog::observe(portal.picker_pid, kind, deadline)?;
+                (Surface::Wayland(portal), Some(controls))
+            }
+            _ => return Err("expected a local X11 or Wayland session".into()),
+        };
+        let picker = Self {
+            surface,
+            controls,
+            kind,
+        };
+        picker.revalidate(deadline)?;
+        Ok(picker)
+    }
+
+    pub fn id(&self) -> u64 {
+        match &self.surface {
+            Surface::Wayland(_) => 0,
+            Surface::X11(window) => window.xid().into(),
+        }
+    }
+
+    /// Wayland portals identify the browser process but expose no transient XID.
+    pub fn process_only(&self) -> bool {
+        matches!(self.surface, Surface::Wayland(_))
+    }
+
+    pub fn revalidate(&self, deadline: Instant) -> Result<()> {
+        match &self.surface {
+            Surface::X11(window) => {
+                window.revalidate(deadline)?;
+                if let Some(gtk) = &self.controls {
+                    if window.title()? != gtk.title().as_bytes() {
+                        return Err("GTK dialog and X11 window titles differ".into());
+                    }
+                }
+            }
+            Surface::Wayland(portal) => portal.revalidate(deadline)?,
+        }
+        if let Some(gtk) = &self.controls {
+            gtk.revalidate(deadline)?;
+        }
+        Ok(())
+    }
+
+    pub fn dismiss(&self, deadline: Instant) -> Result<()> {
+        if self.kind != Kind::Open {
+            return Err("expected the observed Open picker".into());
+        }
+        if let Surface::X11(window) = &self.surface {
+            return window.dismiss(deadline);
+        }
+        let gtk = self
+            .controls
+            .as_ref()
+            .ok_or("missing native Open response")?;
+        if !self.closed(gtk, deadline)? {
+            self.revalidate(deadline)?;
+            gtk.respond(deadline)?;
+        }
+        self.wait_closed(gtk, deadline)
+    }
+
+    pub fn save_new(&self, path: &Path, deadline: Instant) -> Result<()> {
+        if self.kind != Kind::Save {
+            return Err("expected the observed Save picker".into());
+        }
+        let destination =
+            NewFile::under(path.parent().ok_or("missing destination directory")?, path)?;
+        if destination.path().as_os_str() != path.as_os_str() {
+            return Err("expected a fully resolved save destination".into());
+        }
+        let text = path.to_str().ok_or("filename is not UTF-8")?;
+        let gtk = self
+            .controls
+            .as_ref()
+            .ok_or("missing native Save controls")?;
+        self.revalidate(deadline)?;
+        destination.revalidate()?;
+        gtk.fill(text, deadline)?;
+        self.revalidate(deadline)?;
+        gtk.verify_text(text)?;
+        destination.revalidate()?;
+        gtk.respond(deadline)?;
+        self.wait_closed(gtk, deadline)
+    }
+
+    fn closed(&self, gtk: &GtkFileDialog, deadline: Instant) -> Result<bool> {
+        if !gtk.gone(deadline)? {
+            return Ok(false);
+        }
+        match &self.surface {
+            Surface::Wayland(portal) => portal.finished(deadline),
+            Surface::X11(window) => {
+                if !window.ended()? {
+                    return Ok(false);
+                }
+                if let Chooser::Portal(portal) = &window.chooser {
+                    return portal.finished(deadline);
+                }
+                Ok(true)
+            }
+        }
+    }
+    fn wait_closed(&self, gtk: &GtkFileDialog, deadline: Instant) -> Result<()> {
+        while Instant::now() < deadline {
+            if self.closed(gtk, deadline)? {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Err("the observed chooser did not disappear after its response".into())
+    }
+}
+
 x11rb::atom_manager! {
     Atoms: AtomCookies {
         _NET_ACTIVE_WINDOW, _NET_WM_NAME, _NET_WM_PID, _NET_WM_STATE, _NET_WM_STATE_MODAL,
@@ -37,6 +196,8 @@ pub struct OpenPicker {
     pid: u32,
     bounds: [i32; 4],
     chooser: Chooser,
+    kind: Kind,
+    ended: Cell<bool>,
 }
 
 impl OpenPicker {
@@ -45,6 +206,15 @@ impl OpenPicker {
         pid: u32,
         expected: Option<Window>,
         bounds: [i32; 4],
+        deadline: Instant,
+    ) -> Result<Self> {
+        Self::observe_kind(pid, expected, bounds, Kind::Open, deadline)
+    }
+    fn observe_kind(
+        pid: u32,
+        expected: Option<Window>,
+        bounds: [i32; 4],
+        kind: Kind,
         deadline: Instant,
     ) -> Result<Self> {
         if std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("x11") {
@@ -102,6 +272,8 @@ impl OpenPicker {
             pid,
             bounds,
             chooser: Chooser::Gtk3,
+            kind,
+            ended: Cell::new(false),
         };
         let pids = observed.words(picker, atoms._NET_WM_PID, AtomEnum::CARDINAL)?;
         let [picker_pid] = pids.as_slice() else {
@@ -109,13 +281,19 @@ impl OpenPicker {
         };
         observed.check_window(picker, atoms._NET_WM_WINDOW_TYPE_DIALOG, *picker_pid)?;
         let role = observed.bytes(picker, atoms.WM_WINDOW_ROLE, AtomEnum::STRING.into())?;
-        observed.open_title()?;
+        observed.title()?;
         if *picker_pid != pid {
             if role != b"GtkFileChooserDialog" {
                 return Err("unexpected external dialog role".into());
             }
             observed.chooser = Chooser::Portal(GtkPortal::observe(pid, *picker_pid, deadline)?);
         } else if role.is_empty() {
+            if kind == Kind::Save {
+                return Err(
+                    "browser-owned GTK 4 Save requires identifiable filename and response controls"
+                        .into(),
+                );
+            }
             let class =
                 observed.bytes(picker, AtomEnum::WM_CLASS.into(), AtomEnum::STRING.into())?;
             let name = class
@@ -123,7 +301,7 @@ impl OpenPicker {
                 .next()
                 .filter(|s| !s.is_empty())
                 .ok_or("missing GTK window class")?;
-            let title = observed.open_title()?;
+            let title = observed.title()?;
             observed.chooser = Chooser::Gtk4(Box::new(Gtk4Picker::observe(
                 pid,
                 std::str::from_utf8(name)?.into(),
@@ -190,13 +368,16 @@ impl OpenPicker {
         Ok(())
     }
 
-    fn open_title(&self) -> Result<Vec<u8>> {
+    fn title(&self) -> Result<Vec<u8>> {
         let title = self.bytes(self.picker, self.atoms._NET_WM_NAME, self.atoms.UTF8_STRING)?;
-        if !matches!(
-            std::str::from_utf8(&title)?,
-            "Open File" | "Open Files" | "打开文件"
-        ) {
-            return Err("expected an Open File title".into());
+        if title.is_empty()
+            || (self.kind == Kind::Open
+                && !matches!(
+                    std::str::from_utf8(&title)?,
+                    "Open File" | "Open Files" | "打开文件"
+                ))
+        {
+            return Err("unexpected file dialog title".into());
         }
         Ok(title)
     }
@@ -210,7 +391,7 @@ impl OpenPicker {
         self.check_window(self.picker, a._NET_WM_WINDOW_TYPE_DIALOG, picker_pid)?;
         self.check_window(self.owner, a._NET_WM_WINDOW_TYPE_NORMAL, self.pid)?;
         let active = self.words(self.root, a._NET_ACTIVE_WINDOW, AtomEnum::WINDOW)?;
-        let title = self.open_title()?;
+        let title = self.title()?;
         let role = self.bytes(self.picker, a.WM_WINDOW_ROLE, AtomEnum::STRING.into())?;
         let chooser = match &self.chooser {
             Chooser::Gtk4(gtk) => {
@@ -257,12 +438,16 @@ impl OpenPicker {
     }
 
     fn ended(&self) -> Result<bool> {
+        if self.ended.get() {
+            return Ok(true);
+        }
         // A round trip puts prior StructureNotify events in our queue.
         self.conn.get_input_focus()?.reply()?;
         while let Some(event) = self.conn.poll_for_event()? {
             if matches!(event, Event::DestroyNotify(e) if e.window == self.picker)
                 || matches!(event, Event::UnmapNotify(e) if e.window == self.picker)
             {
+                self.ended.set(true);
                 return Ok(true);
             }
         }
@@ -308,7 +493,10 @@ impl OpenPicker {
 
     /// Consume the observation. Deliver WM_DELETE only to the original XID,
     /// then wait for that window's unmap/destroy event, without retrying input.
-    pub fn dismiss(self, deadline: Instant) -> Result<()> {
+    pub fn dismiss(&self, deadline: Instant) -> Result<()> {
+        if self.kind != Kind::Open {
+            return Err("expected an Open dialog".into());
+        }
         if self.ended()? {
             return Ok(());
         }

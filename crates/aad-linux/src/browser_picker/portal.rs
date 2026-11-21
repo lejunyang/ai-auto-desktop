@@ -21,10 +21,26 @@ pub(super) struct GtkPortal {
 }
 
 impl GtkPortal {
+    pub(super) fn for_browser(browser_pid: u32, deadline: Instant) -> Result<Self> {
+        Self::bind(browser_pid, None, deadline)
+    }
     pub(super) fn observe(browser_pid: u32, picker_pid: u32, deadline: Instant) -> Result<Self> {
+        Self::bind(browser_pid, Some(picker_pid), deadline)
+    }
+    fn bind(browser_pid: u32, expected_pid: Option<u32>, deadline: Instant) -> Result<Self> {
         let bus = connection::Builder::session()?
             .method_timeout(Duration::from_secs(2))
             .build()?;
+        let dbus = Proxy::new(
+            &bus,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )?;
+        let picker_pid: u32 = dbus.call("GetConnectionUnixProcessID", &(GTK,))?;
+        if expected_pid.is_some_and(|pid| pid != picker_pid) {
+            return Err("unexpected GTK portal window owner".into());
+        }
         let request = identify(&bus, browser_pid, picker_pid, deadline)?;
         Ok(Self {
             bus,
@@ -39,6 +55,24 @@ impl GtkPortal {
             return Err("the active desktop portal request changed".into());
         }
         Ok(())
+    }
+
+    pub(super) fn finished(&self, deadline: Instant) -> Result<bool> {
+        // Introspect the original unique bus owners. A service disconnect or
+        // observation failure is not evidence that the dialog closed normally.
+        for (owner, interface) in [
+            (&self.request.frontend, "org.freedesktop.portal.Request"),
+            (&self.request.backend, "org.freedesktop.impl.portal.Request"),
+        ] {
+            if inspect(&self.bus, owner, &self.request.path, deadline)?
+                .interfaces()
+                .iter()
+                .any(|i| i.name().as_str() == interface)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 

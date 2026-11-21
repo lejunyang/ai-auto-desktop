@@ -24,6 +24,7 @@ mod actions;
 mod coordinates;
 mod drag_between;
 mod drag_path;
+pub(super) mod file_dialog;
 mod focus_discovery;
 pub(super) mod gtk4_picker;
 mod table;
