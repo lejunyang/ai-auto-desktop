@@ -1,5 +1,11 @@
 # Read a painted canvas grid
 
+## Pointer actions on a canvas
+
+Chromium exposes click, hover, scroll and drag on an observed canvas surface. You can drag between two places on the same canvas or supply a path to draw a polyline. Each point is a fraction inside its observed element. In the browser fixture, trusted input events and the pixels in the resulting PNG independently verify the drawing. Choosing a diagram node by its business name still requires the page to expose that object or the caller to locate it visually. [Pointer actions and paths](../control-sessions.md) · [Chromium canvas tests](../../crates/aad-control/tests/browser_e2e.rs)
+
+## Read regular cells
+
 `aad browser read --canvas-grid` reads single-line labels and numbers from one visible Chromium canvas. Supply the layout that the page paints. For example, if the canvas named `Ledger` contains three rows of data and three equal-width columns, run this in PowerShell 7 with the ledger page already open.
 
 ```powershell
