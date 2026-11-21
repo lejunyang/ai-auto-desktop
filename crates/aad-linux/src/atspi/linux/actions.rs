@@ -85,6 +85,14 @@ fn dispatch_selected(
     if !is_activation(expected) {
         return Err(unsupported());
     }
+    dispatch_qualified(source, expected, activation)
+}
+
+fn dispatch_qualified(
+    source: &impl ActionSource,
+    expected: &str,
+    activation: bool,
+) -> Result<Value, AutomationError> {
     let actions = read(source)?;
     let selected = if activation {
         unique_activation(&actions).ok_or_else(unsupported)?
@@ -193,6 +201,21 @@ impl ActionSource for DbusActions<'_> {
 }
 
 impl LinuxBackend {
+    pub(super) fn show_file_location(
+        &self,
+        chooser: &NativeRef,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        dispatch_qualified(
+            &DbusActions {
+                backend: self,
+                target: chooser,
+                deadline,
+            },
+            "show_location",
+            false,
+        )
+    }
     pub(super) fn canonical_actions(
         &self,
         target: &NativeRef,

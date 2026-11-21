@@ -5,6 +5,7 @@ use crate::{
 };
 use aad_platform::picker::{Kind, NewFile};
 use std::cell::Cell;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
@@ -151,6 +152,79 @@ impl FilePicker {
         self.wait_closed(gtk, deadline)
     }
 
+    pub fn open_file(&self, path: &Path, deadline: Instant) -> Result<()> {
+        if self.kind != Kind::Open {
+            return Err("expected the observed Open picker".into());
+        }
+        let text = path.to_str().ok_or("file path is not UTF-8")?;
+        if text.chars().any(char::is_control) {
+            return Err("invalid characters in native file path".into());
+        }
+        let identity = || -> Result<_> {
+            let meta = path.symlink_metadata()?;
+            if !meta.is_file() || path.canonicalize()?.as_os_str() != path.as_os_str() {
+                return Err("expected a canonical existing regular file".into());
+            }
+            Ok((meta.dev(), meta.ino()))
+        };
+        let observed_file = identity()?;
+        let local;
+        let gtk = match (&self.surface, &self.controls) {
+            (_, Some(gtk)) => gtk,
+            (Surface::X11(window), None) => {
+                if let Some(gtk) = &window.open_controls {
+                    gtk
+                } else {
+                    let owner = match &window.chooser {
+                        Chooser::Portal(portal) => portal.picker_pid,
+                        _ => window.pid,
+                    };
+                    local = GtkFileDialog::observe(owner, Kind::Open, deadline)?;
+                    &local
+                }
+            }
+            _ => return Err("missing observable native file chooser".into()),
+        };
+        let revalidate = || -> Result<()> {
+            self.revalidate(deadline)?;
+            gtk.revalidate(deadline)?;
+            if let Surface::X11(window) = &self.surface {
+                if window.title()? != gtk.title().as_bytes() {
+                    return Err("GTK location dialog differs from the X11 window".into());
+                }
+            }
+            if identity()? != observed_file {
+                return Err("the granted file changed".into());
+            }
+            Ok(())
+        };
+        revalidate()?;
+        let location = match gtk.location(deadline)? {
+            Some(location) => location,
+            None => {
+                gtk.show_location(deadline)?;
+                revalidate()?;
+                gtk.location(deadline)?
+                    .ok_or("the chooser did not expose a location field")?
+            }
+        };
+        revalidate()?;
+        gtk.fill_location(&location, text, deadline)?;
+        loop {
+            revalidate()?;
+            if gtk.accept_location(&location, text, deadline)? {
+                break;
+            }
+            // GTK asynchronously resolves and validates the location before
+            // making the response sensitive. No click was sent on this path.
+            if Instant::now() >= deadline {
+                return Err("the observed Open response stayed disabled".into());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        self.wait_closed(gtk, deadline)
+    }
+
     fn closed(&self, gtk: &GtkFileDialog, deadline: Instant) -> Result<bool> {
         if !gtk.gone(deadline)? {
             return Ok(false);
@@ -198,6 +272,7 @@ pub struct OpenPicker {
     chooser: Chooser,
     kind: Kind,
     ended: Cell<bool>,
+    open_controls: Option<Box<GtkFileDialog>>,
 }
 
 impl OpenPicker {
@@ -274,6 +349,7 @@ impl OpenPicker {
             chooser: Chooser::Gtk3,
             kind,
             ended: Cell::new(false),
+            open_controls: None,
         };
         let pids = observed.words(picker, atoms._NET_WM_PID, AtomEnum::CARDINAL)?;
         let [picker_pid] = pids.as_slice() else {
@@ -281,12 +357,19 @@ impl OpenPicker {
         };
         observed.check_window(picker, atoms._NET_WM_WINDOW_TYPE_DIALOG, *picker_pid)?;
         let role = observed.bytes(picker, atoms.WM_WINDOW_ROLE, AtomEnum::STRING.into())?;
-        observed.title()?;
         if *picker_pid != pid {
             if role != b"GtkFileChooserDialog" {
                 return Err("unexpected external dialog role".into());
             }
             observed.chooser = Chooser::Portal(GtkPortal::observe(pid, *picker_pid, deadline)?);
+            let title = observed.bytes(picker, atoms._NET_WM_NAME, atoms.UTF8_STRING)?;
+            if kind == Kind::Open && !standard_open_title(&title) {
+                let gtk = GtkFileDialog::observe(*picker_pid, kind, deadline)?;
+                if title != gtk.title().as_bytes() {
+                    return Err("GTK portal and X11 dialog titles differ".into());
+                }
+                observed.open_controls = Some(Box::new(gtk));
+            }
         } else if role.is_empty() {
             if kind == Kind::Save {
                 return Err(
@@ -372,10 +455,12 @@ impl OpenPicker {
         let title = self.bytes(self.picker, self.atoms._NET_WM_NAME, self.atoms.UTF8_STRING)?;
         if title.is_empty()
             || (self.kind == Kind::Open
-                && !matches!(
-                    std::str::from_utf8(&title)?,
-                    "Open File" | "Open Files" | "打开文件"
-                ))
+                && !standard_open_title(&title)
+                && self
+                    .open_controls
+                    .as_ref()
+                    .map(|gtk| gtk.title().as_bytes())
+                    != Some(&title))
         {
             return Err("unexpected file dialog title".into());
         }
@@ -484,6 +569,9 @@ impl OpenPicker {
             Chooser::Gtk4(gtk) => gtk.revalidate(deadline)?,
             Chooser::Portal(portal) => portal.revalidate(deadline)?,
         }
+        if let Some(gtk) = &self.open_controls {
+            gtk.revalidate(deadline)?;
+        }
         self.check_pinned()?;
         if self.ended()? {
             return Err("the observed picker was unmapped or destroyed".into());
@@ -530,4 +618,11 @@ impl OpenPicker {
         }
         Err("the observed chooser did not unmap after WM_DELETE_WINDOW".into())
     }
+}
+
+fn standard_open_title(title: &[u8]) -> bool {
+    matches!(
+        std::str::from_utf8(title),
+        Ok("Open File" | "Open Files" | "打开文件")
+    )
 }

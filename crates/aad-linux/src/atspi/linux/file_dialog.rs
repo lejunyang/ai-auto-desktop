@@ -23,6 +23,12 @@ pub(crate) struct GtkFileDialog {
     controls: Controls,
 }
 
+#[derive(PartialEq)]
+pub(crate) struct Location {
+    layer: NativeRef,
+    entry: NativeRef,
+}
+
 fn shown(states: StateSet) -> bool {
     states.contains(State::Showing) && states.contains(State::Visible)
 }
@@ -92,16 +98,120 @@ impl GtkFileDialog {
             .name
             .as_ref()
             .ok_or("missing observed filename entry")?;
+        self.verify_entry(entry, path)
+    }
+    fn verify_entry(&self, entry: &NativeRef, path: &str) -> Result<()> {
         let proxy = zbus::block_on(
             TextProxy::builder(self.backend.connection.inner())
                 .destination(entry.bus_name.as_str())?
                 .path(entry.object_path.as_str())?
                 .build(),
         )?;
-        if zbus::block_on(proxy.get_text(0, -1))? != path {
+        let count = i32::try_from(path.chars().count())?;
+        if zbus::block_on(proxy.character_count())? != count
+            || zbus::block_on(proxy.get_text(0, count))? != path
+        {
             return Err("GTK filename differs from the authorized path".into());
         }
         Ok(())
+    }
+    pub(crate) fn location(&self, deadline: Instant) -> Result<Option<Location>> {
+        // The GTK browse header contains a named stack and a Location Layer.
+        // File rows, the search field and the Connect to Server entry are
+        // outside that layer. Never descend into lists, tables or scroll panes.
+        let mut panels = vec![(self.controls.widget.clone(), false)];
+        let mut locations = Vec::new();
+        let mut visited = 0;
+        while let Some((panel, in_header_stack)) = panels.pop() {
+            for child in self.backend.children(&panel, deadline)? {
+                visited += 1;
+                if visited > 128 || child.bus_name != self.controls.widget.bus_name {
+                    return Err("incomplete location hierarchy".into());
+                }
+                let proxy = self.backend.accessible(&child)?;
+                let role = zbus::block_on(proxy.get_role())?;
+                if !shown(zbus::block_on(proxy.get_state())?) {
+                    continue;
+                }
+                match role {
+                    Role::Filler
+                        if in_header_stack && zbus::block_on(proxy.name())? == "Location Layer" =>
+                    {
+                        let entry = unique(
+                            self.backend.children(&child, deadline)?,
+                            "ambiguous GTK location field",
+                        )?;
+                        if entry.bus_name != child.bus_name {
+                            return Err("foreign location field".into());
+                        }
+                        let field = self.backend.accessible(&entry)?;
+                        let state = zbus::block_on(field.get_state())?;
+                        if zbus::block_on(field.get_role())? != Role::Text
+                            || !shown(state)
+                            || !enabled(state)
+                            || !state.contains(State::Editable)
+                            || !state.contains(State::Focused)
+                            || !state.contains(State::SingleLine)
+                        {
+                            return Err("the GTK location field is not focused and editable".into());
+                        }
+                        locations.push(Location {
+                            layer: child,
+                            entry,
+                        });
+                    }
+                    Role::Filler | Role::Panel | Role::SplitPane => {
+                        let stack = role == Role::Panel
+                            && zbus::block_on(proxy.name())? == "Browse Header Stack";
+                        panels.push((child, stack));
+                    }
+                    _ => (),
+                }
+            }
+        }
+        match locations.len() {
+            0 => Ok(None),
+            1 => Ok(locations.pop()),
+            _ => Err("ambiguous GTK location layers".into()),
+        }
+    }
+    pub(crate) fn show_location(&self, deadline: Instant) -> Result<()> {
+        self.backend
+            .show_file_location(&self.controls.widget, deadline)?;
+        Ok(())
+    }
+    pub(crate) fn fill_location(
+        &self,
+        location: &Location,
+        path: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        if self.location(deadline)?.as_ref() != Some(location) {
+            return Err("the GTK location field changed".into());
+        }
+        self.backend.set_text(&location.entry, path, deadline)?;
+        self.verify_entry(&location.entry, path)
+    }
+    pub(crate) fn accept_location(
+        &self,
+        location: &Location,
+        path: &str,
+        deadline: Instant,
+    ) -> Result<bool> {
+        if self.location(deadline)?.as_ref() != Some(location) {
+            return Err("the GTK location field changed".into());
+        }
+        self.verify_entry(&location.entry, path)?;
+        let state = zbus::block_on(self.backend.accessible(&self.controls.accept)?.get_state())?;
+        if !shown(state) {
+            return Err("the observed Open response disappeared".into());
+        }
+        if !enabled(state) {
+            return Ok(false);
+        }
+        self.backend
+            .invoke_canonical(&self.controls.accept, "click", deadline)?;
+        Ok(true)
     }
     pub(crate) fn respond(&self, deadline: Instant) -> Result<()> {
         let button = match self.kind {
@@ -146,6 +256,21 @@ fn identify(backend: &LinuxBackend, pid: u32, kind: Kind, deadline: Instant) -> 
         }
     }
     let (app, window, title) = unique(windows, "expected one active GTK file chooser")?;
+    // Chromium directory pickers also expose Select and show_location. Bind
+    // the browser's file-specific operation title as well as the GTK controls.
+    if kind == Kind::Open
+        && !matches!(
+            title.as_str(),
+            "Open File"
+                | "Open Files"
+                | "打开文件"
+                | "Select a file this site can read"
+                | "Select files this site can read"
+                | "选择允许此网站读取的文件"
+        )
+    {
+        return Err("expected a Chromium file-open dialog".into());
+    }
     let (mut widgets, mut accept, mut cancel, mut entries) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut panels = vec![(window.clone(), false)];
