@@ -4,6 +4,7 @@
 pub mod browser;
 pub mod browser_access;
 pub mod browser_bidi;
+pub mod canvas_grid;
 pub mod fields;
 pub mod launch;
 pub mod lease;
@@ -330,10 +331,10 @@ pub struct Context {
 // count while allowing the caller to stop waiting immediately on cancellation.
 // The backend retains its original finite deadline and its output is discarded
 // if the caller has already terminated.
-fn capture_cancellable(
+fn capture_cancellable<T: Send + 'static>(
     context: &Context,
-    capture: impl FnOnce() -> Result<Value> + Send + 'static,
-) -> Result<Value> {
+    capture: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
     static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     if ACTIVE
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
@@ -1355,6 +1356,7 @@ impl Session {
             Operation::CollectTable {resource_id, spec} => self.collect_table(resource_id, spec, context)
                 .map_err(|failure| if matches!(context.phase.load(Ordering::SeqCst), 1 | 3) && failure.effect == "not_applied" { failure.with_effect("unknown") } else { failure }),
             Operation::ReadTable { target, columns, max_characters } => self.read_table(target, columns, *max_characters, context),
+            Operation::ReadCanvasGrid { resource_id, spec } => self.read_canvas_grid(resource_id, spec, context),
             Operation::ReadFields { resource_id, fields } => {
                 fields::validate(fields)?;
                 let (id, observation) = self.observe_resource(resource_id, MAX_NODES, context)?;
@@ -2989,7 +2991,7 @@ mod capture_cancellation_tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let running = context.clone();
         let worker = std::thread::spawn(move || {
-            capture_cancellable(&running, move || {
+            capture_cancellable(&running, move || -> Result<Value> {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 Err(error("BROWSER.CDP_ERROR", "late capture error"))

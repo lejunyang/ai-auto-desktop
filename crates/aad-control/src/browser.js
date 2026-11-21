@@ -562,7 +562,7 @@
       const found=nodes.get(args.node_id);
       if (!found || !visible(found.el) || fingerprint(found.el)!==found.fingerprint) return {error:'CONTROL.STALE_TARGET'};
       if (protectedNode(found.el)) return {error:'CONTROL.ACTION_UNSUPPORTED'};
-      found.el.scrollIntoView({block:'nearest',inline:'nearest'});
+      if(!args.noscroll)found.el.scrollIntoView({block:'nearest',inline:'nearest'});
       const box=found.el.getBoundingClientRect();
       if (box.width<1 || box.height<1) return {error:'CONTROL.OCCLUDED'};
       // A parent or overlapping element's screenshot could reveal a field

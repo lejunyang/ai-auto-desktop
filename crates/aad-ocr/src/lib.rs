@@ -337,6 +337,25 @@ impl OcrProvider {
         languages: &[String],
         timeout: Duration,
     ) -> Result<Value, AutomationError> {
+        self.recognize_png_layout(png, languages, timeout, false)
+    }
+
+    /// A pre-segmented cell containing one line of text or a number.
+    pub fn recognize_line_png(
+        &self,
+        png: &[u8],
+        timeout: Duration,
+    ) -> Result<Value, AutomationError> {
+        self.recognize_png_layout(png, &[], timeout, true)
+    }
+
+    fn recognize_png_layout(
+        &self,
+        png: &[u8],
+        languages: &[String],
+        timeout: Duration,
+        single_line: bool,
+    ) -> Result<Value, AutomationError> {
         if timeout <= RESPONSE_BUDGET {
             return Err(ocr_error(
                 "OCR.TIMEOUT",
@@ -366,6 +385,9 @@ impl OcrProvider {
         let version = self.engine_version(deadline)?;
         let mut command = self.engine.clone();
         command.extend([temporary.path().display().to_string(), "stdout".into()]);
+        if single_line {
+            command.extend(["--psm".into(), "7".into()]);
+        }
         if !languages.is_empty() {
             command.extend(["-l".into(), languages.join("+")]);
         }

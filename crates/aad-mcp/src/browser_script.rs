@@ -412,6 +412,7 @@ pub fn run_download_export(
 pub enum PageRead {
     View(ViewMode),
     Fields(Vec<aad_control::fields::ReadField>),
+    CanvasGrid(Box<aad_control::canvas_grid::Spec>),
 }
 
 /// One read through the same resource selection and observation as a browser script.
@@ -431,6 +432,10 @@ pub fn read_page(
         Instant::now() + Duration::from_secs(30),
     )?;
     match read {
+        PageRead::CanvasGrid(spec) => page.request(Operation::ReadCanvasGrid {
+            resource_id: page.resource_id.clone(),
+            spec,
+        }),
         PageRead::View(mode) => page.observe(mode),
         PageRead::Fields(fields) => page.request(Operation::ReadFields {
             resource_id: page.resource_id.clone(),

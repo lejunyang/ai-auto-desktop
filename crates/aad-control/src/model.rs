@@ -519,6 +519,10 @@ pub enum Operation {
         #[serde(default)]
         max_characters: Option<usize>,
     },
+    ReadCanvasGrid {
+        resource_id: String,
+        spec: Box<crate::canvas_grid::Spec>,
+    },
     Act {
         target: Target,
         action: Action,

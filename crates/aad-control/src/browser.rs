@@ -3098,6 +3098,7 @@ mod diagnostic_summary_tests {
 
 /// The most pixels one capture returns; a long page body is cut at this height.
 const MAX_CAPTURE: (f64, f64) = (4096.0, 8192.0);
+mod canvas_grid;
 
 impl BrowserBackend {
     /// A PNG of the observed element, scrolled into view first.
@@ -3107,6 +3108,42 @@ impl BrowserBackend {
         node: &Value,
         timeout: Duration,
     ) -> Result<Value> {
+        self.with_capture_target(snapshot, node, timeout, |client, context, args| {
+            let rect = checked(eval(
+                client,
+                context,
+                format!("globalThis.__aadControlV1.rect({args})"),
+            )?)?;
+            let number = |key: &str| rect[key].as_f64().unwrap_or_default();
+            let (width, height) = (
+                number("width").min(MAX_CAPTURE.0),
+                number("height").min(MAX_CAPTURE.1),
+            );
+            let shot = command(
+                client,
+                "Page.captureScreenshot",
+                json!({
+                    "format":"png","captureBeyondViewport":true,
+                    "clip":{"x":number("x"),"y":number("y"),"width":width,"height":height,"scale":1}
+                }),
+            )?;
+            let data = shot["data"]
+                .as_str()
+                .ok_or_else(|| error("BROWSER.BAD_RESULT", "no screenshot data"))?;
+            Ok(
+                json!({"format":"png","data":data,"width":width.round(),"height":height.round(),
+                "clipped":width<number("width") || height<number("height")}),
+            )
+        })
+    }
+
+    fn with_capture_target<T>(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        timeout: Duration,
+        capture: impl FnOnce(&mut Client, &Ctx, &Value) -> Result<T>,
+    ) -> Result<T> {
         let meta = &snapshot["metadata"];
         if meta["main_frame"] != true {
             return Err(error(
@@ -3177,32 +3214,7 @@ impl BrowserBackend {
             let context = Ctx::new(None, meta["context_id"].as_i64().unwrap_or_default());
             refresh_closed_roots(client,&context,None,true)?;
             let args = json!({"document_token": snapshot["document_token"], "observation": snapshot["snapshot_id"], "node_id": node["node_id"]});
-            let rect = checked(eval(
-                client,
-                &context,
-                format!("globalThis.__aadControlV1.rect({args})"),
-            )?)?;
-            let number = |key: &str| rect[key].as_f64().unwrap_or_default();
-            let (width, height) = (
-                number("width").min(MAX_CAPTURE.0),
-                number("height").min(MAX_CAPTURE.1),
-            );
-            let shot = command(
-                client,
-                "Page.captureScreenshot",
-                json!({"format": "png", "captureBeyondViewport": true,
-                       "clip": {"x": number("x"), "y": number("y"), "width": width, "height": height, "scale": 1}}),
-            )?;
-            let data = shot["data"]
-                .as_str()
-                .ok_or_else(|| error("BROWSER.BAD_RESULT", "no screenshot data"))?;
-            Ok(json!({
-                "format": "png",
-                "data": data,
-                "width": width.round(),
-                "height": height.round(),
-                "clipped": width < number("width") || height < number("height"),
-            }))
+            capture(client, &context, &args)
         })
     }
 }
