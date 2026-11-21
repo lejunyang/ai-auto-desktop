@@ -34,7 +34,7 @@ MCP 使用同名参数。在一次 `browser_script` 调用中传 `source`（上�
 | `page.collect({table, columns, row_key, traversal, expected_rows})` | 跨页或滚动收集同一张表。用 `traversal: {mode:"pagination", next:{name:"下一页"}}` 指定翻页按钮；虚拟列表使用 `mode:"virtual_scroll"` 和 `container` 定位器。结果包含 `records`、`complete` 和 `stop_reason`。 |
 | `page.wait(locator, condition, states)` | 等待 `appears`、`disappears` 或 `state`。最后一种传期望状态，例如 `{enabled:true}`。 |
 | `page.fill(locator, text)`、`page.click(locator)`、`page.key(locator, keys)`、`page.scroll(locator, direction, notches)` | 在脚本绑定的页面上重新观察、定位，然后通过驱动执行。 |
-| `page.openPopup(locator, exactUrl?)` | Chromium：点击当前资源中观察到的元素，等待该 frame 新开的唯一匹配标签页，再将后续操作绑定到新页。可指定完整 URL 等待重定向到达；不传时，不按 URL 筛选。 |
+| `page.openPopup(locator, exactUrl?)` | Chromium 和 Firefox 都支持。点击当前资源中观察到的元素，等待该 frame 新开的唯一匹配标签页，再将后续操作绑定到新页。可指定完整 URL 等待重定向到达；不传时，不按 URL 筛选。 |
 | `page.returnToOpener()` | 将后续操作绑回原来的资源（包括具体 frame）；不激活系统窗口，也不关闭新页。 |
 | `page.chooseFiles(locator, files)` | 给 Chromium 的上传按钮选文件。传入一个或多个绝对路径；单选控件传一个。脚本负责点击按钮并处理它打开的文件选择器。 |
 | `page.upload(locator, files)` | 已经知道网页文件输入框的位置时，可直接给这个输入框选文件。 |
@@ -102,4 +102,6 @@ aad browser script ./consent.js --url 'http://localhost:8080/account' --allow-in
 
 如果授权页还会打开身份验证页，在授权页再调用一次 `openPopup`。第一次 `returnToOpener()` 回到授权页，第二次回到业务页。业务页可以在同一段脚本末尾读回执。
 
-每一层都核对 Chromium 报告的 opener 标签页和 frame。多个新页同时匹配会报歧义。等到截止时间仍未匹配时结束，点击只派发一次。返回时子页可以已经自行关闭，父页必须仍然存在。此功能适用于 Chromium 的普通脚本会话。Firefox 和显式资源白名单会话还不能切页。真实三级页面用例见[弹窗脚本验收](../tests/browser/script-popup.test.mjs)。
+每一层都核对浏览器报告的 opener 标签页和 frame。多个新页同时匹配会报歧义。等到截止时间仍未匹配时结束，点击只派发一次。返回时子页可以已经自行关闭，父页必须仍然存在。显式资源白名单会话禁止切页。[Chromium 弹窗验收](../tests/browser/script-popup.test.mjs)
+
+Firefox 使用同一份 `consent.js`，在上述命令中加上 `--browser-bidi-port 9223`，端口换成当前 Firefox 的 BiDi 端口。Firefox 即使对 `noopener` 新页也可能报告历史 `originalOpener`。脚本要求该 ID 和私有环境中读到的当前 `window.opener` 上下文同时匹配发起操作的 frame。上下文树不完整或超过 256 个上下文时，无法建立基线。Linux 无头 Firefox 实测覆盖两层弹窗、确认后立即关闭、回到发起操作的 iframe 读回执，以及相同 URL 从其他 frame 或通过 `noopener` 打开的情况。[Firefox 弹窗验收](../tests/browser/firefox-script-popup.test.mjs)
