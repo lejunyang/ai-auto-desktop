@@ -1,6 +1,15 @@
 # 收集表格、导出 CSV 和对账
 
-打开 Chromium 的账单页面，定位到第一页，把下面的 JSON 存为 `bills.json`。`table` 和翻页控件都要能在同一页面或 frame 内唯一定位。`row_key` 选用跨页稳定且唯一的业务列，例如账单号。保留前导零的编号可直接使用。
+这里处理 Chromium 网页上有表头的 HTML 表格。根据你要拿到的结果选入口即可。
+
+| 你在做什么 | 怎么调用 |
+|---|---|
+| 看当前页的几列 | 在浏览器脚本中写 `page.table({role:"table", name:"Bills"}, ["ID","Amount"])`。 |
+| 在已有脚本里收完整张表，再用结果继续操作 | 写 `const bills = page.collect(spec)`，检查 `bills.complete` 后遍历 `bills.records`。 |
+| 在 YAML 或 MCP 里收整表 | Recipe 步骤使用 `collect_table`。MCP 调用 `control_collect_table`，传入同一组字段及页面的 `resource_id`。 |
+| 临时导出 CSV，或和本地账单对账 | 在终端运行 `aad table collect`，同时传 CSV 文件路径。 |
+
+下面是一份采集参数。脚本可以直接传这个对象，使用 CLI 时把它存为 `bills.json`。`table` 指定哪张表，`columns` 列出要读的表头，`row_key` 选其中一个跨页唯一的业务列，例如账单号，`traversal` 指定如何翻页或滚动。示例中的 `expected_rows: 2` 表示账单应有两行。知道总数可以传入它；有首页按钮的分页表也可以通过观察首页和末页确认完整性。
 
 ```json
 {
