@@ -215,6 +215,7 @@ name = "aad-platform"
 version = "0.0.9"
 dependencies = [
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

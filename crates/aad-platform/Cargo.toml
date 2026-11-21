@@ -10,6 +10,9 @@ description = "What every operating system offers ai-auto-desktop: shared screen
 [dependencies]
 serde_json = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 # Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
 [lints]
 workspace = true

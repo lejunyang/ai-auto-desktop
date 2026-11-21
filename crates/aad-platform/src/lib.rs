@@ -24,6 +24,7 @@ pub mod buffer;
 pub mod clip;
 pub mod damage;
 pub mod keys;
+pub mod picker;
 pub mod probe;
 
 /// How pixels are laid out in a [`Raw`] picture.
