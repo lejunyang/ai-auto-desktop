@@ -202,9 +202,16 @@ fn run(args: &PageArgs, selection: Selection<'_>) -> Outcome {
     if pages.next().is_some() {
         return Err(refused("ambiguous main page"));
     }
+    // Only the HTML upload needs the full list of controls to locate :open.
+    // Native dialogs need the trusted document metadata and their own observed
+    // OS controls, even when the page contains thousands of elements.
+    let max_nodes = match selection {
+        Selection::Open(open) if !open.native_file => aad_control::MAX_NODES,
+        _ => 1,
+    };
     let observed = desk.call(Operation::Observe {
         resource_id: id.into(),
-        max_nodes: aad_control::MAX_NODES,
+        max_nodes,
         view: View::default(),
     })?;
     if observed["metadata"]["browser_instance_id"] != instance {
