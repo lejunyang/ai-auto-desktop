@@ -381,7 +381,9 @@ aad mcp --browser-port 9222 --allow-input \
 - **边界**　拦截覆盖 CDP 提供 Fetch 的页面、弹窗、跨进程 iframe 和 worker 目标。部分 Chromium 的专用 worker 没有 Fetch 域。Firefox BiDi、浏览器以外的请求、已经建立的 WebSocket 消息和完全由页面缓存满足的操作均在范围之外。动作结果按页面和动作时间窗口关联。命中的请求重定向后，后续裁决仍归到原动作。表单提交到新窗口时，浏览器提供 opener 的首个导航也归到提交动作，记录中的 `page_id` 指向实际发出请求的页面。同页并发的后台请求也可能出现在结果里。附加到已有浏览器前已经发出的请求无法追回。脱离动作时间窗口、稍后由定时器发起的请求可在网络诊断中查询。
 
 
-整张账单可以用 `aad browser collect-table` 翻页或滚动采集，导出 CSV，再按订单号和金额核对。涉及网页、文件管理器、表格软件的操作可用 `aad browser record mixed start` 一起录制，每个桌面应用指定要录的窗口。见[收集表格与对账](docs/table-collection.md)和[跨应用录制](docs/mixed-recording.md)。
+`aad browser` 按任务提供入口。用 `pages` 列出页面，`read` 读正文、页面结构或多个字段，`script` 一次执行整段 JavaScript，`record` 录制流程。涉及多个应用时，用 `record mixed start` 指定网页和桌面窗口。[浏览器脚本](docs/browser-script.md) · [跨应用录制](docs/mixed-recording.md)
+
+整张账单用 `aad browser collect-table` 翻页或滚动采集。网站异步生成的账单用 `aad browser download-export` 按任务号下载。已有本地数据时，用 `aad csv export` 导出工作簿区域或采集结果，再用 `aad csv compare` 按订单号核对日期、金额和总额。[表格采集与对账](docs/table-collection.md) · [异步导出](docs/browser-download-export.md) · [工作簿区域](docs/workbook-csv.md)
 
 **保存与运行流程**（重复劳动）：`save_workflow`、`list_workflows`、`describe_workflow`、`run_workflow`。
 `save_workflow` 收的是和 `aad record`、GUI 相同的平台无关步骤（`control-steps/1`）：每步写应用（provider、进程名、
