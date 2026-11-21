@@ -333,3 +333,102 @@ test('an unconfigured MCP session retains policy from a short-lived CLI', {
   assert.equal(decisions, 2);
   assert.equal(writes, 1);
 });
+
+async function scriptActors(t, page, decide) {
+  const policy = createServer(async (req, res) => {
+    let reply = {revision:'1', watch:[{host:'127.0.0.1', methods:['POST']}]};
+    if (req.method === 'POST') {
+      let data = '';
+      for await (const chunk of req) data += chunk;
+      reply = await decide(JSON.parse(data));
+    }
+    res.end(JSON.stringify(reply));
+  });
+  await new Promise(resolve => policy.listen(0, '127.0.0.1', resolve));
+  t.after(() => policy.close());
+  const bin = process.env.AAD_TEST_CLI || resolve('target/debug/aad');
+  const env = {...process.env, HOME:page.root, LOCALAPPDATA:page.root,
+    AAD_CONTROL_LEASE_DIR:join(page.root,'leases'), AAD_REQUEST_GATE_TOKEN:'fixture-token',
+    AAD_REQUEST_GATE_URL:'http://127.0.0.1:'+policy.address().port+'/policy'};
+  const flags = ['--browser-port',String(page.port),'--allow-input'];
+  const child = spawn(bin, ['mcp',...flags], {env});
+  t.after(() => child.kill());
+  const lines = createInterface({input:child.stdout})[Symbol.asyncIterator]();
+  let id = 0;
+  return {
+    async cli(source) {
+      const file = join(page.root, 'action.js');
+      await writeFile(file, source);
+      try {
+        const {stdout} = await promisify(execFile)(bin, ['browser-script',file,'--url',page.url,...flags], {env});
+        return JSON.parse(stdout);
+      } catch (error) {
+        if (!error.stdout) throw error;
+        const report = JSON.parse(error.stdout);
+        assert.ok(report.error, error.stdout);
+        return report;
+      }
+    },
+    async mcp(source) {
+      const params = {name:'browser_script', arguments:{source,url:page.url}};
+      child.stdin.write(JSON.stringify({jsonrpc:'2.0',id:++id,method:'tools/call',params})+'\n');
+      const reply = JSON.parse((await lines.next()).value);
+      assert.equal(reply.id, id);
+      return JSON.parse(reply.result.content[0].text);
+    }
+  };
+}
+
+test('actions report policy decisions on later redirect hops', {
+  skip: !process.env.AAD_TEST_CHROME, timeout:30000
+}, async t => {
+  let status = 307;
+  const arrivals = [], asked = [];
+  const page = await fixture((req,res) => {
+    if (req.method === 'POST') arrivals.push(req.url);
+    if (req.url === '/redirect') {
+      res.writeHead(status, {Location:'/destination'}).end();
+    } else {
+      res.setHeader('Content-Type','text/html');
+      res.end('<title>Fixture</title><button onclick="fetch(\'/redirect\',{method:\'POST\'}).catch(()=>{})">Save</button>');
+    }
+  });
+  t.after(() => page.close());
+  let decision, firstHop, release;
+  const actors = await scriptActors(t, page, async request => {
+    assert.equal(request.method, 'POST');
+    asked.push(request.url);
+    if (request.url === page.url+'redirect') {
+      firstHop();
+      await new Promise(resolve => { release = resolve; });
+      return {decision:'allow'};
+    }
+    return {decision, message:'Redirect policy', askId:'redirect-approval'};
+  });
+  for (const [actor, code, verdict] of [[actors.cli,307,'pending'],[actors.cli,308,'allow'],[actors.mcp,308,'deny']]) {
+    status = code;
+    decision = verdict;
+    arrivals.length = asked.length = 0;
+    const paused = new Promise(resolve => { firstHop = resolve; });
+    const action = actor('page.click({role:"button",name:"Save"}); return true;');
+    await Promise.race([paused, action.then(report => assert.fail(JSON.stringify(report)))]);
+    const stillWaiting = await Promise.race([action.then(()=>false), delay(250,true)]);
+    release();
+    assert.equal(stillWaiting, true);
+    const report = await action;
+    assert.deepEqual(asked, ['redirect','destination'].map(path=>page.url+path));
+    if (verdict === 'allow') {
+      assert.equal(report.result, true);
+      assert.deepEqual(arrivals, ['/redirect','/destination']);
+    } else {
+      assert.deepEqual(arrivals, ['/redirect']);
+      assert.equal(report.error?.code, 'BROWSER.REQUEST_BLOCKED', JSON.stringify(report));
+      const [block] = report.error.details.blocked_requests;
+      assert.equal(block.url, page.url+'destination');
+      assert.equal(block.decision, verdict);
+      assert.equal(block.message, 'Redirect policy');
+      if (verdict === 'pending') assert.equal(block.askId, 'redirect-approval');
+      assert.match(block.hint, verdict === 'pending' ? /approval/ : /Do not try another route/);
+    }
+  }
+});

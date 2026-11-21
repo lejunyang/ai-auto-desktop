@@ -18,11 +18,19 @@ const TICK: Duration = Duration::from_millis(4);
 const REFRESH: Duration = Duration::from_secs(10);
 const ATTACH: &str = "Target.setAutoAttach";
 
+#[derive(Clone)]
+struct Origin {
+    sequence: u64,
+    page: String,
+}
+
 #[derive(Default)]
 struct History {
     next: u64,
-    pending: HashMap<Key, (u64, String, Value)>,
-    blocked: VecDeque<(u64, String, Value)>,
+    pending: HashMap<Key, (Origin, Value)>,
+    // Network keeps the same id across redirect hops; Fetch assigns one per pause.
+    chains: HashMap<Key, Origin>,
+    blocked: VecDeque<(Origin, Value)>,
 }
 
 #[path = "gate_peer.rs"]
@@ -151,6 +159,9 @@ impl Local {
             "Target.detachedFromTarget",
             "Target.targetInfoChanged",
             "Fetch.requestPaused",
+            "Network.responseReceived",
+            "Network.loadingFailed",
+            "Network.loadingFinished",
         ]);
         let (tx, rx) = mpsc::channel();
         let history = Arc::new(Mutex::new(History::default()));
@@ -187,13 +198,15 @@ impl Local {
     }
     fn window(&self, page: &str, from: u64, end: u64) -> (bool, Vec<Value>) {
         let h = self.history.lock().unwrap();
-        let selected = |n: u64, p: &str| n >= from && n < end && p == page;
-        let pending = h.pending.values().any(|(n, p, _)| selected(*n, p));
+        let selected =
+            |origin: &Origin| (from..end).contains(&origin.sequence) && origin.page == page;
+        let pending = h.pending.values().any(|(origin, _)| selected(origin))
+            || h.chains.values().any(selected);
         let records = h
             .blocked
             .iter()
-            .filter(|(n, p, _)| selected(*n, p))
-            .map(|(_, _, r)| r.clone())
+            .filter(|(origin, _)| selected(origin))
+            .map(|(_, r)| r.clone())
             .collect();
         (pending, records)
     }
@@ -295,6 +308,14 @@ impl Driver {
                 self.client
                     .session_command(Some(sid), "Fetch.disable", json!({}))
                     .map_err(|_| "request gate disable failed")?;
+                self.client
+                    .session_command(Some(sid), "Network.disable", json!({}))
+                    .map_err(|_| "request gate network tracking failed")?;
+                self.history
+                    .lock()
+                    .unwrap()
+                    .chains
+                    .retain(|(session, _), _| session != sid);
                 target.fetch = false;
             }
         } else {
@@ -310,6 +331,11 @@ impl Driver {
                     return Ok(());
                 }
                 return Err("request gate interception failed");
+            }
+            if !target.fetch {
+                self.client
+                    .session_command(Some(sid), "Network.enable", json!({}))
+                    .map_err(|_| "request gate network tracking failed")?;
             }
             target.fetch = true;
         }
@@ -400,11 +426,24 @@ impl Driver {
                 }
                 Some("Target.detachedFromTarget") => {
                     self.pages.remove(sid);
-                    self.history
-                        .lock()
-                        .unwrap()
-                        .pending
-                        .retain(|(s, _), _| s != sid);
+                    let mut history = self.history.lock().unwrap();
+                    history.pending.retain(|(s, _), _| s != sid);
+                    history.chains.retain(|(s, _), _| s != sid);
+                }
+                Some(
+                    "Network.responseReceived"
+                    | "Network.loadingFinished"
+                    | "Network.loadingFailed",
+                ) => {
+                    if let (Some(session), Some(id)) =
+                        (e["sessionId"].as_str(), p["requestId"].as_str())
+                    {
+                        self.history
+                            .lock()
+                            .unwrap()
+                            .chains
+                            .remove(&(session.into(), id.into()));
+                    }
                 }
                 Some("Fetch.requestPaused") => {
                     self.paused(e["sessionId"].as_str().unwrap_or_default(), p, tx)?
@@ -467,11 +506,21 @@ impl Driver {
         if h.pending.contains_key(&key) {
             return Ok(());
         }
-        let seq = h.next;
+        let origin = Origin {
+            sequence: h.next,
+            page: target.page.clone(),
+        };
         h.next += 1;
+        let origin = match p["networkId"].as_str() {
+            Some(id) => h
+                .chains
+                .entry((sid.into(), id.into()))
+                .or_insert(origin)
+                .clone(),
+            None => origin,
+        };
         let busy = h.pending.len() >= 128;
-        h.pending
-            .insert(key.clone(), (seq, target.page.clone(), record.clone()));
+        h.pending.insert(key.clone(), (origin, record.clone()));
         drop(h);
 
         let gate = self.gate.clone();
@@ -597,12 +646,15 @@ impl Driver {
                         let allow = record.is_none();
 
                         let mut h = self.history.lock().unwrap();
-                        let (n, page, _) = h.pending.remove(&key).unwrap();
+                        let (origin, _) = h.pending.remove(&key).unwrap();
                         if let Some(record) = record {
+                            if let Some(id) = record["request_id"].as_str() {
+                                h.chains.remove(&(key.0.clone(), id.into()));
+                            }
                             if h.blocked.len() == 512 {
                                 h.blocked.pop_front();
                             }
-                            h.blocked.push_back((n, page, record));
+                            h.blocked.push_back((origin, record));
                         }
                         let disable = self.scope.as_ref().is_ok_and(|s| s.watch.is_empty())
                             && !h.pending.keys().any(|(s, _)| s == &key.0);
@@ -627,16 +679,17 @@ impl Driver {
     }
     fn abort_pending(&mut self, message: &str) {
         let mut h = self.history.lock().unwrap();
+        h.chains.clear();
         let pending = std::mem::take(&mut h.pending);
         let keys = pending
             .into_iter()
-            .map(|(key, (n, page, mut record))| {
+            .map(|(key, (origin, mut record))| {
                 record["decision"] = json!("unavailable");
                 record["message"] = json!(message);
                 if h.blocked.len() == 512 {
                     h.blocked.pop_front();
                 }
-                h.blocked.push_back((n, page, record));
+                h.blocked.push_back((origin, record));
                 key
             })
             .collect::<Vec<_>>();
