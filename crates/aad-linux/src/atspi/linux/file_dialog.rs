@@ -294,7 +294,17 @@ fn identify(
             let role = zbus::block_on(proxy.get_role())?;
             let dialog = match toolkit {
                 Toolkit::Gtk3 => role == Role::FileChooser && states.contains(State::Active),
-                Toolkit::X11Gtk4(_) => role == Role::Dialog,
+                // Repeated Chromium saves can expose the top-level GtkWindow
+                // as a filler. GTK4 reports the Window layer only for GtkWindow.
+                // The X11 owner/class/title and the chooser, filename entry and
+                // response controls are independently pinned and revalidated.
+                Toolkit::X11Gtk4(_) => {
+                    role == Role::Dialog
+                        || (kind == Kind::Save
+                            && role == Role::Filler
+                            && zbus::block_on(backend.component_proxy(&top)?.get_layer())?
+                                == atspi::Layer::Window)
+                }
             };
             if !toolkit.enables(states) || !dialog {
                 return Err("another modal or confirmation belongs to the application".into());
