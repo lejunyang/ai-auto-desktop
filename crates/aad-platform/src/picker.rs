@@ -5,6 +5,7 @@ pub enum Kind {
     Open,
     Save,
     Directory,
+    DirectoryUpload,
 }
 
 /// Chromium's operation-specific File System Access prompt. A generic Open
@@ -13,6 +14,21 @@ pub fn directory_title(title: &str) -> bool {
     matches!(
         title,
         "Select a folder this site can view" | "选择允许此网站查看的文件夹"
+    )
+}
+
+/// Chromium can use its generic Open title for an HTML folder attachment.
+/// The caller separately checks the exact open webkitdirectory control.
+pub fn directory_upload_title(title: &str) -> bool {
+    matches!(
+        title,
+        "Open File"
+            | "Open Files"
+            | "打开文件"
+            | "Select Folder to Upload"
+            | "选择要上传的文件夹"
+            | "Select Folder"
+            | "选择文件夹"
     )
 }
 

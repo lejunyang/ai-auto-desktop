@@ -638,16 +638,32 @@ impl Session {
     }
 
     fn directory_selection(&self, files: &[String]) -> Result<(Vec<String>, Value)> {
+        if let [requested] = files {
+            let (snapshot, manifest) = self.directory_snapshot(std::path::Path::new(requested))?;
+            return Ok((vec![plain_path(&snapshot)], manifest));
+        }
+        Err(error(
+            "POLICY.DENIED",
+            "select exactly one granted upload tree",
+        ))
+    }
+
+    /// Pin and copy the exact operator-granted tree for a browser upload.
+    /// Both the CDP upload and the native chooser hand Chromium the snapshot.
+    pub fn directory_snapshot(
+        &self,
+        requested: &std::path::Path,
+    ) -> Result<(std::path::PathBuf, Value)> {
         #[cfg(target_os = "linux")]
-        if let (Some((source, grant)), [requested]) = (&self.upload_tree, files) {
-            if source == std::path::Path::new(requested) {
+        if let Some((source, grant)) = &self.upload_tree {
+            if source == requested {
                 let (snapshot, manifest) = grant.snapshot().map_err(|err| {
                     error("POLICY.DENIED", format!("upload tree snapshot: {err}"))
                 })?;
-                return Ok((vec![plain_path(&snapshot)], json!(manifest)));
+                return Ok((snapshot, json!(manifest)));
             }
         }
-        let _ = files;
+        let _ = requested;
         Err(error(
             "POLICY.DENIED",
             "select exactly the operator-granted upload tree",

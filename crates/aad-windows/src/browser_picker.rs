@@ -283,6 +283,7 @@ impl Controls {
 // A Save As dialog can change its primary button to Open when a folder is selected.
 fn matches_kind(kind: Kind, title: &str, button: &str) -> bool {
     match kind {
+        Kind::DirectoryUpload => false, // Staged folder uploads use the Linux tree grant.
         Kind::Directory => {
             matches!(
                 title,

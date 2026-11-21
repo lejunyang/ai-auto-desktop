@@ -60,7 +60,7 @@ impl FilePicker {
                         Some(GtkFileDialog::observe(portal.picker_pid, kind, deadline)?)
                     }
                     (_, Kind::Save) => Some(GtkFileDialog::observe(pid, kind, deadline)?),
-                    (_, Kind::Open | Kind::Directory) => None,
+                    (_, Kind::Open | Kind::Directory | Kind::DirectoryUpload) => None,
                 };
                 (Surface::X11(Box::new(window)), controls)
             }
@@ -188,7 +188,7 @@ impl FilePicker {
     }
 
     pub fn choose_directory(&self, path: &Path, deadline: Instant) -> Result<()> {
-        if self.kind != Kind::Directory {
+        if !matches!(self.kind, Kind::Directory | Kind::DirectoryUpload) {
             return Err("expected the observed directory picker".into());
         }
         self.select_existing(path, deadline)
@@ -201,7 +201,7 @@ impl FilePicker {
         }
         let identity = || -> Result<_> {
             let meta = path.symlink_metadata()?;
-            let expected = if self.kind == Kind::Directory {
+            let expected = if self.kind != Kind::Open {
                 meta.is_dir()
             } else {
                 meta.is_file()
@@ -466,7 +466,7 @@ impl OpenPicker {
                 .ok_or("missing GTK window class")?;
             let class = std::str::from_utf8(name)?.to_owned();
             observed.chooser = match kind {
-                Kind::Directory => return Err("this GTK 4 dialog does not expose a verified directory entry; use the desktop file portal".into()),
+                Kind::Directory | Kind::DirectoryUpload => return Err("this GTK 4 dialog does not expose a verified directory entry; use the desktop file portal".into()),
                 Kind::Save => Chooser::Gtk4Save(class),
                 Kind::Open => Chooser::Gtk4(Box::new(Gtk4Picker::observe(
                     pid,

@@ -13,6 +13,8 @@ use aad_windows::browser_picker::FilePicker;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+#[path = "open_picker/directory_input.rs"]
+mod directory_input;
 
 #[derive(clap::Args)]
 struct PageArgs {
@@ -65,15 +67,41 @@ pub struct DirectoryArgs {
     #[command(flatten)]
     page: PageArgs,
     /// Permit selection of a directory at or below this root.
-    #[arg(long = "allow-directory", value_name = "ROOT")]
-    root: PathBuf,
+    #[arg(
+        long = "allow-directory",
+        value_name = "ROOT",
+        requires = "directory",
+        required_unless_present = "upload_tree",
+        conflicts_with = "upload_tree"
+    )]
+    root: Option<PathBuf>,
     /// Absolute path of the existing directory to give the page.
-    #[arg(long, value_name = "PATH")]
-    directory: PathBuf,
+    #[arg(long, value_name = "PATH", requires = "root")]
+    directory: Option<PathBuf>,
+    /// Select a private snapshot of this exact directory for a webkitdirectory input.
+    #[arg(long = "allow-upload-tree", value_name = "SOURCE", requires = "stage")]
+    upload_tree: Option<PathBuf>,
+    /// New snapshot path outside the source tree, under a trusted parent.
+    #[arg(
+        long = "upload-tree-stage",
+        value_name = "PATH",
+        requires = "upload_tree"
+    )]
+    stage: Option<PathBuf>,
 }
 
 pub fn choose_directory(args: &DirectoryArgs) -> (Value, u8) {
-    let path = &args.directory;
+    if let (Some(source), Some(stage)) = (&args.upload_tree, &args.stage) {
+        return finish_picker(
+            run(&args.page, Selection::DirectoryUpload(source, stage)),
+            "CLI.DIRECTORY_PICKER",
+        );
+    }
+    let (Some(path), Some(root)) = (&args.directory, &args.root) else {
+        return usage(
+            "select a directory under --allow-directory or supply an exact upload tree and stage",
+        );
+    };
     if !path.is_absolute()
         || path
             .components()
@@ -81,13 +109,16 @@ pub fn choose_directory(args: &DirectoryArgs) -> (Value, u8) {
     {
         return usage("--directory requires an absolute path without '..'");
     }
-    let (Ok(root), Ok(path)) = (args.root.canonicalize(), path.canonicalize()) else {
+    let (Ok(root), Ok(path)) = (root.canonicalize(), path.canonicalize()) else {
         return usage("the grant root and selected directory must exist");
     };
     if !path.starts_with(&root) || !path.is_dir() || !root.is_dir() {
         return usage("the selected directory must be within --allow-directory");
     }
-    finish(run(&args.page, Selection::Directory(&path)))
+    finish_picker(
+        run(&args.page, Selection::Directory(&path)),
+        "CLI.DIRECTORY_PICKER",
+    )
 }
 
 fn xid(text: &str) -> Result<u64, String> {
@@ -146,20 +177,26 @@ pub fn save(args: &SaveArgs) -> (Value, u8) {
         Ok(path) => path,
         Err(err) => return usage(err.to_string()),
     };
-    finish(
-        run(&args.page, Selection::Save(&destination)).map_err(|(mut report, status)| {
-            if report["error"]["code"] == "CLI.OPEN_PICKER" {
-                report["error"]["code"] = json!("CLI.SAVE_PICKER");
-            }
-            (report, status)
-        }),
+    finish_picker(
+        run(&args.page, Selection::Save(&destination)),
+        "CLI.SAVE_PICKER",
     )
+}
+
+fn finish_picker(outcome: Outcome, code: &str) -> (Value, u8) {
+    finish(outcome.map_err(|(mut report, status)| {
+        if report["error"]["code"] == "CLI.OPEN_PICKER" {
+            report["error"]["code"] = json!(code);
+        }
+        (report, status)
+    }))
 }
 
 enum Selection<'a> {
     Open(&'a Args),
     Save(&'a NewFile),
     Directory(&'a std::path::Path),
+    DirectoryUpload(&'a std::path::Path, &'a std::path::Path),
 }
 
 fn run(args: &PageArgs, selection: Selection<'_>) -> Outcome {
@@ -167,6 +204,7 @@ fn run(args: &PageArgs, selection: Selection<'_>) -> Outcome {
         Selection::Open(open) => (Kind::Open, open.upload_dirs.as_slice()),
         Selection::Save(_) => (Kind::Save, &[][..]),
         Selection::Directory(_) => (Kind::Directory, &[][..]),
+        Selection::DirectoryUpload(..) => (Kind::DirectoryUpload, &[][..]),
     };
     let roots = upload_dirs
         .iter()
@@ -177,16 +215,23 @@ fn run(args: &PageArgs, selection: Selection<'_>) -> Outcome {
                 .ok_or_else(|| usage("--allow-upload-dir requires an existing directory"))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let session = Session::native_with_browser(
+        Policy {
+            allow_input: args.allow_input,
+            upload_roots: roots,
+            browser_access: BrowserAccess::new(&args.page_dirs, &[]).map_err(refused)?,
+            ..Policy::default()
+        },
+        Some(args.cdp_port),
+    );
     let desk = Desk {
-        session: Session::native_with_browser(
-            Policy {
-                allow_input: args.allow_input,
-                upload_roots: roots,
-                browser_access: BrowserAccess::new(&args.page_dirs, &[]).map_err(refused)?,
-                ..Policy::default()
-            },
-            Some(args.cdp_port),
-        ),
+        session: if let Selection::DirectoryUpload(source, stage) = selection {
+            session
+                .with_upload_tree(source, stage)
+                .map_err(super::automation)?
+        } else {
+            session
+        },
     };
     let deadline = Instant::now() + Duration::from_secs(30);
     let (mut browser, instance) =
@@ -239,6 +284,7 @@ fn run(args: &PageArgs, selection: Selection<'_>) -> Outcome {
     // OS controls, even when the page contains thousands of elements.
     let max_nodes = match selection {
         Selection::Open(open) if !open.native_file => aad_control::MAX_NODES,
+        Selection::DirectoryUpload(..) => aad_control::MAX_NODES,
         _ => 1,
     };
     let observed = desk.call(Operation::Observe {
@@ -263,6 +309,44 @@ fn run(args: &PageArgs, selection: Selection<'_>) -> Outcome {
             let mut result =
                 json!({"window":dialog,"browser_pid":pid,"page":args.page,"picker_closed":true});
             match selection {
+                Selection::DirectoryUpload(source, _) => {
+                    if observed["truncated"] != false {
+                        return Err(refused("incomplete observation of folder inputs"));
+                    }
+                    desk.find(&observed, Locator {
+                        states: Some(json!({"directory_picker_open":true, "protected":false, "enabled":true})),
+                        ..Locator::default()
+                    }, Expect::One)?;
+                    let mut input =
+                        directory_input::Input::observe(args, &observed["metadata"], deadline)?;
+                    let (snapshot, manifest) = desk
+                        .session
+                        .directory_snapshot(source)
+                        .map_err(super::automation)?;
+                    verify_page_binding(&mut browser, args, window.0, picker.process_only())?;
+                    verify_document(args, &observed["metadata"], deadline)?;
+                    if page_window(&mut browser, &args.page)? != window {
+                        return Err(refused("folder input changed windows"));
+                    }
+                    input.revalidate()?;
+                    picker.revalidate(deadline).map_err(refused)?;
+                    picker
+                        .choose_directory(&snapshot, deadline)
+                        .map_err(|e| uncertain("CLI.DIRECTORY_PICKER", e))?;
+                    result["directory_selected"] = json!(true);
+                    let receipt = input.file_list(&manifest);
+                    if receipt == "mismatch" {
+                        let (mut report, status) = uncertain(
+                            "CLI.DIRECTORY_MISMATCH",
+                            "the browser FileList differs from the granted snapshot",
+                        );
+                        report["picker_closed"] = json!(true);
+                        report["snapshot"] = json!(snapshot);
+                        return Err((report, status));
+                    }
+                    result["file_list"] = json!(receipt);
+                    result["snapshot"] = json!(snapshot);
+                }
                 Selection::Directory(path) => {
                     picker
                         .choose_directory(path, deadline)

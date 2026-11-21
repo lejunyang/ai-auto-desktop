@@ -379,7 +379,10 @@
         if (landmark(el)) node.landmark=true;
         if (closedRoots.has(el)) node.surface='closed_shadow';
         if (checkable(el)) node.states.checked=checkedOf(el);
-        if (pickerOpen!==null) node.states.picker_open=pickerOpen;
+        if (pickerOpen!==null) {
+          node.states.picker_open=pickerOpen;
+          if (el.webkitdirectory) node.states.directory_picker_open=pickerOpen;
+        }
         if (fileInput(el)) { node.states.hidden=!visible(el); node.files=Array.from(el.files||[]).slice(0,32).map(f=>f.name.slice(0,256)); node.multiple=!!el.multiple; if(el.webkitdirectory)node.directory=true; }
         if (el.tagName==='SELECT') node.options=Array.from(el.options).slice(0,100).map(o=>o.label.trim().slice(0,256));
         return node;

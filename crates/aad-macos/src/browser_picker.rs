@@ -32,6 +32,7 @@ impl FilePicker {
             Kind::Open => "open",
             Kind::Save => "save",
             Kind::Directory => "directory",
+            Kind::DirectoryUpload => return Err("staged folder uploads require Linux".into()),
         };
         let observed = helper.rpc(
             "picker_observe",

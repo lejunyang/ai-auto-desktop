@@ -134,6 +134,11 @@ impl KdeDialog {
 }
 
 fn identify(b: &LinuxBackend, pid: u32, kind: Kind, deadline: Instant) -> Result<Identity> {
+    let directory_title: Option<fn(&str) -> bool> = match kind {
+        Kind::Directory => Some(aad_platform::picker::directory_title),
+        Kind::DirectoryUpload => Some(aad_platform::picker::directory_upload_title),
+        _ => None,
+    };
     let mut apps = Vec::new();
     for app in b.children(&LinuxBackend::root_ref(), deadline)? {
         if b.process_id(&app.bus_name) == Some(pid) {
@@ -154,12 +159,15 @@ fn identify(b: &LinuxBackend, pid: u32, kind: Kind, deadline: Instant) -> Result
         let states = zbus::block_on(proxy.get_state())?;
         if shown(states) {
             let role = zbus::block_on(proxy.get_role())?;
-            if kind == Kind::Directory
+            if directory_title.is_some()
                 && role == Role::Dialog
                 && !states.contains(State::Active)
-                && aad_platform::picker::directory_title(&zbus::block_on(proxy.name())?)
                 && b.children(&top, deadline)?.is_empty()
             {
+                let title = zbus::block_on(proxy.name())?;
+                if !directory_title.is_some_and(|matches_title| matches_title(&title)) {
+                    return Err("unexpected inactive KDE dialog".into());
+                }
                 if shell.replace(top).is_some() {
                     return Err("ambiguous KDE directory shells".into());
                 }
@@ -176,8 +184,11 @@ fn identify(b: &LinuxBackend, pid: u32, kind: Kind, deadline: Instant) -> Result
         }
     }
     let (window, title) = single(dialogs, "expected one active KDE file dialog")?;
-    if kind == Kind::Directory {
-        return directory_controls(b, app, window, title, shell, deadline);
+    if let Some(matches_title) = directory_title {
+        if !matches_title(&title) {
+            return Err("unexpected Chromium directory chooser operation".into());
+        }
+        return directory_controls(b, app, window, title, shell, kind, deadline);
     }
     if title.is_empty()
         || (kind == Kind::Open
@@ -304,11 +315,9 @@ fn directory_controls(
     window: NativeRef,
     title: String,
     shell: Option<NativeRef>,
+    kind: Kind,
     deadline: Instant,
 ) -> Result<Identity> {
-    if !aad_platform::picker::directory_title(&title) {
-        return Err("expected a Chromium directory selection dialog".into());
-    }
     // KDirSelectDialog has a directory tree and a single path combo in its
     // frame. Do not enumerate tree rows or select a folder by basename.
     let children = |node: &NativeRef| -> Result<Vec<NativeRef>> {
@@ -352,7 +361,16 @@ fn directory_controls(
                     ));
                 }
                 (Role::Panel, Role::Button) => match zbus::block_on(proxy.name())?.as_str() {
-                    "OK" | "确定" if state.contains(State::IsDefault) => accepts.push(control),
+                    "OK" | "确定"
+                        if kind == Kind::Directory && state.contains(State::IsDefault) =>
+                    {
+                        accepts.push(control)
+                    }
+                    "Upload" | "上传"
+                        if kind == Kind::DirectoryUpload && state.contains(State::IsDefault) =>
+                    {
+                        accepts.push(control)
+                    }
                     "Cancel" | "取消" => cancels.push(control),
                     "New Folder..." | "新建文件夹..." | "新建文件夹…" => (),
                     _ => return Err("unexpected KDE directory response".into()),

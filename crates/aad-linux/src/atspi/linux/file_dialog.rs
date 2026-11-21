@@ -250,7 +250,7 @@ impl GtkFileDialog {
     pub(crate) fn respond(&self, deadline: Instant) -> Result<()> {
         let button = match self.kind {
             Kind::Open => &self.controls.cancel,
-            Kind::Save | Kind::Directory => &self.controls.accept,
+            Kind::Save | Kind::Directory | Kind::DirectoryUpload => &self.controls.accept,
         };
         self.backend.invoke_canonical(button, "click", deadline)?;
         Ok(())
@@ -316,6 +316,9 @@ fn identify(
     if kind == Kind::Directory && !aad_platform::picker::directory_title(&title) {
         return Err("expected a Chromium directory selection dialog".into());
     }
+    if kind == Kind::DirectoryUpload && !aad_platform::picker::directory_upload_title(&title) {
+        return Err("expected a Chromium folder upload dialog".into());
+    }
     // Chromium directory pickers also expose Select and show_location. Bind
     // the browser's file-specific operation title as well as the GTK controls.
     if kind == Kind::Open
@@ -377,6 +380,7 @@ fn identify(
                         "Select" | "Open" | "选择" | "打开" if kind != Kind::Save => {
                             accept.push(child)
                         }
+                        "Upload" | "上传" if kind == Kind::DirectoryUpload => accept.push(child),
                         "_Save Save" | "_Open Open" | "Save" | "保存" | "Select" | "Open"
                         | "选择" | "打开" => {
                             return Err("unexpected chooser response button".into())
