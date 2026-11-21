@@ -7,6 +7,7 @@ param(
     [string]$Aad = $env:AAD_TEST_CLI,
     [switch]$DirectGtk4,
     [switch]$RecordSaveAs,
+    [switch]$FolderUpload,
     [switch]$InsideSession
 )
 $ErrorActionPreference = 'Stop'
@@ -34,7 +35,7 @@ if ($InsideSession) {
             & gdbus call --session -d org.freedesktop.portal.Desktop -o /org/freedesktop/portal/desktop -m org.freedesktop.DBus.Properties.Get org.freedesktop.portal.FileChooser version
             if ($LASTEXITCODE) { throw 'File portal did not start' }
         }
-        $test = if ($RecordSaveAs) { 'tests/browser/record-save-as.test.mjs' } elseif ($DirectGtk4) { 'tests/browser/native-gtk4-save.test.mjs' } elseif ($Backend -eq 'kde') { 'tests/browser/native-kde-picker.test.mjs' } else { 'tests/browser/native-portal-picker.test.mjs' }
+        $test = if ($FolderUpload) { 'tests/browser/native-folder-upload.test.mjs' } elseif ($RecordSaveAs) { 'tests/browser/record-save-as.test.mjs' } elseif ($DirectGtk4) { 'tests/browser/native-gtk4-save.test.mjs' } elseif ($Backend -eq 'kde') { 'tests/browser/native-kde-picker.test.mjs' } else { 'tests/browser/native-portal-picker.test.mjs' }
         & node --test $test
         exit $LASTEXITCODE
     } finally {
@@ -80,6 +81,7 @@ try {
     Remove-Item Env:DISPLAY,Env:WAYLAND_DISPLAY,Env:AT_SPI_BUS_ADDRESS,Env:NO_AT_BRIDGE,Env:SESSION_MANAGER,Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
     $inner = @('--', (Get-Process -Id $PID).Path, '-NoProfile', '-File', $PSCommandPath, '-InsideSession', '-Desktop', $Desktop, '-Backend', $Backend)
     if ($RecordSaveAs) { $inner += '-RecordSaveAs' }
+    if ($FolderUpload) { $inner += '-FolderUpload' }
     if ($DirectGtk4) {
         $services = New-Item (Join-Path $env:XDG_DATA_HOME 'dbus-1/services') -ItemType Directory -Force
         "[D-BUS Service]`nName=org.freedesktop.portal.Desktop`nExec=/usr/bin/false" | Set-Content (Join-Path $services.FullName 'org.freedesktop.portal.Desktop.service')
