@@ -156,6 +156,38 @@ fn cancelling_after_observation_stops_a_saved_click_before_dispatch() {
 }
 
 #[test]
+fn a_running_workflow_passes_its_cancel_signal_to_the_current_step() {
+    let (session, backend) = session();
+    let token = aad_runtime::CancellationToken::new();
+    backend
+        .observations
+        .lock()
+        .unwrap()
+        .push_back(ObservationReply::Cancel(token.clone()));
+    let click = act(
+        "save",
+        Some("notes"),
+        named("button", "Save"),
+        json!({"type":"click"}),
+    );
+    let descriptor =
+        aad_core::compile_descriptor(steps::workflow("cancel-save", &[click]).unwrap(), None)
+            .unwrap();
+    let mut providers = aad_runtime::ProviderRegistry::new();
+    providers.insert(Arc::new(steps::StepProvider::new(session)));
+    let options = aad_runtime::RunOptions {
+        cancel: token.shared_flag(),
+        ..Default::default()
+    }
+    .with_providers(providers)
+    .with_granted_permissions(["desktop.input", "desktop.observe"]);
+    let result = aad_runtime::engine::run(&descriptor, options);
+    assert_eq!(result.status.as_str(), "cancelled", "{:?}", result.error);
+    assert_eq!(result.error.unwrap().effect, "not_applied");
+    assert!(backend.acted.lock().unwrap().is_empty());
+}
+
+#[test]
 fn reads_named_fields_in_a_read_only_session() {
     let (_, backend) = session();
     let session = Session::new(vec![backend], Policy::default());

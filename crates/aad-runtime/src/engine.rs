@@ -500,9 +500,10 @@ only if you trust this descriptor."
             json!({"id": step.id, "uses": uses, "attempt": attempt}),
         );
         let started = Instant::now();
+        let cancellation = crate::CancellationToken::from_run_flag(self.cancel.clone());
         let result = if let Some(ledger) = &mut self.recovery {
             ledger.dispatch(step, &scope, &args, contract, || {
-                provider.invoke(&uses, args.clone(), Some(timeout))
+                provider.invoke_cancellable(&uses, args.clone(), Some(timeout), &cancellation)
             })
         } else if contract.has_artifacts() {
             let artifacts = self.artifacts.as_deref().ok_or_else(|| {
@@ -515,7 +516,7 @@ only if you trust this descriptor."
             })?;
             provider.invoke_with_artifacts(&uses, args, Some(timeout), artifacts)
         } else {
-            provider.invoke(&uses, args, Some(timeout))
+            provider.invoke_cancellable(&uses, args, Some(timeout), &cancellation)
         };
         let elapsed = started.elapsed().as_secs_f64();
 
@@ -547,6 +548,20 @@ only if you trust this descriptor."
                 Ok(Flow::Next)
             }
             Err(mut error) => {
+                if cancellation.is_cancelled()
+                    && matches!(
+                        error.code.as_str(),
+                        "CONTROL.CANCELLED" | "DRIVER.CANCELLED"
+                    )
+                    && error.effect == "not_applied"
+                {
+                    error = AutomationError::new(
+                        "WORKFLOW.CANCELLED",
+                        "the run was cancelled before dispatch",
+                    )
+                    .with_effect("not_applied")
+                    .with_cause(error);
+                }
                 // A read-only action cannot have changed anything, even when
                 // the transport outcome was ambiguous.
                 if declared_effect.as_deref() == Some("read_only") && error.effect == "unknown" {

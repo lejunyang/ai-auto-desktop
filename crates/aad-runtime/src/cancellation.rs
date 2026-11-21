@@ -18,6 +18,10 @@ impl CancellationToken {
         Self::default()
     }
 
+    pub(crate) fn from_run_flag(cancelled: Arc<AtomicBool>) -> Self {
+        Self { cancelled }
+    }
+
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
     }
