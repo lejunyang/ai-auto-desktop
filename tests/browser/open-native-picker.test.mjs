@@ -22,13 +22,14 @@ async function waitDialog(owner) {
   assert.fail('the headed browser did not map a native dialog');
 }
 
-test('complete an already-open X11 file picker on the observed page', {
+const gtk = process.env.AAD_TEST_PICKER_GTK || '3';
+test(`complete an already-open GTK ${gtk} X11 file picker on the observed page`, {
   skip: !process.env.AAD_TEST_PICKER_X11 || !process.env.AAD_TEST_CHROME, timeout: 150_000
 }, async t => {
   const page = await fixture((_req, res) => {
     res.setHeader('Content-Type', 'text/html');
     res.end('<input type=file id=files hidden multiple><input type=file id=sibling><input id=text value=original>');
-  }, ['--ozone-platform=x11', '--gtk-version=3'], {headed:true});
+  }, ['--ozone-platform=x11', '--gtk-version='+gtk], {headed:true});
   t.after(() => page.close());
   const allowed = join(page.root, 'grant');
   await mkdir(allowed);
@@ -50,6 +51,7 @@ test('complete an already-open X11 file picker on the observed page', {
   const gesture = expression => page.cdp.call('Runtime.evaluate', {expression, userGesture:true});
   await gesture('files.click()');
   const picker = await waitDialog(owner);
+  const {stdout:properties} = await exec('xprop', ['-id', picker, 'WM_WINDOW_ROLE', '_NET_WM_PID']);
   const opened = () => page.cdp.eval('[files.matches(":open"), sibling.matches(":open"), files.files.length, sibling.files.length]');
   assert.deepEqual(await opened(), [true, false, 0, 0]);
   await reject(run(page.target.id, '--window', owner, '--file', first), 'CLI.OPEN_PICKER');
@@ -60,6 +62,8 @@ test('complete an already-open X11 file picker on the observed page', {
   const {stdout} = await run(page.target.id, '--file', second, '--file', first);
   const result = JSON.parse(stdout);
   assert.equal(String(result.window), picker);
+  assert.equal(Number(properties.match(/_NET_WM_PID\(CARDINAL\) = (\d+)/)[1]), result.browser_pid);
+  assert.equal(properties.includes('"GtkFileChooserDialog"'), gtk === '3');
   assert.equal(result.picker_closed, true);
   assert.equal(result.file_count, 2);
   assert.equal(await active(), owner);
@@ -70,6 +74,10 @@ test('complete an already-open X11 file picker on the observed page', {
   await gesture('void showSaveFilePicker({suggestedName:"outside.txt"}).catch(()=>{})');
   const save = await waitDialog(owner);
   await reject(run(page.target.id, '--window', save, '--file', first), 'CLI.OPEN_PICKER');
+  if (gtk === '4') {
+    await exec('xprop', ['-id', save, '-f', '_NET_WM_NAME', '8u', '-set', '_NET_WM_NAME', 'Open File']);
+    await reject(run(page.target.id, '--window', save, '--file', first), 'CLI.OPEN_PICKER');
+  }
   assert.equal(await active(), save);
   assert.equal(await readFile(outside, 'utf8'), 'original outside');
 });
