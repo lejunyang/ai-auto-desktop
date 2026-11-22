@@ -10,8 +10,7 @@ use super::{JournalError, Result};
 /// still arbitrate with us through SQLite's file lock.
 #[derive(Default)]
 pub(super) struct Writers {
-    queue: Mutex<VecDeque<u64>>,
-    changed: Condvar,
+    queue: Mutex<VecDeque<Arc<Condvar>>>,
 }
 
 impl Writers {
@@ -30,17 +29,17 @@ impl Writers {
 
     pub(super) fn enter(&self, deadline: Instant) -> Result<Turn<'_>> {
         let mut queue = self.queue.lock().unwrap();
-        let ticket = queue.back().map_or(0, |last| last.wrapping_add(1));
-        queue.push_back(ticket);
-        while queue.front() != Some(&ticket) {
+        let turn = Arc::new(Condvar::new());
+        queue.push_back(turn.clone());
+        while !queue.front().is_some_and(|head| Arc::ptr_eq(head, &turn)) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                queue.retain(|&waiting| waiting != ticket);
+                queue.retain(|waiting| !Arc::ptr_eq(waiting, &turn));
                 return Err(JournalError::Storage(
                     "timed out waiting for the journal writer".into(),
                 ));
             }
-            queue = self.changed.wait_timeout(queue, remaining).unwrap().0;
+            queue = turn.wait_timeout(queue, remaining).unwrap().0;
         }
         Ok(Turn(self))
     }
@@ -50,7 +49,10 @@ pub(super) struct Turn<'a>(&'a Writers);
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
-        self.0.queue.lock().unwrap().pop_front();
-        self.0.changed.notify_all();
+        let mut queue = self.0.queue.lock().unwrap();
+        queue.pop_front();
+        if let Some(next) = queue.front() {
+            next.notify_one();
+        }
     }
 }

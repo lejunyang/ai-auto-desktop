@@ -57,7 +57,7 @@ pub fn default_store_path() -> PathBuf {
 pub const SCHEMA_VERSION: i64 = 1;
 
 /// How long a writer waits for a competing transaction before giving up.
-pub const DEFAULT_BUSY_TIMEOUT_MS: u32 = 5_000;
+pub const DEFAULT_BUSY_TIMEOUT_MS: u32 = 30_000;
 
 /// Where a run has actually got to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -532,9 +532,10 @@ impl JournalStore {
     fn migrate(&self) -> Result<()> {
         // Opening an existing journal to read progress can share a WAL snapshot
         // with a running writer. Only migrations require the writer lock.
-        let version: i64 = self
-            .connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version: i64 = self.retry_busy(Instant::now() + self.busy_timeout, || {
+            self.connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+        })?;
         if version == SCHEMA_VERSION {
             return Ok(());
         }
@@ -580,6 +581,10 @@ impl JournalStore {
         mut attempt: impl FnMut() -> rusqlite::Result<T>,
     ) -> Result<T> {
         self.connection.busy_timeout(Duration::ZERO)?;
+        // Contending processes can otherwise all retry at the same instant
+        // throughout WAL creation or a slow FULL-synchronous commit.
+        let mut delay_ms = 1;
+        let phase_ms = u64::from(std::process::id() % 5);
         let result = loop {
             let result = attempt();
             if !matches!(&result, Err(e) if e.sqlite_error_code() == Some(ErrorCode::DatabaseBusy))
@@ -590,7 +595,8 @@ impl JournalStore {
             if remaining.is_zero() {
                 break result;
             }
-            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            std::thread::sleep(remaining.min(Duration::from_millis(delay_ms + phase_ms)));
+            delay_ms = (delay_ms * 2).min(24);
         };
         self.connection.busy_timeout(self.busy_timeout)?;
         Ok(result?)
