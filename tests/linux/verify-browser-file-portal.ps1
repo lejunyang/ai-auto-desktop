@@ -36,7 +36,8 @@ if ($InsideSession) {
             if ($LASTEXITCODE) { throw 'File portal did not start' }
         }
         $test = if ($FolderUpload) { 'tests/browser/native-folder-upload.test.mjs' } elseif ($RecordSaveAs) { 'tests/browser/record-save-as.test.mjs' } elseif ($DirectGtk4) { 'tests/browser/native-gtk4-save.test.mjs' } elseif ($Backend -eq 'kde') { 'tests/browser/native-kde-picker.test.mjs' } else { 'tests/browser/native-portal-picker.test.mjs' }
-        & node --test $test
+        if ($RecordSaveAs) { $test = @($test, 'tests/browser/record-download-save-as.test.mjs') }
+        & node --test --test-concurrency=1 $test
         exit $LASTEXITCODE
     } finally {
         if (!$wm.HasExited) { $wm.Kill(); $wm.WaitForExit() }

@@ -1,6 +1,6 @@
 import {createServer} from 'node:http';
 import {spawn} from 'node:child_process';
-import {mkdtemp,readFile,rm} from 'node:fs/promises';
+import {mkdir,mkdtemp,readFile,rm,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
@@ -32,8 +32,16 @@ export async function connect(url) {
   };
 }
 
-export async function fixture(handler, flags = [], {headed = false} = {}) {
+export async function fixture(handler, flags = [], {headed = false, downloadPrompt} = {}) {
   const root=await mkdtemp(join(tmpdir(),'aad-observation-test-'));
+  if (downloadPrompt !== undefined) {
+    const directory = join(root,'downloads');
+    await mkdir(directory);
+    await mkdir(join(root,'Default'));
+    await writeFile(join(root,'Default','Preferences'),JSON.stringify({
+      download:{prompt_for_download:downloadPrompt,default_directory:directory}
+    }));
+  }
   const server=createServer(handler);
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const url=`http://127.0.0.1:${server.address().port}/`;
