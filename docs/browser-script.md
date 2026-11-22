@@ -31,6 +31,8 @@ MCP 使用同名参数。在一次 `browser_script` 调用中传 `source`（上�
 | `page.present(locator)`、`page.read(locator, property)` | 判断元素是否存在，或读取 `value`（默认）、`name`、`checked`、`enabled`、`selected`。定位有歧义会报错。 |
 | `page.fields([{as, locator, property}, …])` | 在一次观察中读取多个字段，返回按名字取值的对象。 |
 | `page.readText(locator, language?)` | 从 Chromium 画布上读出文字、每个词的位置和置信度。适合没有 DOM 文字的流程图和白板。[画布文字示例](testing/canvas-grid-ocr.md#read-labels-without-a-grid) |
+| `page.readObjects(locator, options?)` | 读出 Chromium 画布上的对象、边界和连线。传入 `{description:"a printer icon"}` 可让本机视觉模型查找图标。 |
+| `page.clickObject(locator, query, options?)` | 重新读取画布，按标签、形状或前后节点定位，点击唯一匹配的对象。若有多个匹配，返回候选供选择。[对象选择和预览](canvas-objects.md) |
 | `page.table(locator, columns)` | 从 Chromium 已渲染的表格里按列取记录，返回完整性提示。 |
 | `page.collect({table, columns, row_key, traversal, expected_rows})` | 跨页或滚动收集同一张表。用 `traversal: {mode:"pagination", next:{name:"下一页"}}` 指定翻页按钮；虚拟列表使用 `mode:"virtual_scroll"` 和 `container` 定位器。结果包含 `records`、`complete` 和 `stop_reason`。 |
 | `page.wait(locator, condition, states)` | 等待 `appears`、`disappears` 或 `state`。最后一种传期望状态，例如 `{enabled:true}`。 |

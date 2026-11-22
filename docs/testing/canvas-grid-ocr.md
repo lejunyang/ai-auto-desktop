@@ -12,7 +12,7 @@ Read the words painted on a visible Chromium canvas by providing its locator. Te
 aad browser read --browser-port 9222 --url 'http://localhost:8080/diagram' --canvas-text '{"name":"Diagram"}' --language en-US
 ```
 
-Scripts can use `page.readText({name:"Diagram"}, "en-US")`. MCP clients can use `control_read_text` on the observed canvas. When the diagram stays still, the centre of a unique word gives a location for an ordinary canvas click. Read again after a pan, zoom or redraw. An empty canvas returns an empty list. OCR reads printed labels, and shapes or connecting lines without text require visual interpretation. [Example with an independently verified click](../../tests/browser/canvas-text.test.mjs)
+Scripts can use `page.readText({name:"Diagram"}, "en-US")`. MCP clients can use `control_read_text` on the observed canvas. When the diagram stays still, the centre of a unique word gives a location for an ordinary canvas click. Read again after a pan, zoom or redraw. An empty canvas returns an empty list. Use `page.readObjects` to identify shapes and directed connections. [Word click example](../../tests/browser/canvas-text.test.mjs) · [Object recognition](../canvas-objects.md)
 
 ## Read regular cells
 
