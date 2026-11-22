@@ -257,6 +257,8 @@ postcondition:
 `--store` 可省略：默认是每用户一份的 `~/.ai-auto-desktop/runs.sqlite3`（`AAD_RUN_STORE` 可覆盖），
 MCP 的 `run_workflow` 持久模式也写这里，所以 AI 起的运行能直接用 `aad status` / `aad resume` 跟进。
 
+多个进程同时写同一份运行库时，AAD 在数据库旁使用 `.aad-writer.lock` 后缀的文件协调下一次写入。这个文件可以一直存在，进程退出后系统会释放锁。普通日志写入默认最多等 30 秒；续租按租期安排，过期的执行者须重新取得租约。
+
 ```powershell
 aad start workflow.yaml --store runs.sqlite3 --run-id job-1
 aad status job-1  --store runs.sqlite3     # 进度、当前状态、检查点
