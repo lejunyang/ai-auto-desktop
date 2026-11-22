@@ -24,6 +24,7 @@ struct ReadOnlyProvider {
     manifest: CapabilityManifest,
     calls: AtomicUsize,
     failure: Option<aad_core::AutomationError>,
+    during_action: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl ReadOnlyProvider {
@@ -51,6 +52,7 @@ impl ReadOnlyProvider {
             manifest: manifest::parse(&raw).expect("valid provider"),
             calls: AtomicUsize::new(0),
             failure: None,
+            during_action: None,
         })
     }
 
@@ -77,6 +79,9 @@ impl Provider for ReadOnlyProvider {
         _timeout: Option<Duration>,
     ) -> Result<Value, aad_core::AutomationError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(during_action) = &self.during_action {
+            during_action();
+        }
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -272,6 +277,46 @@ fn digest_json(value: &Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(canonical_json(value));
     format!("sha256:{:x}", hasher.finalize())
+}
+
+#[test]
+fn heartbeat_recovers_when_a_competing_writer_releases_before_lease_expiry() {
+    let temp = TempDir::new("busy-heartbeat");
+    let path = temp.journal_path();
+    let mut provider = ReadOnlyProvider::new();
+    Arc::get_mut(&mut provider).unwrap().during_action = Some(Box::new(move || {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let expiry = || {
+            db.query_row(
+                "SELECT lease_expires_at FROM runs WHERE run_id='run-1'",
+                [],
+                |row| row.get::<_, f64>(0),
+            )
+            .unwrap()
+        };
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let initial = expiry();
+        // Eight-second lease, two-second renewal interval. Hold the database
+        // through the first renewal for longer than the old 500 ms busy limit.
+        std::thread::sleep(Duration::from_secs(3));
+        db.execute_batch("COMMIT").unwrap();
+        while expiry() == initial {
+            assert!(
+                aad_runtime::durable::now_seconds() < initial,
+                "keeper failed to renew the live lease"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }));
+    let result = DurableExecutor::new(temp.open())
+        .start(
+            &read_only_workflow(),
+            Some("run-1"),
+            read_only_options(provider.clone()).with_lease_ttl_seconds(8.0),
+        )
+        .unwrap();
+    assert_eq!(result.run.status, RunStatus::Succeeded);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

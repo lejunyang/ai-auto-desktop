@@ -480,6 +480,11 @@ impl JournalStore {
         Ok(store)
     }
 
+    pub(crate) fn heartbeat_connection(&self, ttl_seconds: f64) -> Result<Self> {
+        let wait_ms = self.busy_timeout.as_millis() as u32;
+        Self::open_with_timeout(&self.path, wait_ms.min((ttl_seconds * 500.0) as u32))
+    }
+
     /// Apply and then *verify* the pragmas the journal depends on.
     ///
     /// Verification is the point. SQLite silently ignores a pragma it cannot

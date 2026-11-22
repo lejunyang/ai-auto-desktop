@@ -153,7 +153,7 @@ struct FinalizedRun {
 
 /// Decision made under the same lease and writer lock as dispatch.
 enum Dispatch {
-    Authorized,
+    Authorized { expires_at: f64 },
     Paused(Box<RunRecord>),
     Cancelled,
 }
@@ -662,7 +662,7 @@ impl DurableExecutor {
                 &step_id,
                 options.lease_ttl_seconds,
             )? {
-                Dispatch::Authorized => {}
+                Dispatch::Authorized { .. } => {}
                 Dispatch::Paused(run) => {
                     return Ok(DurableOutcome {
                         run: *run,
@@ -731,9 +731,11 @@ impl DurableExecutor {
             .with_owner(lease, LeaseTime::Current, |owned| {
                 match owned.expect(Some(RunStatus::Running), None)? {
                     DesiredState::Run => {
-                        owned.heartbeat(ttl_seconds)?;
+                        let renewed = owned.heartbeat(ttl_seconds)?;
                         owned.checkpoint(event_type, payload, checkpoint)?;
-                        Ok(Dispatch::Authorized)
+                        Ok(Dispatch::Authorized {
+                            expires_at: renewed.expires_at,
+                        })
                     }
                     DesiredState::Pause => {
                         let run = owned.set_status(
@@ -785,7 +787,7 @@ impl DurableExecutor {
             &prepared.step.id,
             options.lease_ttl_seconds,
         )? {
-            Dispatch::Authorized => {}
+            Dispatch::Authorized { .. } => {}
             Dispatch::Paused(run) => {
                 segmented.release_action_attempt()?;
                 return Ok(DurableOutcome {
@@ -820,6 +822,12 @@ impl DurableExecutor {
         checkpoint: Value,
     ) -> Result<DurableOutcome, AutomationError> {
         let operation_id = checkpoint["actionIntent"]["operationId"].clone();
+        // Open the keeper connection before the final authorization. That
+        // transaction renews the lease and records the dispatch together.
+        let keeper = self
+            .journal
+            .heartbeat_connection(options.lease_ttl_seconds)
+            .map_err(journal_error)?;
         match self.authorize_dispatch(
             &lease,
             "run.action_dispatch_authorized",
@@ -828,7 +836,7 @@ impl DurableExecutor {
             &prepared.step.id,
             options.lease_ttl_seconds,
         )? {
-            Dispatch::Authorized => {}
+            Dispatch::Authorized { expires_at } => lease.expires_at = expires_at,
             Dispatch::Paused(run) => {
                 return Ok(DurableOutcome {
                     run: *run,
@@ -844,7 +852,8 @@ impl DurableExecutor {
             }
         }
 
-        let result = self.invoke_with_lease_heartbeat(segmented, &prepared, &lease, options);
+        let result =
+            self.invoke_with_lease_heartbeat(segmented, &prepared, &lease, options, keeper);
         lease = self
             .journal
             .heartbeat_owner(&lease, options.lease_ttl_seconds, LeaseTime::Current)
@@ -901,47 +910,38 @@ impl DurableExecutor {
         prepared: &PreparedAction,
         lease: &OwnerLease,
         options: &DurableOptions,
+        journal: JournalStore,
     ) -> Result<Value, AutomationError> {
-        let path = self.journal.path.clone();
         let held = lease.clone();
         let ttl = options.lease_ttl_seconds;
         let (stop_sender, stop_receiver) = mpsc::channel();
-        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let keeper = std::thread::spawn(move || -> Result<(), JournalError> {
-            let journal = match JournalStore::open_with_timeout(&path, 500) {
-                Ok(journal) => journal,
-                Err(error) => {
-                    let _ = ready_sender.send(false);
-                    return Err(error);
-                }
-            };
-            if let Err(error) = journal.heartbeat_owner(&held, ttl, LeaseTime::Current) {
-                let _ = ready_sender.send(false);
-                return Err(error);
-            }
-            let _ = ready_sender.send(true);
-            let interval = Duration::from_secs_f64((ttl / 4.0).max(0.05));
+            let mut expiry = held.expires_at;
             loop {
+                // Account for time spent committing the last renewal and for
+                // delays scheduling this thread, even during a short lease.
+                let remaining = (expiry - durable::now_seconds()).max(0.0);
+                let interval = Duration::from_secs_f64((remaining - ttl * 0.75).clamp(0.0, 60.0));
                 match stop_receiver.recv_timeout(interval) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        journal.heartbeat_owner(&held, ttl, LeaseTime::Current)?;
+                        expiry = journal
+                            .heartbeat_owner(&held, ttl, LeaseTime::Current)?
+                            .expires_at;
                     }
                 }
             }
         });
-        let ready_timeout = Duration::from_secs_f64((ttl / 2.0).clamp(0.05, 1.0));
-        if ready_receiver.recv_timeout(ready_timeout) != Ok(true) {
-            let _ = stop_sender.send(());
-            let _ = keeper.join();
-            return Err(AutomationError::new(
+        let result = if durable::now_seconds() >= lease.expires_at {
+            Err(AutomationError::new(
                 "DURABLE.LEASE_HEARTBEAT_FAILED",
-                "durable action lease heartbeat failed before dispatch",
+                "durable action lease expired before dispatch",
             )
             .with_category("durable")
-            .with_effect("not_applied"));
-        }
-        let result = invoke_durable_action(segmented, prepared);
+            .with_effect("not_applied"))
+        } else {
+            invoke_durable_action(segmented, prepared)
+        };
         let _ = stop_sender.send(());
         let heartbeat = keeper.join().map_err(|_| {
             durable_error(
