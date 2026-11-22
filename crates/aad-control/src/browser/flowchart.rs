@@ -254,7 +254,7 @@ impl Bitmap {
                         rows: spans.to_vec(),
                     };
                     if let Some(outline) = self
-                        .outline(&inside)
+                        .outline(&inside, kind)
                         .filter(|_| !objects.iter().any(|object| object.inside.encloses(&inside)))
                     {
                         if objects.len() == MAX_OBJECTS {
@@ -274,7 +274,7 @@ impl Bitmap {
         Ok(objects)
     }
 
-    fn outline(&self, inside: &Profile) -> Option<Profile> {
+    fn outline(&self, inside: &Profile, kind: &str) -> Option<Profile> {
         let mut grow = 0;
         for radius in 1..=7 {
             let (mut ink, mut total) = (0, 0);
@@ -287,7 +287,8 @@ impl Bitmap {
                     .count();
                 total += width;
             });
-            if total == 0 || ink * 5 < total {
+            let coverage = if kind == "diamond" { 20 } else { 5 };
+            if total == 0 || ink * coverage < total {
                 break;
             }
             grow = radius;
@@ -598,7 +599,12 @@ impl Bitmap {
                 }
                 cursor += 1;
             }
-            if (!ambiguous && owners[0] == 0) || component.len() < 8 {
+            if component.len() < 8
+                || (!ambiguous
+                    && (owners[0] == 0
+                        || (owners[1] == 0
+                            && component.iter().all(|&index| marks[index].owner != 0))))
+            {
                 continue;
             }
             if result.len() == MAX_EDGES {
@@ -670,7 +676,7 @@ fn route(trace: &[Point]) -> Option<Vec<Segment>> {
         let furthest = ((first + 1)..last)
             .map(|index| (index, segment.distance(trace[index])))
             .max_by(|left, right| left.1.total_cmp(&right.1));
-        if let Some((split, _)) = furthest.filter(|(_, distance)| *distance > 2.0) {
+        if let Some((split, _)) = furthest.filter(|(_, distance)| *distance > 3.0) {
             if knots.len() == 7 {
                 return None;
             }
