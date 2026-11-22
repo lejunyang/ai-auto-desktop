@@ -206,7 +206,9 @@ impl Step {
             if name == "save_as" {
                 if self.app.provider.as_deref() != Some(crate::browser::PROVIDER)
                     || self.input.is_none()
-                    || action.as_object().is_none_or(|fields| fields.len() != 2)
+                    || action.as_object().is_none_or(|fields| {
+                        fields.len() != if action["source"] == "download" { 3 } else { 2 }
+                    })
                     || !matches!(action["trigger"].as_str(), Some("click" | "enter"))
                 {
                     return Err(invalid("save_as requires a browser.cdp trigger (click or enter) and a run-supplied destination input"));
@@ -626,9 +628,25 @@ fn perform_step(
     };
     let action = step.typed(value, to.as_ref())?;
     let picker_deadline = deadline.min(Instant::now() + Duration::from_secs(30));
+    let download = step
+        .action
+        .as_ref()
+        .is_some_and(|a| a["source"] == "download");
+    if download && found["node"]["download_link"] != true {
+        return Err(invalid(
+            "download Save As requires an observed download link",
+        ));
+    }
     let picker = destination
         .as_ref()
-        .map(|_| save_as::Picker::watch(session.session, &observation["metadata"], picker_deadline))
+        .map(|_| {
+            save_as::Picker::watch(
+                session.session,
+                &observation["metadata"],
+                picker_deadline,
+                download,
+            )
+        })
         .transpose()?;
     let target = serde_json::from_value(found["target"].clone())
         .map_err(|e| error("STEP.BAD_TARGET", e.to_string()))?;

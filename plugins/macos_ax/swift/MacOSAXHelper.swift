@@ -623,7 +623,7 @@ private final class AXService {
     ) throws -> Any {
         try checkDeadline(deadlineMS)
         switch operation {
-        case "picker_observe", "picker_revalidate", "picker_dismiss", "picker_save_new", "picker_open_file", "picker_directory":
+        case "picker_observe", "picker_revalidate", "picker_verify_suggestion", "picker_save_closed", "picker_dismiss", "picker_save_new", "picker_open_file", "picker_directory":
             return try filePicker(operation, Arguments(values: args), deadlineMS, requestID)
         case "status":
             try Arguments(values: args).only([])
@@ -3006,12 +3006,26 @@ private extension AXService {
                                           window: window, sheet: sheets[0], controls: controls)
             return ["token": token]
         }
-        try args.only(["picker_save_new", "picker_open_file", "picker_directory"].contains(op) ? ["token", "path"] : ["token"])
+        try args.only(op == "picker_verify_suggestion" ? ["token", "name"] :
+                      ["picker_save_new", "picker_open_file", "picker_directory"].contains(op) ? ["token", "path"] : ["token"])
         guard let held = browserPicker, held.token == (try args.string("token")) else {
             throw pickerError("expired native file panel lease")
         }
+        if op == "picker_save_closed" {
+            let window = try panelWindow(held.pid, held.bounds, deadline)
+            guard held.kind == "save", CFEqual(window, held.window) else { throw pickerError("Save panel owner changed") }
+            return ["closed": try attachedSheets(window, deadline).isEmpty]
+        }
         try checkPanel(held, deadline)
         if op == "picker_revalidate" { return ["verified": true] }
+        if op == "picker_verify_suggestion" {
+            guard held.kind == "save", let field = held.controls.filename,
+                  let name = try args.string("name"),
+                  let actual = copyAttribute(field, kAXValueAttribute as CFString) as? String else {
+                throw pickerError("missing observed Save filename")
+            }
+            return ["verified": actual.utf8.elementsEqual(name.utf8)]
+        }
         let target: AXUIElement
         if op == "picker_save_new" {
             guard held.kind == "save", let field = held.controls.filename, let path = try args.string("path") else {

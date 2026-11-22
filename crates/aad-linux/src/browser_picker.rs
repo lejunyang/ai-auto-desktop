@@ -151,6 +151,26 @@ impl FilePicker {
         self.wait_closed(gtk, deadline)
     }
 
+    /// Compare the browser's suggestion with the native filename without returning local text.
+    pub fn verify_suggestion(&self, name: &str, deadline: Instant) -> Result<()> {
+        self.revalidate(deadline)?;
+        if let Surface::WaylandKde(_, dialog) = &self.surface {
+            return dialog.verify(name);
+        }
+        let gtk = self.controls.as_ref().ok_or("missing Save controls")?;
+        gtk.verify_text(name)
+    }
+
+    pub fn save_closed(&self, deadline: Instant) -> Result<bool> {
+        if let Surface::WaylandKde(portal, dialog) = &self.surface {
+            return Ok(dialog.gone(deadline)? && portal.finished(deadline)?);
+        }
+        self.closed(
+            self.controls.as_ref().ok_or("missing Save controls")?,
+            deadline,
+        )
+    }
+
     pub fn save_new(&self, path: &Path, deadline: Instant) -> Result<()> {
         if self.kind != Kind::Save {
             return Err("expected the observed Save picker".into());

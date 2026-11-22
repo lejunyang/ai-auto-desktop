@@ -15,6 +15,7 @@ pub mod cdp;
 mod connection;
 pub mod gate_session;
 pub mod launch;
+pub mod picker;
 pub mod recording;
 pub mod request_gate;
 mod tcp;

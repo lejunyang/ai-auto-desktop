@@ -83,7 +83,10 @@
       emit('file_activation', field, null, event.isTrusted, 'click', {...target,trigger_sequence:trigger});
     } else if (el?.tagName) {
       const enter_sequence = event.isTrusted && event.detail === 0 && enter?.element === el ? enter.sequence : undefined;
-      activation = {event, sequence:emit('click', el, null, event.isTrusted, 'click', {...describe(el),enter_sequence})};
+      const download_link = el.tagName === 'A' && el.hasAttribute('download') && !!el.href &&
+        event.button === 0 && !event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey;
+      activation = {event, sequence:emit('click', el, null, event.isTrusted, 'click',
+        {...describe(el),enter_sequence,...(download_link ? {download_link:true} : {})})};
     }
   });
   listen('submit', event => { if (event.target?.tagName) emit('submit', event.target, null, event.isTrusted); });
@@ -140,7 +143,7 @@
     return {document_id:documentId,url:location.href,title:document.title,nodes,truncated};
   };
   globalThis.__aadCdp = {
-    version:3, installed:true, snapshot, isDirty:()=>dirty,
+    version:3, installed:true, documentId, snapshot, isDirty:()=>dirty,
     take:()=>queue.splice(0),
     takeReport:()=>{ const report={events:queue.splice(0),dropped}; dropped=0; return report; },
     stop:()=>{ if (binding) document.dispatchEvent(new Event(binding + '_save_stop')); for (const [name,fn] of listeners) document.removeEventListener(name,fn,true); observer?.disconnect(); queue.length=0; delete globalThis.__aadCdp; }

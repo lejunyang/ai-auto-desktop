@@ -240,7 +240,7 @@
   }
   const enabled = el => !el.disabled && !el.closest('[inert]') && el.getAttribute('aria-disabled') !== 'true';
   const editable = el => (['INPUT','TEXTAREA'].includes(el.tagName) || el.isContentEditable) && !el.readOnly && !protectedNode(el) && !fileInput(el);
-  const fingerprint = el => JSON.stringify([el.tagName,el.id,el.type||'',roleOf(el),labelOf(el),el.getAttribute('name'),el.getAttribute('href'),!!el.isContentEditable,fileInput(el) && el.webkitdirectory]);
+  const fingerprint = el => JSON.stringify([el.tagName,el.id,el.type||'',roleOf(el),labelOf(el),el.getAttribute('name'),el.getAttribute('href'),el.getAttribute('download'),!!el.isContentEditable,fileInput(el) && el.webkitdirectory]);
   const checkable = el => (el.tagName==='INPUT' && ['checkbox','radio'].includes((el.type||'').toLowerCase())) || ['checkbox','switch','radio'].includes(el.getAttribute('role'));
   const checkedOf = el => el.tagName==='INPUT' ? !!el.checked : el.getAttribute('aria-checked')==='true';
   const radio = el => (el.type||'').toLowerCase()==='radio' || el.getAttribute('role')==='radio';
@@ -377,6 +377,7 @@
           states:{enabled:enabled(el),protected:protectedNode(el),read_only:!!el.readOnly,focused:activeElement()===el},actions:actions(el),parent:parentOf(el)};
         if (!node.states.protected && typeof el.value==='string' && el.value.length>4096) node.value_truncated=true;
         if (landmark(el)) node.landmark=true;
+        if (el.tagName==='A' && el.hasAttribute('download') && el.href) node.download_link=true;
         if (closedRoots.has(el)) node.surface='closed_shadow';
         if (checkable(el)) node.states.checked=checkedOf(el);
         if (pickerOpen!==null) {

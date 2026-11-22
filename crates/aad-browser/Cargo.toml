@@ -24,6 +24,16 @@ url = "2"
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 fs2 = "0.4"
 dunce = "1"
+aad-platform.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aad-linux.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+aad-macos.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+aad-windows.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -6,6 +6,10 @@ version = 3
 name = "aad-browser"
 version = "0.0.9"
 dependencies = [
+ "aad-linux",
+ "aad-macos",
+ "aad-platform",
+ "aad-windows",
  "base64 0.22.1",
  "clap",
  "dunce",

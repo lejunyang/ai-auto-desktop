@@ -478,6 +478,35 @@ impl FilePicker {
         self.invoke_and_wait(&self.controls.cancel, deadline, || Ok(()))
     }
 
+    pub fn verify_suggestion(&self, name: &str, deadline: Instant) -> Result<()> {
+        self.revalidate(deadline)?;
+        let value = unsafe {
+            self.controls
+                .field
+                .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)?
+                .CurrentValue()?
+        };
+        if !value.as_wide().iter().copied().eq(name.encode_utf16()) {
+            return Err("the download suggestion differs from the native filename".into());
+        }
+        Ok(())
+    }
+
+    pub fn save_closed(&self, deadline: Instant) -> Result<bool> {
+        remaining(deadline)?;
+        if unsafe { IsWindow(self.dialog) }.as_bool() {
+            return Ok(false);
+        }
+        if pid(self.frame) != self.browser
+            || !unsafe { IsWindowEnabled(self.frame) }.as_bool()
+            || windows()?.iter().any(|&w| owner_of(w) == Some(self.frame))
+        {
+            return Ok(false);
+        }
+        let frame = unsafe { self.ui.ElementFromHandle(self.frame) }?;
+        Ok(unsafe { self.ui.CompareElements(&self.controls.frame, &frame) }?.as_bool())
+    }
+
     pub fn save_new(&self, path: &Path, deadline: Instant) -> Result<()> {
         if self.kind != Kind::Save {
             return Err("save requires an observed Save dialog".into());

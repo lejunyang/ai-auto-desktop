@@ -64,6 +64,29 @@ impl FilePicker {
         self.check("picker_revalidate", json!({"token": self.token}), deadline)
     }
 
+    pub fn verify_suggestion(&self, name: &str, deadline: Instant) -> Result<()> {
+        let result = self.helper.rpc(
+            "picker_verify_suggestion",
+            json!({"token":self.token,"name":name}),
+            deadline,
+            false,
+        )?;
+        if result["verified"] != true {
+            return Err("the download suggestion differs from the native filename".into());
+        }
+        Ok(())
+    }
+
+    pub fn save_closed(&self, deadline: Instant) -> Result<bool> {
+        let result = self.helper.rpc(
+            "picker_save_closed",
+            json!({"token":self.token}),
+            deadline,
+            false,
+        )?;
+        Ok(result["closed"] == true)
+    }
+
     pub fn dismiss(&self, deadline: Instant) -> Result<()> {
         if self.kind != Kind::Open {
             return Err("only an observed Open panel can be dismissed after upload".into());

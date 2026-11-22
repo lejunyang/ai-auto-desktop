@@ -84,9 +84,13 @@ impl Timeline {
                     {
                         let action = &mut self.events[*index].value;
                         action["trigger"] = row["action"]["trigger"].clone();
+                        if row["action"]["source"] == "download" {
+                            action["source"] = json!("download");
+                        }
                         action["kind"] = match row["action"]["outcome"].as_str() {
                             Some("save_as") => json!("save_as"),
                             Some("save_cancel") => json!("save_cancel"),
+                            Some("download_canceled") => json!("download_canceled"),
                             Some("save_failed") => json!("save_failed"),
                             _ => json!("save_pending"),
                         };

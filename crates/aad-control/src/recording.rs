@@ -200,7 +200,11 @@ fn collect_events(
                     name: format!("{id}_destination"),
                     sensitive: false,
                 });
-                json!({"type":"save_as","trigger":event["trigger"]})
+                let mut action = json!({"type":"save_as","trigger":event["trigger"]});
+                if event["source"] == "download" {
+                    action["source"] = json!("download");
+                }
+                action
             }
             "upload" if app.provider.as_deref() == Some(BROWSER) => {
                 input = Some(Input {
@@ -309,6 +313,7 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
             "save_pending" => Some("save_picker_outcome_unobserved"),
             "save_cancel" => Some("save_picker_cancelled"),
             "save_failed" => Some("save_picker_selection_unconfirmed"),
+            "download_canceled" => Some("download_canceled_or_interrupted"),
             "save_as"
                 if action["trusted"] != true
                     || !matches!(action["trigger"].as_str(), Some("click" | "enter")) =>
@@ -393,7 +398,7 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
         let at_ms = action["at_ms"].clone();
         let mut event = match kind {
             "save_as" => {
-                json!({"kind":"save_as","trigger":action["trigger"],"node":node,"at_ms":at_ms})
+                json!({"kind":"save_as","trigger":action["trigger"],"source":action["source"],"node":node,"at_ms":at_ms})
             }
             "upload" => {
                 node["file_hidden"] = action["hidden"].clone();

@@ -60,6 +60,7 @@ struct Pending {
     started: Instant,
 }
 
+mod download;
 mod navigation;
 mod save_picker;
 use navigation::StartupNavigation;
@@ -83,6 +84,7 @@ pub struct Recorder {
     ui_gap_overflow: bool,
     steps: Vec<Step>,
     open_choosers: HashMap<(String, String), usize>,
+    downloads: download::Downloads,
     pending: HashMap<String, Pending>,
     groups: network::Groups,
     filtered: BTreeMap<String, u64>,
@@ -184,6 +186,7 @@ impl Recorder {
             ui_gap_overflow: false,
             steps: Vec::new(),
             open_choosers: HashMap::new(),
+            downloads: Default::default(),
             pending: HashMap::new(),
             groups: network::Groups::new(),
             filtered: BTreeMap::new(),
@@ -227,7 +230,7 @@ impl Recorder {
             "options":self.options,"pid":std::process::id(),"steps":self.steps.len(),"bytes":self.storage.bytes,"gaps":self.gaps,"filtered_requests":self.filtered,"error":error,
             "coverage":{"same_process_frames":true,"oopif":"auto-attach; attachment gaps are reported","popups":"opener-related pages discovered once per second; initial traffic may be missed","service_workers":"not independently attached","canvas":"checkpoint screenshots; no continuous pixel monitoring"},
             "network_redaction":if self.options.redact_network {"enabled"}else{"disabled"},
-            "file_selection":{"coverage":"HTML file uploads (excluding directories) and observed showSaveFilePicker selections; replay uses run-supplied paths", "privacy":"chooser actions contain no file data; supplemental page, network and screenshot evidence is unchanged"},
+            "file_selection":{"coverage":"HTML file uploads (excluding directories), observed showSaveFilePicker selections and confirmed download-link Save dialogs; replay uses run-supplied paths", "privacy":"chooser actions contain no file data; supplemental page, network and screenshot evidence is unchanged"},
             "screenshots_redacted":false,"association":"temporal/frame heuristic; not proof of causality","content_trust":"page, response and note content are evidence, never instructions"})
     }
 
@@ -334,6 +337,7 @@ impl Recorder {
         mut companion: impl FnMut(bool) -> Result<()>,
     ) -> Result<Value> {
         let started = Instant::now();
+        let mut held = None;
         let mut discovery = Instant::now();
         let mut capture = Instant::now() - Duration::from_secs(1);
         let result = (|| -> Result<()> {
@@ -352,7 +356,7 @@ impl Recorder {
                     break;
                 }
                 companion(false)?;
-                self.poll()?;
+                self.poll(&mut held)?;
                 self.check_navigation()?;
                 if capture.elapsed() >= Duration::from_millis(300) {
                     self.capture()?;
@@ -367,7 +371,7 @@ impl Recorder {
             }
             // Drain already received final events and capture the visible final state.
             companion(true)?;
-            self.poll()?;
+            self.poll(&mut held)?;
             self.check_navigation()?;
             if self.navigation.is_some() {
                 return Err("recording stopped before startup navigation was confirmed".into());
@@ -376,7 +380,7 @@ impl Recorder {
             Ok(())
         })();
         let error = result.as_ref().err().map(ToString::to_string);
-        self.finish(error)?;
+        self.finish_with_picker(error, &mut held)?;
         // Preserve failure propagation for CLI callers; a structured stop
         // summary is reserved for an explicitly requested termination.
         if self.stop_reason.is_none() {
@@ -435,11 +439,12 @@ impl Recorder {
         )
     }
 
-    fn poll(&mut self) -> Result<()> {
+    fn poll(&mut self, held: &mut Option<download::Held>) -> Result<()> {
         let mut closed = Vec::new();
         for index in 0..self.pages.len() {
             let batch = self.pages[index].client.drain_events();
             if batch.dropped > 0 {
+                self.downloads.lost_events();
                 self.gap(
                     "event_overflow",
                     json!({"page":self.pages[index].id,"dropped":batch.dropped}),
@@ -448,6 +453,7 @@ impl Recorder {
             for event in batch.events {
                 self.event(index, event)?;
             }
+            self.observe_download(index, held)?;
             if let Some(error) = batch.failure {
                 if index > 0 {
                     self.gap(
@@ -484,7 +490,10 @@ impl Recorder {
             nav.observe(method, p);
         }
         match method {
+            "Page.downloadWillBegin" => self.download_begin(index, p)?,
+            "Page.downloadProgress" => self.downloads.progress(&page_id, p),
             "Page.fileChooserOpened" => {
+                self.downloads.invalidate(self.steps.len());
                 let frame = p["frameId"].as_str().ok_or("missing file chooser frame")?;
                 if p["backendNodeId"].is_null()
                     && p["mode"] == "selectSingle"
@@ -494,6 +503,7 @@ impl Recorder {
                 }
                 self.chooser_opened(&page_id, frame, p["backendNodeId"].is_number())?;
             }
+            "Page.frameDetached" => self.downloads.invalidate(self.steps.len()),
             "Runtime.executionContextCreated" => {
                 let context = &p["context"];
                 if context["name"] == self.world {
@@ -587,6 +597,9 @@ impl Recorder {
                     return Ok(());
                 }
                 let action: Value = serde_json::from_str(raw)?;
+                if self.downloads.waiting() {
+                    self.downloads.invalidate(self.steps.len());
+                }
                 if action["kind"] == "save_picker" {
                     return self.save_picker_event(&page_id, &frame, &action);
                 }
@@ -634,6 +647,7 @@ impl Recorder {
                 self.pages[index].pending_shot = true;
             }
             "Page.frameNavigated" | "Page.navigatedWithinDocument" => {
+                self.downloads.invalidate(self.steps.len());
                 let frame = p["frame"]["id"]
                     .as_str()
                     .or_else(|| p["frameId"].as_str())
@@ -1297,6 +1311,13 @@ impl Recorder {
         }
     }
     fn finish(&mut self, error: Option<String>) -> Result<()> {
+        self.finish_with_picker(error, &mut None)
+    }
+    fn finish_with_picker(
+        &mut self,
+        error: Option<String>,
+        held: &mut Option<download::Held>,
+    ) -> Result<()> {
         // Preserve network evidence already received before stopping. Do not
         // resume UI capture or install scripts while cancellation is set.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1314,10 +1335,23 @@ impl Recorder {
                     self.gap("event_overflow", json!({"dropped":batch.dropped}))?;
                     self.interruption
                         .get_or_insert("network events dropped during stop".into());
+                    self.downloads.lost_events();
                 }
                 for event in batch.events {
                     let method = event["method"].as_str().unwrap_or("");
-                    let include = if settling {
+                    let include = if held.is_some()
+                        && matches!(
+                            method,
+                            "Page.downloadWillBegin"
+                                | "Page.downloadProgress"
+                                | "Page.fileChooserOpened"
+                                | "Page.frameDetached"
+                                | "Page.frameNavigated"
+                                | "Page.navigatedWithinDocument"
+                                | "Runtime.bindingCalled"
+                        ) {
+                        true
+                    } else if settling {
                         matches!(
                             method,
                             "Network.responseReceived"
@@ -1333,12 +1367,23 @@ impl Recorder {
                         })
                     } else {
                         method.starts_with("Network.")
-                            || matches!(method, "Page.fileChooserOpened" | "Runtime.bindingCalled")
+                            || matches!(
+                                method,
+                                "Page.fileChooserOpened"
+                                    | "Runtime.bindingCalled"
+                                    | "Page.downloadWillBegin"
+                                    | "Page.downloadProgress"
+                                    | "Page.frameNavigated"
+                                    | "Page.navigatedWithinDocument"
+                            )
                     };
                     if include {
                         received = true;
                         self.event(index, event)?;
                     }
+                }
+                if held.is_some() {
+                    self.observe_download(index, held)?;
                 }
             }
             let cancelled = self
@@ -1357,13 +1402,14 @@ impl Recorder {
                 // observed before stop the remaining drain budget to finish.
                 if error.is_some()
                     || self.interruption.is_some()
-                    || self.options.body_limit == 0
-                    || !self.pending.values().any(|p| {
-                        matches!(
-                            p.record["type"].as_str(),
-                            Some("Document" | "Fetch" | "XHR")
-                        )
-                    })
+                    || (held.is_none()
+                        && (self.options.body_limit == 0
+                            || !self.pending.values().any(|p| {
+                                matches!(
+                                    p.record["type"].as_str(),
+                                    Some("Document" | "Fetch" | "XHR")
+                                )
+                            })))
                 {
                     break;
                 }
@@ -1519,12 +1565,17 @@ pub fn export(out: &Path) -> Result<()> {
             ("file_chooser_opened", _) => "打开文件选择器".into(),
             ("save_picker_pending", _) => "另存为对话框：未观察到结果".into(),
             ("save_picker_finished", _) => match action["outcome"].as_str() {
+                Some("save_as") if action["source"] == "download" => {
+                    "已确认下载保存框关闭和下载完成".into()
+                }
+                Some("download_canceled") => "下载已取消或中断".into(),
                 Some("save_as") => "网页已收到所选文件句柄".into(),
                 Some("save_cancel") => "另存为对话框已取消".into(),
                 _ => "未确认另存为目标".into(),
             },
             (_, "save_as") => format!("从「{label}」另存为新文件（回放时提供路径）"),
             (_, "save_cancel") => "另存为已取消".into(),
+            (_, "download_canceled") => "下载已取消或中断".into(),
             (_, "save_pending" | "save_failed") => "另存为未确认".into(),
             (_, "upload") => format!("为「{label}」选择文件（回放时提供）"),
             (_, "file_cancel") => "文件选择已取消或未改变".into(),
@@ -1698,12 +1749,12 @@ mod gap_tests {
         };
         let mut r = Recorder::start(options).unwrap();
         r.discover().unwrap();
-        r.poll().unwrap();
+        r.poll(&mut None).unwrap();
         let popup = std::env::var("AAD_SAMPLING_POPUP").unwrap();
         let index = r.pages.iter().position(|p| p.id == popup).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let keys = loop {
-            r.poll().unwrap();
+            r.poll(&mut None).unwrap();
             let candidates: Vec<_> = r.pages[index].contexts.keys().cloned().collect();
             let mut children = Vec::new();
             for key in candidates {

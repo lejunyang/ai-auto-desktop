@@ -243,7 +243,7 @@ pub(crate) fn saved_action_schema() -> Value {
         variants.retain(|variant| variant["properties"]["type"]["const"] != "secret_input");
         variants.push(json!({
             "type":"object","description":"Open Chromium Save As from the observed element. Bind a new absolute destination with the step's input, under a server-granted save directory.",
-            "properties":{"type":{"const":"save_as"},"trigger":{"enum":["click","enter"]}},
+            "properties":{"type":{"const":"save_as"},"trigger":{"enum":["click","enter"]},"source":{"const":"download"}},
             "required":["type","trigger"],"additionalProperties":false
         }));
     }
