@@ -232,6 +232,8 @@ KDE 文件窗口须在前台，焦点在“名称”框内。原生打开和另�
 
 录制 Chromium 页面时，点击导出按钮或用 Enter 触发网页的 `showSaveFilePicker()`，在系统窗口选好新文件。停止录制后，`browser-record steps` 会把触发按钮和成功的选择合成一个 `save_as` 步骤。取消窗口会跳过这次触发。导出的步骤用参数表示目的地，回放可以换目录和文件名。
 
+网页使用 `<a download>` 链接，且浏览器开启“下载前询问保存位置”时，也能录出 `save_as`。录制器会核对触发链接、下载事件和实际弹出的保存窗口。回放会等待下载完成，并对照下载字节数检查新文件。取消保存会跳过这次下载；直接下载到默认目录时，记录保留原来的链接点击。此流程已在 Linux X11 的 Chromium 原生 GTK 4 窗口录制和回放。[下载链接用例](../tests/browser/record-download-save-as.test.mjs)
+
 ```powershell
 aad browser-record steps --out ./ledger-recording --save export-ledger
 # 从上一步返回的步骤读取 input.name，例如 rec1_destination。
