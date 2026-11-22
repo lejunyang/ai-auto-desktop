@@ -58,6 +58,15 @@ fn hold_schema(description: &str) -> Value {
         "description":format!("{description} Within this request only; input is released on completion or failure. Providers refuse unsupported holds or insufficient deadlines.")})
 }
 
+fn canvas_object_options() -> Value {
+    json!({"type":"object","additionalProperties":false,"properties":{
+        "source":{"enum":["auto","editor","flowchart","vision"]},
+        "description":{"type":"string","minLength":1,"maxLength":1024},
+        "preview":{"type":"boolean","description":"Include a numbered SVG over the verified screenshot."},
+        "language":{"type":"string","minLength":1,"maxLength":35}
+    }})
+}
+
 fn action_schema() -> Value {
     let files = json!({"files": {"type": "array", "minItems": 1, "maxItems": 32,
         "items": {"type": "string", "minLength": 1, "maxLength": 4096}}});
@@ -76,6 +85,14 @@ fn action_schema() -> Value {
     };
     json!({"oneOf": [
         variant("focus", "Give keyboard focus to the element.", json!({}), &[]),
+        variant("click_object", "Find a unique object inside an observed Chromium canvas and click its centre. Match exact labels and immediate, confirmed predecessor (after) or successor (before) labels. Use the read digest with a pixel candidate id.", json!({
+            "options":canvas_object_options(), "query":{"type":"object","additionalProperties":false,"properties":{
+                "id":{"type":"string"}, "kind":{"type":"string"}, "label":{"type":"string"},
+                "region":{"enum":["top_left","top_right","bottom_left","bottom_right"]},
+                "min_confidence":{"type":"number","minimum":0,"maximum":1},
+                "after":{"type":"string"}, "before":{"type":"string"}, "digest":{"type":"string"}
+            }}
+        }), &["query"]),
         variant("invoke", "Activate the element's default action, such as pressing a \
     button. Prefer this over click where offered: it does not depend on window position or \
     z-order.", json!({}), &[]),
@@ -489,6 +506,13 @@ unknown-effect write automatically. A CDP session started with --request-gate-ur
             "Read-only QR polling for at most five seconds. Supply the prior version to deduplicate. Only explicit expired/confirmed locators establish those states; confirmed stops monitoring. Send returned PNG only to the owner, without logging it or decoded challenge data. No automatic refresh or input.",
             json!({"resource_id":{"type":"string"}, "locator":locator_schema(), "expired":locator_schema(), "confirmed":locator_schema(), "previous":{"type":"string"}}),
             vec!["resource_id", "locator"],
+            false,
+        ),
+        (
+            "control_read_canvas_objects",
+            "Read editor objects, pixel flowchart nodes and arrows, or visual candidates matching a description in an observed Chromium canvas. Returns labelled objects, normalized boxes, edges and a selection digest.",
+            json!({"target":target_schema(),"options":canvas_object_options()}),
+            vec!["target"],
             false,
         ),
         (

@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 pub const PROVIDER: &str = "browser.cdp";
 pub mod export;
 
-/// CDP `Input` and page navigation address the page, not a frame, so they are
-/// offered only where the observed frame is the main one.
-const MAIN_FRAME_ONLY: [&str; 9] = PAGE_ACTIONS;
+/// Page operations and verified canvas recognition use a main-frame target.
+fn main_frame_only(action: &str) -> bool {
+    action == "click_object" || PAGE_ACTIONS.contains(&action)
+}
 
 /// How long a newly attached page may take to answer before it counts as blocked.
 const RESPONSIVE: Duration = Duration::from_secs(2);
@@ -2170,7 +2171,7 @@ impl Backend for BrowserBackend {
         self.read_network(selector, limit, bodies, timeout)
     }
     fn reads(&self) -> Vec<String> {
-        let mut reads = vec!["capture".into()];
+        let mut reads = vec!["capture".into(), "read_canvas_objects".into()];
         if crate::pixel_text::tesseract().is_ok() {
             reads.push("read_text".into());
         }
@@ -2186,6 +2187,7 @@ impl Backend for BrowserBackend {
         [
             "focus",
             "click",
+            "click_object",
             "fill",
             "type_text",
             "secret_input",
@@ -2319,7 +2321,7 @@ impl Backend for BrowserBackend {
                 let mut capabilities = self.capabilities();
                 // Navigation and tabs address the page, not a frame.
                 if !main {
-                    capabilities.retain(|s| !MAIN_FRAME_ONLY.contains(&s.as_str()));
+                    capabilities.retain(|s| !main_frame_only(s));
                 }
                 let access_error = denied
                     .get(&id)
@@ -2525,7 +2527,7 @@ impl Backend for BrowserBackend {
                 if !surface["surface"].is_null() {node["surface"]=surface["surface"].clone();}
             }
             let main=entry.main();
-            if !main {if let Some(nodes)=result["nodes"].as_array_mut(){for node in nodes {if let Some(actions)=node["actions"].as_array_mut(){actions.retain(|v|!MAIN_FRAME_ONLY.iter().any(|name|v==name));}}}}
+            if !main {if let Some(nodes)=result["nodes"].as_array_mut(){for node in nodes {if let Some(actions)=node["actions"].as_array_mut(){actions.retain(|v|!v.as_str().is_some_and(main_frame_only));}}}}
             result["snapshot_id"]=json!(observation);
             // Roles and names as the browser's accessibility tree has them; a
             // failure there leaves the heuristic ones rather than failing the look.
@@ -2627,6 +2629,20 @@ impl Backend for BrowserBackend {
         action: &Action,
         action_context: &crate::Context,
     ) -> Result<Value> {
+        let resolved_click;
+        let object_guard;
+        let (action, guard) = if let Action::ClickObject { query, options } = action {
+            let options = crate::canvas_objects::Options {
+                preview: false,
+                ..options.clone()
+            };
+            let scene = self.read_objects(snapshot, node, &options, action_context.remaining()?)?;
+            resolved_click = scene.click(query)?;
+            object_guard = scene.guard;
+            (&resolved_click, Some(&object_guard))
+        } else {
+            (action, None)
+        };
         if let Action::Navigate { url } | Action::OpenTab { url } = action {
             self.access.navigation_url(url)?;
         }
@@ -2703,7 +2719,7 @@ impl Backend for BrowserBackend {
                 _=>{}
             }
             if trusted {
-                return pointer(client,&context,&route,&args,action,action_context);
+                return pointer(client,&context,&route,&args,action,action_context,guard);
             }
             if let Action::Upload {files}=action {
                 return upload(client,&context,&args,node,files,action_context);
@@ -3115,6 +3131,9 @@ mod diagnostic_summary_tests {
 /// The most pixels one capture returns; a long page body is cut at this height.
 const MAX_CAPTURE: (f64, f64) = (4096.0, 8192.0);
 mod canvas_grid;
+mod canvas_objects;
+mod canvas_vision;
+mod flowchart;
 
 impl BrowserBackend {
     /// A PNG of the observed element, scrolled into view first.
@@ -3320,6 +3339,7 @@ fn pointer(
     args: &Value,
     action: &Action,
     action_context: &crate::Context,
+    guard: Option<&canvas_objects::Guard>,
 ) -> Result<Value> {
     if let Action::Click { hold_ms, .. } = action {
         hold_preflight(action_context, *hold_ms)?;
@@ -3354,6 +3374,11 @@ fn pointer(
                 Some(Button::Middle) => ("middle", 4),
             };
             for click in 1..=count.unwrap_or(1) {
+                if let Some(guard) = guard {
+                    guard
+                        .check(client, context, args)
+                        .map_err(|e| e.with_effect("contextual"))?;
+                }
                 held_pointer(client, context, route, args, (x, y))
                     .map_err(|e| e.with_effect(if click > 1 { "unknown" } else { "contextual" }))?;
                 action_context.commit()?;

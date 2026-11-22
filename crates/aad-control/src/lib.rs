@@ -5,6 +5,7 @@ pub mod browser;
 pub mod browser_access;
 pub mod browser_bidi;
 pub mod canvas_grid;
+pub mod canvas_objects;
 pub mod fields;
 pub mod launch;
 pub mod lease;
@@ -1694,6 +1695,17 @@ impl Session {
                 Ok(
                     json!({"submitted": true, "provider": observation.provider, "operation": action.name(), "backend_result": value, "requires_fresh_observation": true}),
                 )
+            }
+            Operation::ReadCanvasObjects { target, options } => {
+                let (observation, node) = self.observed_node(target)?;
+                let browser = self.browser.clone().filter(|_| observation.provider == browser::PROVIDER)
+                    .ok_or_else(|| error("CONTROL.ACTION_UNSUPPORTED", "canvas objects require Chromium"))?;
+                let timeout = context.remaining()?;
+                let options = options.clone();
+                capture_cancellable(context, move || {
+                    browser.read_objects(&observation.raw, &node, &options, timeout)
+                        .map(|scene| scene.public)
+                })
             }
             Operation::Capture { target } => {
                 let (observation, node) = self.observed_node(target)?;

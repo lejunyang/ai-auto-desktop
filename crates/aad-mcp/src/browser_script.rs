@@ -37,7 +37,7 @@ pub struct Script {
 pub fn tool() -> Tool {
     Tool {
         name: NAME,
-        description: "Run synchronous JavaScript starting on one observed resource selected by resource_id or exact url. Use page.observe, present, read, fields, table, collect, wait, click, fill, key, scroll and act. In Chromium and Firefox, page.openPopup(locator, exactUrl?) clicks and binds to one new popup opened by the bound frame; page.returnToOpener() restores that frame. Popup switching is unavailable with explicit resource grants. page.chooseFiles(locator, files) selects files through an upload button; page.upload sets a file input directly. In a session-launched Chromium, page.downloadExport({task_id,trigger,expected}) verifies a task download and returns its preserved file path and digest. Pass JSON in inputs and return JSON. Writes need the server's input grant; file selection also needs an allowed upload directory.",
+        description: "Run synchronous JavaScript starting on one observed resource selected by resource_id or exact url. Use page.observe, present, read, fields, table, collect, wait, click, fill, key, scroll and act. In Chromium, page.readObjects(locator, options?) reads a canvas graph and page.clickObject(locator, query, options?) targets an object by label, relation or visual description. In Chromium and Firefox, page.openPopup(locator, exactUrl?) clicks and binds to one new popup opened by the bound frame; page.returnToOpener() restores that frame. Popup switching is unavailable with explicit resource grants. page.chooseFiles(locator, files) selects files through an upload button; page.upload sets a file input directly. In a session-launched Chromium, page.downloadExport({task_id,trigger,expected}) verifies a task download and returns its preserved file path and digest. Pass JSON in inputs and return JSON. Writes need the server's input grant; file selection also needs an allowed upload directory.",
         schema: json!({"type":"object","additionalProperties":false,"required":["source"],
             "oneOf":[{"required":["resource_id"]},{"required":["url"]}],
             "properties":{"source":{"type":"string","maxLength":SOURCE_LIMIT},
@@ -67,6 +67,10 @@ enum PageCall {
     ReadText {
         locator: Locator,
         language: Option<String>,
+    },
+    ReadObjects {
+        locator: Locator,
+        options: aad_control::canvas_objects::Options,
     },
     Act {
         locator: Locator,
@@ -319,6 +323,12 @@ impl Page {
             PageCall::ReturnToOpener {} => self.return_to_opener(),
             PageCall::Observe { mode } => self.observe(mode),
             PageCall::ReadText { locator, language } => self.read_text(locator, language),
+            PageCall::ReadObjects { locator, options } => {
+                self.request(Operation::ReadCanvasObjects {
+                    target: self.target(locator)?,
+                    options,
+                })
+            }
             PageCall::DownloadExport { spec } => self.download_export(*spec),
             PageCall::Fields { fields } => self.request(Operation::ReadFields {
                 resource_id: self.resource_id.clone(),
@@ -355,6 +365,7 @@ impl Page {
                 if !matches!(
                     action,
                     Action::Click { .. }
+                        | Action::ClickObject { .. }
                         | Action::Focus {}
                         | Action::Invoke {}
                         | Action::Fill { .. }
@@ -438,6 +449,10 @@ pub enum PageRead {
     View(ViewMode),
     Fields(Vec<aad_control::fields::ReadField>),
     CanvasGrid(Box<aad_control::canvas_grid::Spec>),
+    CanvasObjects {
+        locator: Box<Locator>,
+        options: aad_control::canvas_objects::Options,
+    },
     CanvasText {
         locator: Box<Locator>,
         language: Option<String>,
@@ -462,6 +477,12 @@ pub fn read_page(
     )?;
     match read {
         PageRead::CanvasText { locator, language } => page.read_text(*locator, language),
+        PageRead::CanvasObjects { locator, options } => {
+            page.request(Operation::ReadCanvasObjects {
+                target: page.target(*locator)?,
+                options,
+            })
+        }
         PageRead::CanvasGrid(spec) => page.request(Operation::ReadCanvasGrid {
             resource_id: page.resource_id.clone(),
             spec,

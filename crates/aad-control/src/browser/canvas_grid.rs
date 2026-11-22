@@ -10,7 +10,12 @@ fn unproven() -> aad_core::AutomationError {
     )
 }
 
-fn scope(client: &mut Client, context: &Ctx, args: &Value, verify_pixels: bool) -> Result<Value> {
+pub(super) fn scope(
+    client: &mut Client,
+    context: &Ctx,
+    args: &Value,
+    verify_pixels: bool,
+) -> Result<Value> {
     let expression = format!("{}({args},{verify_pixels})", include_str!("canvas_grid.js"));
     let result = run(
         client,

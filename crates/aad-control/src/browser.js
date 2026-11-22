@@ -302,6 +302,7 @@
     // check() rechecks this capability and the observed identity before input.
     if ((surface(el) || ['BUTTON','A','INPUT','SELECT'].includes(el.tagName) || el.onclick || roleOf(el)==='button' || checkable(el) || cursorMarks(el, /^pointer$/)) && typeof el.click==='function') result.push('click','hover');
     if (result.includes('click') && !surface(el)) result.push('choose_files');
+    if (el instanceof HTMLCanvasElement && result.includes('click')) result.push('click_object');
     if (editable(el)) result.push('fill','type_text');
     if (el.tagName==='SELECT' && !el.multiple) result.push('select');
     if (checkable(el)) result.push('check');

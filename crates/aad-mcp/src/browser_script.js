@@ -15,6 +15,8 @@
     const page = Object.freeze({
         observe: (mode = "outline") => call("observe", {mode}),
         readText: (locator, language) => call("read_text", {locator, language}),
+        readObjects: (locator, options = {}) => call("read_objects", {locator, options}),
+        clickObject: (locator, query, options = {}) => act(locator, {type:"click_object", query, options}),
         read, fields, act,
         downloadExport: spec => call("download_export", {spec}),
         present: locator => read(locator, "present"),

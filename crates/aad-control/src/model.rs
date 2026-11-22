@@ -181,6 +181,11 @@ pub const MAX_DRAG_ANCHORS: usize = 32;
 pub enum Action {
     Focus {},
     Invoke {},
+    ClickObject {
+        query: Box<crate::canvas_objects::Query>,
+        #[serde(default)]
+        options: crate::canvas_objects::Options,
+    },
     /// A plain left click unless a button, a double click or a position is given.
     Click {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -417,6 +422,7 @@ impl Action {
             Self::Focus {} => "focus",
             Self::Invoke {} => "invoke",
             Self::Click { .. } => "click",
+            Self::ClickObject { .. } => "click_object",
             Self::Fill { .. } => "fill",
             Self::SecretInput { .. } => "secret_input",
             Self::TypeText { .. } => "type_text",
@@ -522,6 +528,11 @@ pub enum Operation {
     ReadCanvasGrid {
         resource_id: String,
         spec: Box<crate::canvas_grid::Spec>,
+    },
+    ReadCanvasObjects {
+        target: Target,
+        #[serde(default)]
+        options: crate::canvas_objects::Options,
     },
     Act {
         target: Target,
