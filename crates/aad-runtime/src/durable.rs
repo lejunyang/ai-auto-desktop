@@ -475,8 +475,18 @@ impl JournalStore {
             busy_timeout,
             path,
         };
-        store.configure()?;
-        store.migrate()?;
+        store.configure().map_err(|err| match err {
+            JournalError::Storage(message) => {
+                JournalError::Storage(format!("configure journal: {message}"))
+            }
+            other => other,
+        })?;
+        store.migrate().map_err(|err| match err {
+            JournalError::Storage(message) => {
+                JournalError::Storage(format!("open journal schema: {message}"))
+            }
+            other => other,
+        })?;
         Ok(store)
     }
 
@@ -537,28 +547,33 @@ impl JournalStore {
     fn migrate(&self) -> Result<()> {
         // Opening an existing journal to read progress can share a WAL snapshot
         // with a running writer. Only migrations require the writer lock.
-        let version: i64 = self.retry_busy(Instant::now() + self.busy_timeout, || {
-            self.connection
-                .query_row("PRAGMA user_version", [], |row| row.get(0))
+        // A peer may finish the migration and immediately start writing events.
+        // While waiting for the writer, look for its committed schema on every
+        // attempt. A newly ready reader can then open alongside those writes.
+        let pending = self.retry_busy(Instant::now() + self.busy_timeout, || {
+            let version: i64 = self
+                .connection
+                .query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if version == SCHEMA_VERSION {
+                return Ok(None);
+            }
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate).map(Some)
         })?;
-        if version == SCHEMA_VERSION {
+        let Some(transaction) = pending else {
             return Ok(());
+        };
+        let current: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if current > SCHEMA_VERSION {
+            return Err(JournalError::Storage(format!(
+                "journal schema {current} is newer than the supported {SCHEMA_VERSION}"
+            )));
         }
-        self.write(|transaction| {
-            let current: i64 =
-                transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            if current > SCHEMA_VERSION {
-                return Err(JournalError::Storage(format!(
-                    "journal schema {current} is newer than the supported {SCHEMA_VERSION}"
-                )));
-            }
-            if current == SCHEMA_VERSION {
-                return Ok(());
-            }
+        if current < SCHEMA_VERSION {
             transaction.execute_batch(&schema_ddl())?;
             transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
-            Ok(())
-        })
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Begin an immediate transaction, taking the writer lock up front.

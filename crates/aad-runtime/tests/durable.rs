@@ -150,6 +150,32 @@ fn open_a_current_journal_while_another_connection_is_writing() {
 }
 
 #[test]
+fn an_opener_sees_a_committed_schema_while_the_migrator_keeps_writing() {
+    let journal = TempJournal::open();
+    seed(&journal, "run-1");
+    let db = journal.raw();
+    db.execute_batch("PRAGMA user_version=0; BEGIN IMMEDIATE")
+        .unwrap();
+    db.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .unwrap();
+    let path = journal.path();
+    std::thread::scope(|scope| {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let start = barrier.clone();
+        let opener = scope.spawn(move || {
+            start.wait();
+            let reader = JournalStore::open_with_timeout(path, 1_000).unwrap();
+            reader.get_run("run-1").unwrap().status
+        });
+        barrier.wait();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        db.execute_batch("COMMIT; BEGIN IMMEDIATE").unwrap();
+        assert_eq!(opener.join().unwrap(), RunStatus::Pending);
+        db.execute_batch("ROLLBACK").unwrap();
+    });
+}
+
+#[test]
 fn a_busy_writer_times_out_without_appending_and_can_try_again() {
     let journal = TempJournal::open();
     let lease = seed_running(&journal, "run-1");
