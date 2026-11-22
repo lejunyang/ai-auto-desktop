@@ -584,9 +584,11 @@ impl JournalStore {
     fn write<T>(&self, body: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let deadline = Instant::now() + self.busy_timeout;
         let _turn = self.writers.enter(deadline)?;
+        let reservation = self.writers.reserve(deadline)?;
         let transaction = self.retry_busy(deadline, || {
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
         })?;
+        drop(reservation);
         let result = body(&transaction)?;
         transaction.commit()?;
         Ok(result)

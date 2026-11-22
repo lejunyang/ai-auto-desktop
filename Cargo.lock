@@ -254,6 +254,7 @@ version = "0.0.9"
 dependencies = [
  "aad-core",
  "aad-plugin",
+ "fs2",
  "image",
  "indexmap 2.14.1",
  "jsonschema",
