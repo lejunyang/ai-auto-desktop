@@ -19,23 +19,7 @@ pub(crate) fn read_capture(
             .ok_or_else(|| error("CONTROL.TIMEOUT", "request deadline elapsed"))
     };
     let engine = tesseract()?;
-    let languages = match language {
-        None => Vec::new(),
-        Some(tag) => {
-            let wanted = tesseract_language(tag);
-            let available = engine.languages(left()?).map_err(ocr_unavailable)?;
-            match wanted.filter(|code| available.iter().any(|have| have == code)) {
-                Some(code) => vec![code.to_string()],
-                None => {
-                    return Err(error(
-                        "DRIVER.OCR_UNAVAILABLE",
-                        format!("no installed Tesseract language data reads {tag}"),
-                    )
-                    .with_detail("available_languages", json!(available)))
-                }
-            }
-        }
-    };
+    let languages = languages(&engine, language, left()?)?;
     let shot = capture(left()?)?;
     let png = shot["data"]
         .as_str()
@@ -48,6 +32,64 @@ pub(crate) fn read_capture(
         read[key] = shot[key].clone();
     }
     Ok(read)
+}
+
+fn languages(
+    engine: &aad_ocr::OcrProvider,
+    tag: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<String>> {
+    let Some(tag) = tag else {
+        return Ok(Vec::new());
+    };
+    let available = engine.languages(timeout).map_err(ocr_unavailable)?;
+    tesseract_language(tag)
+        .filter(|code| available.iter().any(|have| have == code))
+        .map(|code| vec![code.to_owned()])
+        .ok_or_else(|| {
+            error(
+                "DRIVER.OCR_UNAVAILABLE",
+                format!("no installed Tesseract language data reads {tag}"),
+            )
+            .with_detail("available_languages", json!(available))
+        })
+}
+
+/// OCR from the interiors of detected shapes. Masking preserves the original
+/// dimensions, so the resulting word boxes use the same canvas fractions.
+pub(crate) fn flowchart_labels(
+    image: &image::RgbaImage,
+    tag: Option<&str>,
+    deadline: std::time::Instant,
+) -> Result<Value> {
+    use image::ImageEncoder;
+    let left = || {
+        deadline
+            .checked_duration_since(std::time::Instant::now())
+            .ok_or_else(|| error("CONTROL.TIMEOUT", "canvas label recognition timed out"))
+    };
+    let engine = tesseract()?;
+    let languages = languages(&engine, tag, left()?)?;
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            image::ColorType::Rgba8,
+        )
+        .map_err(|_| {
+            error(
+                "OCR.IMAGE_UNSUPPORTED",
+                "could not encode the flowchart label image",
+            )
+        })?;
+    let mut read = engine
+        .recognize_png_layout(&png, &languages, left()?, TextLayout::Sparse)
+        .map_err(ocr_unavailable)?;
+    read["width"] = json!(image.width());
+    read["height"] = json!(image.height());
+    Ok(crate::text_answer(&read, crate::browser::PROVIDER)["lines"].take())
 }
 
 pub(crate) fn tesseract() -> Result<aad_ocr::OcrProvider> {
