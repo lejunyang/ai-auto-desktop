@@ -165,9 +165,12 @@ fn scan(system: &mut System, path: &Path) -> Result<Scan> {
         }
         let directory = match profile_argument(process.cwd(), &args)? {
             ProfileArgument::Directory(path) => Some(path),
-            // An unreadable default path cannot establish ownership. The lock
-            // and CDP checks still reject a target with an unverified holder.
-            ProfileArgument::Default => default_directory(process, family).ok().flatten(),
+            // Where the browser's default path is unreadable, corroborate
+            // its lock PID with the socket held by that browser.
+            ProfileArgument::Default => default_directory(process, family)
+                .ok()
+                .flatten()
+                .or_else(|| singleton_owner(path, *pid).then(|| path.to_path_buf())),
             // A different launch can remove its profile after refresh(). Its PID
             // must disappear or resolve on a fresh scan before choosing owners.
             ProfileArgument::MissingPath => return Ok(Scan::Unverified(*pid)),
@@ -222,6 +225,57 @@ fn default_directory(process: &Process, browser: &str) -> Result<Option<PathBuf>
 #[cfg(not(target_os = "linux"))]
 fn default_directory(_process: &Process, browser: &str) -> Result<Option<PathBuf>> {
     Ok(super::real_user_data(browser).and_then(|path| path.canonicalize().ok()))
+}
+
+#[cfg(target_os = "linux")]
+fn singleton_owner(path: &Path, pid: Pid) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    // Chromium may rewrite its process title and hide the original HOME and
+    // XDG values. Require the matching local PID and the listening socket it
+    // actually holds before using the lock to identify the data directory.
+    let Some(host) = System::host_name() else {
+        return false;
+    };
+    if !std::fs::read_link(path.join("SingletonLock"))
+        .is_ok_and(|lock| lock.as_os_str() == std::ffi::OsStr::new(&format!("{host}-{pid}")))
+    {
+        return false;
+    }
+    let Ok(socket) = path.join("SingletonSocket").canonicalize() else {
+        return false;
+    };
+    if !socket.metadata().is_ok_and(|m| m.file_type().is_socket()) {
+        return false;
+    }
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    let Ok(unix) = std::fs::read(proc.join("net/unix")) else {
+        return false;
+    };
+    let Some(inode) = unix.split(|&byte| byte == b'\n').find_map(|line| {
+        // The first seven fields are space separated, followed by the full path.
+        let fields: Vec<_> = line.splitn(8, |&byte| byte == b' ').collect();
+        (fields.len() == 8
+            && fields[3] == b"00010000"
+            && fields[4] == b"0001"
+            && fields[7] == socket.as_os_str().as_bytes())
+        .then(|| std::str::from_utf8(fields[6]).ok()?.parse::<u64>().ok())
+        .flatten()
+    }) else {
+        return false;
+    };
+    let descriptor = PathBuf::from(format!("socket:[{inode}]"));
+    std::fs::read_dir(proc.join("fd")).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| std::fs::read_link(entry.path()).is_ok_and(|target| target == descriptor))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn singleton_owner(_path: &Path, _pid: Pid) -> bool {
+    false
 }
 
 #[derive(Clone)]
@@ -444,6 +498,28 @@ pub(super) fn ensure_available_guarded(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn singleton_owner_requires_the_matching_listening_socket_and_pid() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let path = std::env::temp_dir().join(format!("aad-socket-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let pid = Pid::from_u32(std::process::id());
+        let target = path.canonicalize().unwrap().join("actual socket");
+        let host = System::host_name().unwrap();
+        symlink(format!("{host}-{pid}"), path.join("SingletonLock")).unwrap();
+        symlink(&target, path.join("SingletonSocket")).unwrap();
+        assert!(!singleton_owner(&path, pid));
+        let listener = UnixListener::bind(&target).unwrap();
+        assert!(singleton_owner(&path, pid));
+        assert!(!singleton_owner(&path, Pid::from_u32(1)));
+        drop(listener);
+        assert!(!singleton_owner(&path, pid));
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
