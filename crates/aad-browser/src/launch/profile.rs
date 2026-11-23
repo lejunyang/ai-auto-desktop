@@ -161,15 +161,12 @@ pub fn real_user_data(browser: &str) -> Option<PathBuf> {
                     _ => return None,
                 })
         } else {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".config"))
-                .join(match browser {
-                    "edge" => "microsoft-edge",
-                    "chrome" => "google-chrome",
-                    "brave" => "BraveSoftware/Brave-Browser",
-                    _ => return None,
-                })
+            linux_default_root(
+                browser,
+                Some(home),
+                std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+                std::env::var_os("CHROME_CONFIG_HOME").map(PathBuf::from),
+            )?
         };
         return path.is_dir().then_some(path);
     }
@@ -184,6 +181,27 @@ pub fn real_user_data(browser: &str) -> Option<PathBuf> {
         _ => return None,
     };
     path.exists().then_some(path)
+}
+
+pub(super) fn linux_default_root(
+    browser: &str,
+    home: Option<PathBuf>,
+    xdg: Option<PathBuf>,
+    chrome_config: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let base = chrome_config
+        .filter(|path| path.is_absolute())
+        .or_else(|| xdg.filter(|path| path.is_absolute()))
+        .or_else(|| {
+            home.filter(|path| path.is_absolute())
+                .map(|path| path.join(".config"))
+        })?;
+    Some(base.join(match browser {
+        "edge" => "microsoft-edge",
+        "chrome" => "google-chrome",
+        "brave" => "BraveSoftware/Brave-Browser",
+        _ => return None,
+    }))
 }
 
 /// Session/login files only — a few MB, not the multi-GB cache.

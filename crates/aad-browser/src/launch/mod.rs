@@ -64,12 +64,7 @@ impl Profile {
         if let Some(source) = &options.copy_from {
             selected_profile(source, &options.profile_id)?;
             profile::validate_copy_destination(source, &path)?;
-            occupancy::ensure_available_guarded(
-                source,
-                &options.browser,
-                options.kill_browser,
-                authority,
-            )?;
+            occupancy::ensure_available_guarded(source, options.kill_browser, authority)?;
             // Keep the source unavailable to other AAD launches while copying.
             let _source = lease::Lease::acquire(source)?;
             copy_selected_profile(source, &path, &options.profile_id)?;
@@ -84,12 +79,7 @@ impl Profile {
             temporary: options.profile_dir.is_none(),
             lock: Arc::new(Mutex::new(None)),
         };
-        occupancy::ensure_available_guarded(
-            &profile.path,
-            &options.browser,
-            options.kill_browser,
-            authority,
-        )?;
+        occupancy::ensure_available_guarded(&profile.path, options.kill_browser, authority)?;
         *profile.lock.lock().unwrap() = Some(lease::Lease::acquire(&profile.path)?);
         // A new launch must write a fresh endpoint file. Never attach to a stale
         // port or assume that a pre-existing endpoint belongs to this process.

@@ -9,8 +9,7 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {fixture} from './fixture.mjs';
 
 const aad=process.env.AAD_TEST_CLI || resolve('target/debug/aad');
-// Occupancy is checked per browser family (process name), so name the family
-// of the executable under test rather than assuming Edge.
+// Use the installed browser family for operations that select its profiles.
 const exe=basename(process.env.AAD_TEST_CHROME||'').toLowerCase();
 const family=/msedge|microsoft-edge/.test(exe)?'edge':/brave/.test(exe)?'brave':'chrome';
 function command(args,executable=aad) {
@@ -222,7 +221,13 @@ test('occupied non-CDP profiles require opt-in termination and unrelated browser
     assert.equal(await other.cdp.eval('document.title'),'Unrelated browser');
     assert.ok(await exists(join(profile,'Default','Preferences')));
     await occupy();
-    const reuse=await command([...base,'--out',join(root,'reused'),'--profile-dir',profile,'--kill-browser']).done;
+    const otherFamily=family==='edge'?'chrome':'edge';
+    const switched=base.map((arg,index)=>index===3?otherFamily:arg);
+    const crossFamilyRefused=await command([...switched,'--out',join(root,'wrong-family'),'--profile-dir',profile]).done;
+    assert.notEqual(crossFamilyRefused.code,0);
+    assert.match(crossFamilyRefused.stderr+crossFamilyRefused.stdout,/occupied by browser PID/);
+    await assertAlive();
+    const reuse=await command([...switched,'--out',join(root,'reused'),'--profile-dir',profile,'--kill-browser']).done;
     assert.equal(reuse.code,0,reuse.stdout+reuse.stderr);
     await until(()=>owner.exitCode!==null||owner.signalCode!==null);
     assert.equal(await other.cdp.eval('document.title'),'Unrelated browser');
