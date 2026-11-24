@@ -472,6 +472,19 @@ pub trait AtspiBackend: Send + Sync {
     ) -> Result<bool, AutomationError> {
         Ok(false)
     }
+    fn gtk3_click(
+        &self,
+        _target: &NativeRef,
+        _window: Option<&WindowAnchor>,
+        _point: (i32, i32),
+        _process_id: u32,
+        _deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "GTK widget click is unavailable",
+        ))
+    }
     /// The element's parent, or `None` above the application.
     fn parent(
         &self,
@@ -1599,6 +1612,22 @@ impl AtspiProvider {
             Some((points, validate))
         };
         let mut dispatched = false;
+        let gtk_pointer = node["provenance"]["coordinate_space"] == "gtk_window_logical";
+        let click = |point| {
+            let process = process_id(&node, &fresh)?;
+            if gtk_pointer {
+                self.backend
+                    .gtk3_click(&native, window.as_ref(), point, process, deadline)
+            } else {
+                self.backend.pointer_click_in_window(
+                    &native,
+                    window.as_ref(),
+                    point,
+                    process,
+                    deadline,
+                )
+            }
+        };
         let result = (|| {
             dispatched = true;
             match action {
@@ -1628,7 +1657,6 @@ impl AtspiProvider {
                     }
                 }
                 "pointer_click" => {
-                    let process = process_id(&node, &fresh)?;
                     let bounds = parse_bounds(node.get("bounds"))?;
                     if bounds.width <= 0 || bounds.height <= 0 {
                         return Err(driver_error(
@@ -1647,13 +1675,22 @@ impl AtspiProvider {
                             .ok_or_else(|| invalid("center overflow"))?,
                     );
                     self.validate_point(&fresh, &fresh_id, point, deadline)?;
-                    self.backend.pointer_click_in_window(
-                        &native,
-                        window.as_ref(),
-                        point,
-                        process,
-                        deadline,
-                    )
+                    click(point)
+                }
+                "pointer_gesture"
+                    if gtk_pointer && matches!(gesture, Some(Gesture::Click { .. })) =>
+                {
+                    if gesture
+                        != Some(Gesture::Click {
+                            button: 1,
+                            count: 1,
+                        })
+                        || !modifiers.is_empty()
+                        || hold_ms.is_some()
+                    {
+                        return Err(driver_error("DRIVER.ACTION_UNSUPPORTED", "GTK widget click requires a single unmodified left click without a hold"));
+                    }
+                    click(pointer.expect("computed GTK click point"))
                 }
                 "pointer_gesture" => {
                     let process = process_id(&node, &fresh)?;
@@ -2164,7 +2201,7 @@ impl AtspiProvider {
             }
             return Err(driver_error(
                 "DRIVER.POINT_NOT_PROVEN",
-                "GTK could not prove the window-local wheel hit",
+                "GTK could not prove the window-local pointer hit",
             ));
         }
         let allowed = descendants(record, node_id);
@@ -3470,7 +3507,7 @@ fn manifest_document() -> Value {
     ));
     actions["secret_input"]["sensitivity"] =
         json!({"input": "sensitive", "output": "public", "error": "public"});
-    actions.insert("pointer_click".into(), contract("重新验证目标与中心点命中后执行左键单击；支持 KDE/X11 XTest 和显式启用窗口定向输入的 Wayland Qt Widgets。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema(), "button": {"enum": ["left"]}, "position": {"enum": ["center"]}}, "additionalProperties": false}), write_output(), true, true));
+    actions.insert("pointer_click".into(), contract("重新验证目标与中心点命中后执行左键单击；支持 KDE/X11 XTest、Wayland Qt Widgets 和启用定向输入的 GTK 3 按钮与绘图区。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], json!({"type": "object", "required": ["target", "locator"], "properties": {"target": target_schema(), "locator": locator_schema(), "button": {"enum": ["left"]}, "position": {"enum": ["center"]}}, "additionalProperties": false}), write_output(), true, true));
     let point_input = |extra: Value, required: &[&str]| {
         let mut properties = json!({"target": target_schema(), "locator": locator_schema()});
         properties
@@ -3483,7 +3520,7 @@ fn manifest_document() -> Value {
     };
     let fraction = json!({"type": "object", "required": ["fx", "fy"], "properties": {"fx": {"type": "number", "minimum": 0, "maximum": 1}, "fy": {"type": "number", "minimum": 0, "maximum": 1}}, "additionalProperties": false});
     let button = json!({"enum": ["left", "middle", "right"]});
-    actions.insert("pointer_gesture".into(), contract("重新验证目标和比例位置的命中后，在 KDE/X11 XTest 或显式启用输入的 Wayland Qt Widgets 上执行单击、双击、滚轮或悬停。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
+    actions.insert("pointer_gesture".into(), contract("重新验证目标和比例位置的命中后，按节点公布的模式执行单击、双击、滚轮或悬停。Wayland GTK 3 支持已验证控件上的无修饰左键单击和滚轮。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
     actions.insert("drag".into(), contract("分别重新验证起点与终点后执行拖拽。KDE/X11 使用 XTest helper；Wayland Qt Widgets 要求两个端点和直线路径均命中同一控件。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
     actions.insert("key_chord".into(), contract("重新验证元素后向其发送组合键；KDE/X11 验证原生焦点，Wayland Qt Widgets 需要已聚焦的元素和显式启用的窗口定向输入。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
     for name in ["pointer_gesture", "drag"] {

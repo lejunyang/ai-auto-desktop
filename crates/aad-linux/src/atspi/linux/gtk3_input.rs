@@ -85,31 +85,63 @@ impl LinuxBackend {
                 node.actions.push("key_chord".into());
                 node.provenance
                     .insert("wayland_input_window".into(), json!(entry_window));
-            } else if matches!(node.role.as_str(), "slider" | "scroll_bar" | "drawing_area") {
+                continue;
+            }
+            let mut modes = Vec::new();
+            let mut allocation = None;
+            for (mode, role_matches, method) in [
+                (
+                    "wheel",
+                    matches!(node.role.as_str(), "slider" | "scroll_bar" | "drawing_area"),
+                    "WheelBounds",
+                ),
+                (
+                    "click",
+                    matches!(
+                        node.role.as_str(),
+                        "push_button" | "button" | "drawing_area" | "canvas" | "unknown"
+                    ),
+                    "ClickBounds",
+                ),
+            ] {
+                if !role_matches {
+                    continue;
+                }
                 remaining(deadline, false)?;
                 self.check_cancelled(false)?;
-                let Ok((x, y, width, height)) = proxy.call::<_, _, (i32, i32, i32, i32)>(
-                    "WheelBounds",
-                    &(&node.native.object_path, top),
-                ) else {
+                let Ok((x, y, width, height)) = proxy
+                    .call::<_, _, (i32, i32, i32, i32)>(method, &(&node.native.object_path, top))
+                else {
                     continue;
                 };
                 if width <= 0 || height <= 0 {
                     continue;
                 }
-                let window = json!(top);
-                let node = &mut snapshot.nodes[i];
-                node.bounds = Some(Bounds {
+                let bounds = Bounds {
                     x,
                     y,
                     width,
                     height,
-                });
+                };
+                if allocation.is_some_and(|old| old != bounds) {
+                    modes.clear();
+                    break;
+                }
+                allocation = Some(bounds);
+                modes.push(mode);
+            }
+            if !modes.is_empty() {
+                let window = json!(top);
+                let node = &mut snapshot.nodes[i];
+                node.bounds = allocation;
+                if modes.contains(&"click") {
+                    node.actions.push("pointer_click".into());
+                }
                 node.actions.push("pointer_gesture".into());
                 node.provenance
                     .insert("coordinate_space".into(), json!("gtk_window_logical"));
                 node.provenance
-                    .insert("wayland_pointer_modes".into(), json!(["wheel"]));
+                    .insert("wayland_pointer_modes".into(), json!(modes));
                 node.provenance
                     .insert("wayland_input_window".into(), window);
             }
@@ -129,10 +161,9 @@ impl LinuxBackend {
         self.check_cancelled(false)?;
         let proxy = Proxy::new(&self.connection, target.bus_name.as_str(), PATH, INTERFACE)
             .map_err(|_| unavailable())?;
-        Ok(
-            proxy.call::<_, _, bool>("WheelHit", &(&target.object_path, top, point.0, point.1))
-                == Ok(true),
-        )
+        let args = (&target.object_path, top, point.0, point.1);
+        Ok(proxy.call::<_, _, bool>("WheelHit", &args) == Ok(true)
+            || proxy.call::<_, _, bool>("ClickHit", &args) == Ok(true))
     }
 
     pub(super) fn gtk3_input(
@@ -165,6 +196,9 @@ impl LinuxBackend {
         self.check_cancelled(false)?;
         let (object, window) = (&target.object_path, &top.object_path);
         let (events, reply): (u8, zbus::Result<i32>) = match event {
+            wayland_input::Event::Click((x, y)) => {
+                (2, proxy.call("Click", &(object, window, x, y, until)))
+            }
             wayland_input::Event::Key(keys) => {
                 let (modifier, key) = match keys {
                     [key] => ("", key),

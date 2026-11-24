@@ -20,7 +20,7 @@ try {
     & tar -xzf $archivePath -C $scratch
     if ($LASTEXITCODE -ne 0) { throw 'Cannot extract the release archive' }
     $root = Join-Path $scratch "aad-$Version-$Target"
-    foreach ($source in @('entry.c', 'scroll.h', 'build.ps1', 'README.md')) {
+    foreach ($source in @('entry.c', 'scroll.h', 'click.h', 'build.ps1', 'README.md')) {
         if (!(Test-Path -LiteralPath (Join-Path $root "gtk3-wayland-input/$source") -PathType Leaf)) {
             throw "Missing GTK 3 Wayland source kit member $source"
         }

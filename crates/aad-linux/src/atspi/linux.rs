@@ -1336,6 +1336,22 @@ impl AtspiBackend for LinuxBackend {
     ) -> Result<bool, AutomationError> {
         self.gtk3_hit(target, top, point, deadline)
     }
+    fn gtk3_click(
+        &self,
+        target: &NativeRef,
+        window: Option<&WindowAnchor>,
+        point: (i32, i32),
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<Value, AutomationError> {
+        self.gtk3_input(
+            target,
+            window,
+            wayland_input::Event::Click(point),
+            process_id,
+            deadline,
+        )
+    }
 
     fn parent(
         &self,

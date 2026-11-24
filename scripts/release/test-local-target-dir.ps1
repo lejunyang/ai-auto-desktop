@@ -47,7 +47,7 @@ try {
         & "$fixture/scripts/release/build-local-linux.ps1" -OutputDirectory "$fixture/dist"
         New-Item -ItemType Directory "$fixture/unpacked" -Force | Out-Null
         & tar -xzf "$fixture/dist/aad-0.0.4-x86_64-unknown-linux-gnu.tar.gz" -C "$fixture/unpacked"
-        foreach ($source in @('build.ps1', 'entry.c', 'scroll.h', 'README.md')) {
+        foreach ($source in @('build.ps1', 'entry.c', 'scroll.h', 'click.h', 'README.md')) {
             $packed = "$fixture/unpacked/aad-0.0.4-x86_64-unknown-linux-gnu/gtk3-wayland-input/$source"
             if ((Get-FileHash $packed).Hash -ne (Get-FileHash "$fixture/crates/aad-linux/gtk3-wayland-input/$source").Hash) {
                 throw "GTK source kit mismatch in $source"

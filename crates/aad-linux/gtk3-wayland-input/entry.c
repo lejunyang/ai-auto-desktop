@@ -8,6 +8,8 @@
 #define IFACE "org.aiautodesktop.Gtk3WidgetInput1"
 #define PATH "/org/aiautodesktop/Gtk3WidgetInput1"
 
+static gboolean delivering;
+
 /* The ATK bridge exports this query on supported versions. A weak import
  * lets a module built for another bridge omit its endpoint safely. It only
  * reads the registration of an already exposed object. */
@@ -19,6 +21,7 @@ static char *registered_path(GtkWidget *widget) {
 }
 
 #include "scroll.h"
+#include "click.h"
 
 static GtkWidget *focused_entry(void) {
     GList *windows = gtk_window_list_toplevels();
@@ -57,7 +60,6 @@ static gboolean matches(GtkWidget *entry, const char *target, const char *top) {
 
 static int send_key(const char *target, const char *top, const char *key,
                     const char *modifier, dbus_uint64_t until) {
-    static gboolean delivering;
     GtkWidget *entry = focused_entry();
     if (delivering || !matches(entry, target, top)) return 0;
     GdkModifierType state = 0;
@@ -115,31 +117,52 @@ static DBusHandlerResult message(DBusConnection *bus, DBusMessage *request, void
         const char *a = target ? target : "", *b = window ? window : "";
         reply = dbus_message_new_method_return(request);
         dbus_message_append_args(reply, DBUS_TYPE_STRING, &a, DBUS_TYPE_STRING, &b, DBUS_TYPE_INVALID);
-    } else if (dbus_message_is_method_call(request, IFACE, "WheelBounds") &&
+    } else if ((dbus_message_is_method_call(request, IFACE, "WheelBounds") ||
+                dbus_message_is_method_call(request, IFACE, "ClickBounds")) &&
                dbus_message_has_signature(request, "ss")) {
         const char *target, *top;
         dbus_message_get_args(request, NULL, DBUS_TYPE_STRING, &target, DBUS_TYPE_STRING, &top, DBUS_TYPE_INVALID);
-        GtkWidget *w = wheel_target(target, top);
+        gboolean click = dbus_message_is_method_call(request, IFACE, "ClickBounds");
+        GtkWidget *w = click ? pointer_target(target, top) : wheel_target(target, top);
         int x = 0, y = 0, width = 0, height = 0;
         if (w && gtk_widget_translate_coordinates(w, gtk_widget_get_toplevel(w), 0, 0, &x, &y)) {
             width = gtk_widget_get_allocated_width(w);
             height = gtk_widget_get_allocated_height(w);
+            if (click) {
+                ClickHit hit;
+                if (!click_hit(target, top, x + width / 2, y + height / 2, &hit))
+                    width = height = 0;
+            }
         }
         reply = dbus_message_new_method_return(request);
         dbus_message_append_args(reply, DBUS_TYPE_INT32, &x, DBUS_TYPE_INT32, &y,
                                  DBUS_TYPE_INT32, &width, DBUS_TYPE_INT32, &height, DBUS_TYPE_INVALID);
-    } else if (dbus_message_is_method_call(request, IFACE, "WheelHit") &&
+    } else if ((dbus_message_is_method_call(request, IFACE, "WheelHit") ||
+                dbus_message_is_method_call(request, IFACE, "ClickHit")) &&
                dbus_message_has_signature(request, "ssii")) {
         const char *target, *top;
         int x, y;
         dbus_message_get_args(request, NULL, DBUS_TYPE_STRING, &target, DBUS_TYPE_STRING, &top,
                               DBUS_TYPE_INT32, &x, DBUS_TYPE_INT32, &y, DBUS_TYPE_INVALID);
-        dbus_bool_t hit = wheel_hit(target, top, x, y) != NULL;
+        ClickHit click;
+        dbus_bool_t hit = dbus_message_is_method_call(request, IFACE, "ClickHit")
+            ? click_hit(target, top, x, y, &click) : wheel_hit(target, top, x, y) != NULL;
         reply = dbus_message_new_method_return(request);
         dbus_message_append_args(reply, DBUS_TYPE_BOOLEAN, &hit, DBUS_TYPE_INVALID);
+    } else if (dbus_message_is_method_call(request, IFACE, "Click") &&
+               dbus_message_has_signature(request, "ssiit")) {
+        const char *target, *top;
+        int x, y;
+        dbus_uint64_t until;
+        dbus_message_get_args(request, NULL, DBUS_TYPE_STRING, &target, DBUS_TYPE_STRING, &top,
+                              DBUS_TYPE_INT32, &x, DBUS_TYPE_INT32, &y, DBUS_TYPE_UINT64, &until,
+                              DBUS_TYPE_INVALID);
+        if (start_click(bus, request, target, top, x, y, until)) return DBUS_HANDLER_RESULT_HANDLED;
+        dbus_int32_t phases = 0;
+        reply = dbus_message_new_method_return(request);
+        dbus_message_append_args(reply, DBUS_TYPE_INT32, &phases, DBUS_TYPE_INVALID);
     } else if (dbus_message_is_method_call(request, IFACE, "Wheel") &&
                dbus_message_has_signature(request, "ssiiiit")) {
-        static gboolean scrolling;
         const char *target, *top;
         int x, y, direction, notches;
         dbus_uint64_t until;
@@ -147,10 +170,10 @@ static DBusHandlerResult message(DBusConnection *bus, DBusMessage *request, void
                               DBUS_TYPE_INT32, &x, DBUS_TYPE_INT32, &y, DBUS_TYPE_INT32, &direction,
                               DBUS_TYPE_INT32, &notches, DBUS_TYPE_UINT64, &until, DBUS_TYPE_INVALID);
         int result = 0;
-        if (!scrolling) {
-            scrolling = TRUE;
+        if (!delivering) {
+            delivering = TRUE;
             result = wheel(target, top, x, y, direction, notches, until);
-            scrolling = FALSE;
+            delivering = FALSE;
         }
         reply = dbus_message_new_method_return(request);
         dbus_message_append_args(reply, DBUS_TYPE_INT32, &result, DBUS_TYPE_INVALID);

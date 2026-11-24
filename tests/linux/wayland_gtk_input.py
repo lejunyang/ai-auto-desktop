@@ -64,6 +64,78 @@ def application(major, receipt):
         cover.set_halign(Gtk.Align.START)
         overlay.add_overlay(cover)
         box.add(overlay)
+
+        mouse = []
+        mask = Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+
+        def watch_mouse(widget, name, on_press=None):
+            widget.get_accessible().set_name(name)
+            def phase(_widget, event, kind):
+                mouse.append([name, kind, int(event.button),
+                              bool(event.state & Gdk.ModifierType.BUTTON1_MASK)])
+                if kind == "press" and on_press:
+                    on_press()
+                return False
+            widget.connect("button-press-event", phase, "press")
+            widget.connect("button-release-event", phase, "release")
+
+        button = Gtk.Button(label="Post invoice")
+        watch_mouse(button, "Post invoice")
+        button.connect("clicked", lambda *_: clicks.append("posted"))
+        box.add(button)
+
+        def drawing(name, on_press=None):
+            area = Gtk.DrawingArea()
+            area.set_size_request(250, 32)
+            area.add_events(mask)
+            watch_mouse(area, name, on_press)
+            return area
+
+        canvas = Gtk.Overlay()
+        canvas.add(drawing("Invoice canvas"))
+        edge = Gtk.EventBox()
+        edge.set_size_request(35, -1)
+        edge.set_halign(Gtk.Align.START)
+        watch_mouse(edge, "Edge cover")
+        canvas.add_overlay(edge)
+        box.add(canvas)
+        changing = Gtk.Overlay()
+        curtain = Gtk.EventBox()
+        curtain.set_no_show_all(True)
+        watch_mouse(curtain, "New cover")
+        changing_button = Gtk.Button(label="Cover on press")
+        armed = True
+        cancelled = []
+        watch_mouse(changing_button, "Cover on press", lambda: curtain.show() if armed else None)
+        changing_button.connect("grab-broken-event", lambda w, e: cancelled.append(
+            bool(w.get_state_flags() & Gtk.StateFlags.ACTIVE)) or False)
+        changing_button.connect("clicked", lambda *_: clicks.append("restored"))
+        changing.add(changing_button)
+        changing.add_overlay(curtain)
+        box.add(changing)
+        def uncover(*_):
+            nonlocal armed
+            armed = False
+            curtain.hide()
+        remove_cover = Gtk.Button(label="Remove cover")
+        remove_cover.connect("clicked", uncover)
+        box.add(remove_cover)
+        incomplete = Gtk.DrawingArea()
+        incomplete.set_size_request(250, 15)
+        incomplete.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        watch_mouse(incomplete, "Press only")
+        box.add(incomplete)
+
+        def show_closing(*_):
+            popup = Gtk.Window(title="Close on press test", transient_for=window)
+            popup.add(drawing("Close on press", popup.close))
+            popup.connect("destroy", lambda *_: clicks.append("closed"))
+            popup.show_all()
+            popup.present()
+
+        opener = Gtk.Button(label="Open closing window")
+        opener.connect("clicked", show_closing)
+        box.add(opener)
         window.add(box)
         window.show_all()
         entry.grab_focus()
@@ -86,7 +158,8 @@ def application(major, receipt):
             return dict(text=entry.get_text(), selected=list(selection),
                         sibling=sibling.get_text(), secret=bool(secret.get_text()),
                         prepared=prepared, pin_focused=secret.has_focus(),
-                        wheel=wheel, quantity=scale.get_value(), phases=phases)
+                        wheel=wheel, quantity=scale.get_value(), phases=phases, mouse=mouse, clicks=clicks,
+                        cancelled=cancelled, pressed=bool(changing_button.get_state_flags() & Gtk.StateFlags.ACTIVE))
     else:
         editor = Gtk.TextView()
         editor.update_property([Gtk.AccessibleProperty.LABEL], ["Invoice notes"])
@@ -132,7 +205,7 @@ def run(aad, module, root, major, enabled):
         result = subprocess.run([aad, *args], capture_output=True, text=True, timeout=40)
         if success != (result.returncode == 0):
             raise AssertionError((args, result.stdout, result.stderr))
-        return json.loads(result.stdout) if success else None
+        return json.loads(result.stdout)
 
     def state():
         return json.loads(receipt.read_text())
@@ -184,6 +257,50 @@ def run(aad, module, root, major, enabled):
             time.sleep(.1)
             assert not state()["sibling"] and not state()["secret"]
             assert state()["text"] == ("k" if enabled else "INV-2037")
+            names = ("Post invoice", "Invoice canvas", "Cover on press")
+            nodes = {n.get("name"): n["capabilities"] for n in call("snapshot", resource)["nodes"]}
+            for name in names:
+                assert ("click" in nodes[name]) == enabled, (name, nodes)
+            assert "click" not in nodes["Press only"], nodes
+            call("do", "click", resource, "--name", "Press only", success=False)
+            if enabled:
+                expected = []
+                for name, args in ((names[0], []), (names[1], ["--fx", ".76", "--fy", ".4"])):
+                    call("do", "click", resource, "--name", name, *args)
+                    expected.extend([[name, "press", 1, False], [name, "release", 1, True]])
+                    wait_for(lambda: state()["mouse"] == expected, name + " button phases")
+                assert state()["clicks"] == ["posted"]
+                for args in (["--fx", ".02", "--fy", ".5"], ["--button", "right"], ["--count", "2"]):
+                    call("do", "click", resource, "--name", names[1], *args, success=False)
+                assert state()["mouse"] == expected
+                for name in (names[2], "Close on press"):
+                    if name == "Close on press":
+                        call("do", "invoke", resource, "--name", "Open closing window")
+                        wait_for(lambda: any(n.get("name") == name and "click" in n["capabilities"]
+                            for n in call("snapshot", resource)["nodes"]), "closing window ready")
+                    failure = call("do", "click", resource, "--name", name, success=False)["error"]
+                    assert failure["effect"] == "unknown", failure
+                    expected.append([name, "press", 1, False])
+                    wait_for(lambda: state()["mouse"] == expected, name + " withheld release")
+                    if name == "Cover on press":
+                        covered = next(n for n in call("snapshot", resource)["nodes"] if n.get("name") == name)
+                        assert "click" not in covered["capabilities"], covered
+                        call("do", "click", resource, "--name", name, success=False)
+                        current = state()
+                        assert current["cancelled"] == [True] and not current["pressed"], current
+                        assert current["clicks"] == ["posted"] and current["mouse"] == expected, current
+                        call("do", "invoke", resource, "--name", "Remove cover")
+                        call("do", "click", resource, "--name", name)
+                        expected.extend([[name, "press", 1, False], [name, "release", 1, True]])
+                        wait_for(lambda: state()["mouse"] == expected and state()["clicks"] == ["posted", "restored"]
+                                 and not state()["pressed"], "uncovered button recovers on next click")
+                wait_for(lambda: state()["clicks"] == ["posted", "restored", "closed"], "closed on press")
+                time.sleep(.12)
+                assert state()["mouse"] == expected
+            else:
+                for name in names:
+                    call("do", "click", resource, "--name", name, success=False)
+                assert not state()["mouse"] and not state()["clicks"]
         else:
             call("do", "fill", resource, "--name", "Invoice notes", "--value", "発票 2037")
             wait_for(lambda: state()["text"] == "発票 2037", "GTK 4 text buffer")
@@ -194,6 +311,10 @@ def run(aad, module, root, major, enabled):
             time.sleep(.1)
             assert state()["clicks"] == ["saved"] and not state()["hidden_changed"]
         print(json.dumps(dict(gtk=major, module=enabled, **state()), ensure_ascii=False), flush=True)
+    except Exception:
+        if receipt.exists():
+            print(receipt.read_text(), file=sys.stderr, flush=True)
+        raise
     finally:
         child.terminate()
         child.wait(timeout=10)

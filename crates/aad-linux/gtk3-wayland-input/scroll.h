@@ -17,14 +17,19 @@ static GtkWidget *widget_at_path(const char *path) {
     return g_strcmp0(path, canonical) == 0 ? w : NULL;
 }
 
-static GtkWidget *wheel_target(const char *target, const char *top) {
+static GtkWidget *pointer_target(const char *target, const char *top) {
     GtkWidget *w = widget_at_path(target);
     GtkWidget *window = widget_at_path(top);
-    if ((!GTK_IS_RANGE(w) && !GTK_IS_DRAWING_AREA(w)) || !GTK_IS_WINDOW(window) ||
+    if (!w || !GTK_IS_WINDOW(window) ||
         gtk_widget_get_toplevel(w) != window || !gtk_window_is_active(GTK_WINDOW(window)) ||
         !gtk_widget_get_mapped(w) || !gtk_widget_is_sensitive(w) || gtk_grab_get_current())
         return NULL;
     return w;
+}
+
+static GtkWidget *wheel_target(const char *target, const char *top) {
+    GtkWidget *w = pointer_target(target, top);
+    return GTK_IS_RANGE(w) || GTK_IS_DRAWING_AREA(w) ? w : NULL;
 }
 
 typedef struct {
@@ -45,14 +50,14 @@ static void pick_child(GtkWidget *child, gpointer data) {
     }
 }
 
-static GtkWidget *wheel_hit(const char *target, const char *top, int x, int y) {
-    GtkWidget *w = wheel_target(target, top);
+static GtkWidget *widget_hit(GtkWidget *w, int x, int y) {
     if (!w) return NULL;
     GtkWidget *window = gtk_widget_get_toplevel(w);
     GtkWidget *branch = window;
     if (x < 0 || y < 0 || x >= gtk_widget_get_allocated_width(window) ||
         y >= gtk_widget_get_allocated_height(window)) return NULL;
-    for (int depth = 0; GTK_IS_CONTAINER(branch) && depth < 64; depth++) {
+    for (int depth = 0; GTK_IS_CONTAINER(branch); depth++) {
+        if (depth >= 64) return NULL;
         Pick pick = {window, x, y, 0, NULL};
         gtk_container_forall(GTK_CONTAINER(branch), pick_child, &pick);
         if (pick.count == 0) break;
@@ -61,7 +66,12 @@ static GtkWidget *wheel_hit(const char *target, const char *top, int x, int y) {
         if (pick.count != 1) return NULL;
         branch = pick.child;
     }
-    return branch == w ? w : NULL;
+    return branch;
+}
+
+static GtkWidget *wheel_hit(const char *target, const char *top, int x, int y) {
+    GtkWidget *w = wheel_target(target, top);
+    return w && widget_hit(w, x, y) == w ? w : NULL;
 }
 
 static int wheel(const char *target, const char *top, int x, int y, int direction,
