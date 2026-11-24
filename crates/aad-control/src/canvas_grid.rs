@@ -30,7 +30,7 @@ impl Session {
         if spec.locator.is_empty() || !(1..=256).contains(&spec.rows) {
             return Err(error(
                 "CONTROL.INVALID_REQUEST",
-                "choose a canvas locator and 1..256 visible rows",
+                "choose a canvas locator and 1..256 rows across the full canvas",
             ));
         }
         if self.readable(resource)?.0.name() != browser::PROVIDER {

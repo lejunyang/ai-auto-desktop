@@ -511,7 +511,7 @@ unknown-effect write automatically. A CDP session started with --request-gate-ur
         ),
         (
             "control_read_canvas_objects",
-            "Read editor objects, pixel flowchart nodes and arrows, or visual candidates matching a description in an observed Chromium canvas. Returns labelled objects, normalized boxes, edges and a selection digest.",
+            "Read editor objects, pixel flowchart nodes and arrows, or visual candidates matching a description in an observed Chromium canvas. Pixel results cover the visible crop. Object boxes use fractions of the full canvas. The result includes edges and a selection digest.",
             json!({"target":target_schema(),"options":canvas_object_options()}),
             vec!["target"],
             false,
@@ -525,7 +525,7 @@ with `words`, every one with a `box` of fx/fy/fw/fh: fractions of the element's 
 screen positions. The lines are not targets: to act on a word, click the element it was \
 read from with `fraction` at the word's centre (fx + fw/2, fy + fh/2), which is anchored \
 and revalidated on that element -- read again first if the content may have moved. \
-`digest` identifies the screenshot. Chromium reads sparse labels in one fully visible canvas. \
+`digest` identifies the screenshot. Chromium reads labels in the visible part of a scrolled or scaled canvas. \
 Desktop providers use Windows OCR on Windows and Tesseract elsewhere when installed; \
 OCR can misread characters such as I and l.",
             json!({
