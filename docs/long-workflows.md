@@ -79,7 +79,7 @@ aad review ./draft-run-001.ndjson
 | 恢复 | 持久只读运行可暂停/恢复。写流程可在开始时启用恢复日志，中断后凭业务回执继续 | 需要业务方提供可靠回执。跨运行的全局去重和跨账号恢复仍需业务系统配合。 |
 | 浏览器覆盖 | Chromium 和 Firefox 脚本可逐层进入授权弹窗，再逐层返回。Firefox 同源子页面支持已定位控件上的按键、指针和滚轮。WebKitGTK 可以打开指定 URL 并读取正文、标题、链接和按钮。 | Firefox 跨域或变形子页面的物理输入，WebKit 的写操作和脚本。[Firefox 子页面条件](testing/firefox-frame-input.md) |
 | 画布与自绘 | Chromium 可以在滚动、缩放后的画布里读对象、文字和网格。录制点击按编辑器 ID 或流程图标签、形状和直接连线回放。可配置本机视觉模型按描述找白板对象。[对象识别](canvas-objects.md) · [画布文字和网格](testing/canvas-grid-ocr.md) | 将多次滚屏拼成全图、恢复被遮挡的连线、给任意白板图标自动录出视觉描述。 |
-| 原生系统 | Linux X11 和 KWin Wayland 已验证原生表单和文件窗口。Wayland 上的 Qt 5/6 Widgets 支持定向键鼠和同进程跨窗口复制选中文本或列表项。GTK 3 支持部分控件的键盘和滚轮，GTK 4 支持按钮和多行文本框。已开放本地 CDP 的 Electron 窗口支持按控件定向输入。[Qt 应用启动与操作](../crates/aad-linux/qt-wayland-input/README.md) | Wayland 的跨进程拖放、GTK 4 任意控件的原始键鼠，以及 Electron 原生菜单的通用指针输入。**[待验证]** 用户同意屏幕共享后的完整链路、Windows 和 Mac 的交互桌面、混合 DPI 多屏。 |
+| 原生系统 | Linux X11 和 KWin Wayland 已验证原生表单和文件窗口。Wayland 上的 Qt 5/6 Widgets 支持定向键鼠和同进程跨窗口复制选中文本或列表项。GTK 3 可向编辑框发按键、向滑块和绘图区发滚轮，也可左键单击按钮和接收鼠标事件的绘图区。GTK 4 可激活按钮、填写多行文本框。Electron 可以通过本地 CDP 向工作台控件发键鼠，也可直接通过系统无障碍接口操作链接和复选框。[各框架的启用条件与实测范围](testing/platform-capability-matrix.md) | Wayland 的跨进程拖放、GTK 4 任意控件的原始键鼠，以及 Electron 原生菜单的通用指针输入。**[待验证]** 用户同意屏幕共享后的完整链路、Windows 和 Mac 的交互桌面、混合 DPI 多屏。 |
 | 部署与脚本 | 本地/SSH 控制、输入租约、声明式步骤。CLI 和 MCP 都支持 JavaScript 通过 `page` 操作选定的标签页。工作流中的 Python 计算步骤由 `aad run --allow-scripts` 启用。 | 无人值守机器池、账号和会话调度、按次业务审批。 |
 
 原始竞品依据见[23 项逐项对比](research/browser-computer-recording-efficiency-2026-11-21.md)；本页记录后续代码与验收进展。

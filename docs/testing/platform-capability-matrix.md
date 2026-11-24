@@ -17,7 +17,7 @@ Electron 的两条恢复路径见 [规范动作与窗口 surface 验证](../rese
 | 本机 Qt/X11 应用缩放 | `597656c` 按准确窗口身份校准逻辑/物理坐标；单显示器 Qt 1/1.5/2 倍应用缩放下的实际点击、F2 与局部 PNG；歧义和 scope 拒绝；8 项标题编码检查；Dolphin 中文目录重命名与 KWrite 中文文件保存经磁盘回读通过 | **[待真机验收]** 混合 DPI 多屏、旋转与热插拔；非 Qt 缩放不在此次校准范围；不证明 Wayland 支持 |
 | 本机 Qt/X11 局部截图 | `2e00547` 私下检查完整所属窗口；4/4 公开入口检查，无覆盖及非重叠密码框时 PNG 像素与尺寸正确，scope 外普通/密码控件覆盖时拒绝；原 scope 继续有效 | 未把私有检查升级为外部节点操作授权；无法完整观察所属窗口时仍拒绝截图；不代表所有第三方自绘界面都能证明无遮挡 |
 | 原生 KWin Wayland 与 GTK 3 | 独立 compositor、关闭 X11 显示连接，经公开 CLI 枚举应用、填写发票号、触发保存。应用回执同时记录了发票号和 GdkWaylandDisplay。[复现入口](../../tests/linux/verify-wayland-form.ps1) | 其他应用的控件语义、物理键鼠、多屏和授权撤销行为需分别验收。 |
-| KWin Wayland GTK 定向输入 | GTK 3.24.38 的应用模块定向发送按键和四向滚轮。已观察到全选后替换、滑块数值变化和按下后焦点变化的处理。GTK 4.8.3 通过控件接口激活按钮、填写多行文本。[控件与模块](../research/gtk-wayland-input.md) | GTK 4 的原始按键与鼠标事件、任意 GTK 控件的拖放。 |
+| KWin Wayland GTK 定向输入 | GTK 3.24.38 的应用模块支持编辑框按键、四向滚轮，以及按钮和绘图区的左键单击。已核对全选后替换、滑块数值和实际鼠标事件。按钮按下后被遮挡时会取消该手势，移开遮挡后再次点击只触发一次。GTK 4.8.3 通过控件接口激活按钮、填写多行文本。[控件与模块](../research/gtk-wayland-input.md) | GTK 4 的原始按键与鼠标事件、任意 GTK 控件的拖放。 |
 | KWin Wayland Electron 工作台 | 用 CDP 选定 VS Code 1.146.0 的工作台文档，真实指针点击搜索侧栏，搜索框收到了 Ctrl+A 和退格，选区和内容均有独立回读。[启动和授权](../browser-script.md#在-wayland-上操作-electron-应用窗口) | 未开放 CDP 的应用需依赖其无障碍控件。Electron 原生菜单和跨应用拖放需桌面端支持。 |
 | KWin Wayland Electron 原生 AT-SPI | Electron 43.8.6 独立应用通过已观察链接的 `jump` 跳转至页内锚点，复选框的 `check` 和 `uncheck` 各产生一次目标事件，旧观察被拒绝。[验收步骤和环境](../research/electron-atspi-canonical-actions-2026-11-07.md#wayland-上的链接与复选框) | 其他运行时版本、自绘控件和原生菜单。 |
 | KWin Wayland 文件窗口 | 选择网页附件、读取原生文件句柄、另存为新文件、选择已有目录。GTK 和 KDE 均核对了实际内容或系统返回的目录 URI。[命令与窗口条件](../browser-recording.md#在已经打开的文件选择器里选文件) | 更多桌面和本地化窗口。 |
