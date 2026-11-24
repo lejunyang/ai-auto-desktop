@@ -68,7 +68,17 @@ async function verify() {
     const script=join(root,'search.js');
     const execute=async(source,inputs={})=>{
       await writeFile(script,source);
-      return run(cli,['browser','script',script,...flags,'--allow-app-document',target.url,'--allow-input','--inputs',JSON.stringify(inputs)],{env});
+      const args=['browser','script',script,...flags,'--allow-app-document',target.url,'--allow-input','--inputs',JSON.stringify(inputs)];
+      try {
+        return await run(cli,args,{env});
+      } catch (failure) {
+        // VS Code can replace the search field while the sidebar is opening.
+        let result;
+        try { result=JSON.parse(failure.stdout); } catch { throw failure; }
+        if (result.completed_actions!==0 || result.error?.code!=='CONTROL.STALE_TARGET' ||
+            result.error.effect!=='not_applied') throw failure;
+        return run(cli,args,{env});
+      }
     };
     const observe=async()=>JSON.parse((await run(cli,['browser','read',...flags,'--allow-app-document',target.url,'--view','nodes'],{env,maxBuffer:8*1024*1024})).stdout);
     const matching=(await observe()).nodes.filter(n=>n.name===searchTab);
@@ -78,7 +88,7 @@ async function verify() {
     await cdp.eval(`window.__aadTestInput=[];for(const type of ['mousedown','mouseup','keydown'])document.addEventListener(type,
       e=>window.__aadTestInput.push([type,e.isTrusted,e.key??'',e.target.closest('[role=tab]')?.querySelector('[aria-label]')?.ariaLabel??'']),true);true`);
     await execute('return page.act(inputs.tab,{type:"click",fraction:{fx:.5,fy:.5}})',{tab:{role:tab.role,name:tab.name}});
-    const field=await until(()=>cdp.eval(`[...document.querySelectorAll('.search-view textarea')].find(el=>el.getBoundingClientRect().height>0)?.ariaLabel`),'Search field');
+    const field=await until(()=>cdp.eval(`document.activeElement.matches('.search-view textarea') && document.activeElement.ariaLabel`),'focused Search field');
     assert.match(field,/Search/);
     const loc={role:'textbox',name:'Search',match:'contains',states:{focused:true}};
     await execute('return page.fill(inputs.loc,"Invoice-2037")',{loc});
@@ -89,7 +99,9 @@ async function verify() {
     await execute('return page.key(inputs.loc,["Backspace"])',{loc});
     assert.equal(await cdp.eval('document.activeElement.value'),'');
     const events=await cdp.eval('window.__aadTestInput');
-    assert.ok(events.some(([type,trusted,,tab])=>type==='mousedown' && trusted && tab===searchTab));
+    const tabMouseEvents=events.filter(([type,trusted,,tab])=>
+      (type==='mousedown' || type==='mouseup') && trusted && tab===searchTab);
+    assert.deepEqual(tabMouseEvents.map(([type])=>type),['mousedown','mouseup']);
     assert.ok(events.some(([type,trusted,key])=>type==='keydown' && trusted && key==='Backspace'));
     console.log(JSON.stringify({tab:searchTab,field,selection:state,afterDeletion:'',wayland:env.WAYLAND_DISPLAY}));
   } finally {
@@ -101,4 +113,3 @@ async function verify() {
     for(const child of children){try{process.kill(-child.pid,'SIGKILL');}catch{}}
   }
 }
-
