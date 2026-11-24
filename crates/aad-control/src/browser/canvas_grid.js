@@ -24,8 +24,10 @@
   if (!sameRect(rect, original) || !sameRect(entry.boundingClientRect, box)) return unknown;
   const pseudoPaints = el => ['::before','::after'].some(p =>
     !['none','normal'].includes(getComputedStyle(el,p).content));
+  let scaledTransform=false;
   for (let el=canvas; el; el=el.parentElement) {
     const s=getComputedStyle(el), m=new DOMMatrixReadOnly(s.transform==='none'?undefined:s.transform);
+    scaledTransform ||= m.a!==1 || m.d!==1 || (s.scale!=='none' && s.scale!=='1');
     if (!m.is2D || m.a<=0 || m.d<=0 || m.b!==0 || m.c!==0 || s.perspective!=='none' ||
         s.rotate!=='none' || s.offsetPath!=='none' || s.clipPath!=='none' ||
         s.opacity!=='1' || s.filter!=='none' || s.backdropFilter!=='none' || s.maskImage!=='none' ||
@@ -52,27 +54,37 @@
   const rw=Math.max(1,Math.floor(sampleWidth*factor+1e-7)), rh=Math.max(1,Math.floor(sampleHeight*factor+1e-7));
   const sourceView=width!==canvas.width || height!==canvas.height || rw!==width || rh!==height ||
     rect.width!==width || rect.height!==height || dpr!==1 || zoom!==1;
+  const overlaps = r => r.width>0 && r.height>0 && r.left+scrollX<right && r.right+scrollX>x &&
+    r.top+scrollY<bottom && r.bottom+scrollY>y;
   const roots=[document]; let count=0;
   while (roots.length) {
-    const walker=document.createTreeWalker(roots.pop(),NodeFilter.SHOW_ELEMENT);
+    const inspectPaint=sourceView && !entry.isVisible;
+    const walker=document.createTreeWalker(roots.pop(), NodeFilter.SHOW_ELEMENT | (inspectPaint?NodeFilter.SHOW_TEXT:0));
     for(let el=walker.nextNode();el;el=walker.nextNode()) {
       if(++count>20000)return unknown;
+      if(el.nodeType===Node.TEXT_NODE) {
+        if(!el.length || canvas.contains(el))continue;
+        const range=document.createRange();range.selectNodeContents(el);
+        if(overlaps(range.getBoundingClientRect()))return unknown;
+        continue;
+      }
       if(el.shadowRoot)roots.push(el.shadowRoot);
       if(el===canvas || el.contains(canvas))continue;
       const sensitive=['input','iframe','frame','object','embed'].includes(el.localName);
       if(!sensitive && entry.isVisible && !sourceView)continue;
       const r=el.getBoundingClientRect();
-      if(r.width>0 && r.height>0 && r.left+scrollX<right && r.right+scrollX>x &&
-          r.top+scrollY<bottom && r.bottom+scrollY>y) {
+      if(overlaps(r)) {
         return sensitive ? {error:'CONTROL.ACTION_UNSUPPORTED'} : unknown;
       }
-      if(!entry.isVisible && r.width>0 && r.height>0) {
+      if(inspectPaint) {
         const style=getComputedStyle(el);
-        if(style.boxShadow!=='none' || style.textShadow!=='none' || style.filter!=='none' ||
+        if(style.display==='none')continue;
+        if(el.localName.includes('-') || style.boxShadow!=='none' || style.textShadow!=='none' || style.filter!=='none' ||
             parseFloat(style.outlineWidth)>0 || pseudoPaints(el))return unknown;
       }
     }
   }
+  if(sourceView && !entry.isVisible && !scaledTransform)return unknown;
   // Chromium can report isVisible=false for an otherwise unobstructed
   // downscaled transform. Require hits inside the clipped rectangle as well.
   if(!entry.isVisible || sourceView) {
