@@ -739,7 +739,7 @@ impl AtspiProvider {
                     200000,
                     "max_characters",
                 )? as usize;
-                let (_, _, node, native) = self.fresh_target(args, deadline)?;
+                let (_, _, node, native) = self.fresh_target(args, deadline, false)?;
                 if node["states"]["protected"] != false
                     || node["provenance"]["scope_context"] == true
                 {
@@ -1257,11 +1257,12 @@ impl AtspiProvider {
         &self,
         args: &Map<String, Value>,
         deadline: Instant,
+        pin_invoke_name: bool,
     ) -> Result<(Record, String, Value, NativeRef), AutomationError> {
         let record = self.observed_record(args)?;
         // Reject invalid observed references before asking the backend for a
         // fresh tree. Both checks use the same identity/fingerprint rules.
-        Self::revalidate_target(args, &record, &record, deadline)?;
+        let (_, observed, _) = Self::revalidate_target(args, &record, &record, deadline)?;
         let fresh = self.capture_scoped(
             &record.application_selector,
             record.max_depth,
@@ -1271,6 +1272,16 @@ impl AtspiProvider {
         )?;
         let (fresh_id, resolved, native) =
             Self::revalidate_target(args, &record, &fresh, deadline)?;
+        // On a Chromium checkbox the default action can reverse while the
+        // object, role and locator all remain identical.
+        if pin_invoke_name
+            && observed["provenance"]["native_invoke_name"]
+                != resolved["provenance"]["native_invoke_name"]
+        {
+            return Err(stale(
+                "the observed native activation changed before dispatch",
+            ));
+        }
         Ok((fresh, fresh_id, resolved, native))
     }
 
@@ -1284,7 +1295,7 @@ impl AtspiProvider {
         let observed = self.observed_record(args)?;
         let (_, observed_node, _) = Self::revalidate_target(args, &observed, &observed, deadline)?;
         check_secret_target(&observed_node)?;
-        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline)?;
+        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline, false)?;
         check_secret_target(&node)?;
         remaining(deadline, false)?;
         let result = self.backend.secret_input(&native, text, deadline);
@@ -1387,7 +1398,8 @@ impl AtspiProvider {
         } else {
             None
         };
-        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline)?;
+        let (fresh, fresh_id, node, native) =
+            self.fresh_target(args, deadline, action == "invoke")?;
         let available = node["actions"].as_array().expect("normalized action array");
         if !available.iter().any(|value| value == action) {
             self.backend.check_action_support(action, deadline)?;
@@ -1864,7 +1876,7 @@ impl AtspiProvider {
         args: &Map<String, Value>,
         deadline: Instant,
     ) -> Result<(Vec<u8>, Map<String, Value>), AutomationError> {
-        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline)?;
+        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline, false)?;
         let expanded = self.private_window_record(&fresh, &fresh_id, "capture", deadline)?;
         let (visibility, visibility_id) = expanded
             .as_ref()

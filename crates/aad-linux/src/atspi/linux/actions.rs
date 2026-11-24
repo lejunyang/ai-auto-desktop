@@ -13,6 +13,7 @@ pub(super) struct NativeAction {
 }
 
 trait ActionSource {
+    fn role(&self) -> Result<atspi::Role, AutomationError>;
     fn count(&self) -> Result<i32, AutomationError>;
     fn name(&self, index: i32) -> Result<String, AutomationError>;
     fn localized(&self) -> Result<Vec<atspi::Action>, AutomationError>;
@@ -65,8 +66,17 @@ fn is_activation(name: &str) -> bool {
         .any(|verb| name.eq_ignore_ascii_case(verb))
 }
 
-pub(super) fn unique_activation(actions: &[NativeAction]) -> Option<&NativeAction> {
-    let mut matches = actions.iter().filter(|action| is_activation(&action.name));
+pub(super) fn unique_activation(
+    actions: &[NativeAction],
+    role: atspi::Role,
+) -> Option<&NativeAction> {
+    let mut matches = actions.iter().filter(|action| {
+        is_activation(&action.name)
+            || matches!(
+                (role, action.name.as_str()),
+                (atspi::Role::Link, "jump") | (atspi::Role::CheckBox, "check" | "uncheck")
+            )
+    });
     let selected = matches.next()?;
     matches.next().is_none().then_some(selected)
 }
@@ -82,7 +92,7 @@ fn dispatch_selected(
 ) -> Result<Value, AutomationError> {
     // The expected canonical name comes from the provider's fresh target.
     // Re-resolve the live index, never reuse an observed numerical index.
-    if !is_activation(expected) {
+    if !activation && !is_activation(expected) {
         return Err(unsupported());
     }
     dispatch_qualified(source, expected, activation)
@@ -95,7 +105,7 @@ fn dispatch_qualified(
 ) -> Result<Value, AutomationError> {
     let actions = read(source)?;
     let selected = if activation {
-        unique_activation(&actions).ok_or_else(unsupported)?
+        unique_activation(&actions, source.role()?).ok_or_else(unsupported)?
     } else {
         // toggle/expand/collapse select a specified verb, not a generic
         // activation. Other activation verbs do not make that verb ambiguous.
@@ -164,6 +174,12 @@ impl DbusActions<'_> {
 }
 
 impl ActionSource for DbusActions<'_> {
+    fn role(&self) -> Result<atspi::Role, AutomationError> {
+        self.check(false)?;
+        zbus::block_on(self.backend.accessible(self.target)?.get_role())
+            .map_err(|err| native_failure("Accessible.GetRole", self.target, err))
+    }
+
     fn count(&self) -> Result<i32, AutomationError> {
         self.check(false)?;
         let count = canonical_count(&self.backend.action_proxy(self.target)?)
@@ -304,6 +320,7 @@ mod tests {
     }
 
     struct Source {
+        role: atspi::Role,
         names: Vec<String>,
         localized: Vec<String>,
         calls: Cell<usize>,
@@ -316,6 +333,7 @@ mod tests {
     impl Source {
         fn new(names: &[&str]) -> Self {
             Self {
+                role: atspi::Role::Button,
                 names: names.iter().map(|s| (*s).into()).collect(),
                 localized: vec![String::new(); names.len()],
                 calls: Cell::new(0),
@@ -328,6 +346,9 @@ mod tests {
     }
 
     impl ActionSource for Source {
+        fn role(&self) -> Result<atspi::Role, AutomationError> {
+            Ok(self.role)
+        }
         fn count(&self) -> Result<i32, AutomationError> {
             let n = self.names.len() as i32;
             Ok(n + i32::from(self.changed_count && self.calls.get() > 0))
@@ -361,7 +382,10 @@ mod tests {
         let mut source = Source::new(&["showContextMenu", "press"]);
         source.localized = vec!["press".into(), String::new()];
         let actions = read(&source).unwrap();
-        assert_eq!(unique_activation(&actions).unwrap().name, "press");
+        assert_eq!(
+            unique_activation(&actions, source.role).unwrap().name,
+            "press"
+        );
         let result = dispatch_named(&source, "press").unwrap();
         assert_eq!(result["native_action"]["index"], 1);
         assert_eq!(*source.dispatched.borrow(), vec![1]);
@@ -369,6 +393,26 @@ mod tests {
         let qt = Source::new(&["Press", "SetFocus"]);
         dispatch_named(&qt, "Press").unwrap();
         assert_eq!(*qt.dispatched.borrow(), vec![0]);
+    }
+
+    #[test]
+    fn role_specific_activation_requires_the_live_role_and_unique_verb() {
+        for (role, name) in [
+            (atspi::Role::Link, "jump"),
+            (atspi::Role::CheckBox, "check"),
+            (atspi::Role::CheckBox, "uncheck"),
+        ] {
+            let mut source = Source::new(&["showContextMenu", name]);
+            assert!(dispatch_named(&source, name).is_err());
+            source.role = role;
+            assert!(dispatch_named(&source, "click").is_err());
+            assert!(source.dispatched.borrow().is_empty());
+            dispatch_named(&source, name).unwrap();
+            let mut ambiguous = Source::new(&["press", name]);
+            ambiguous.role = role;
+            assert!(dispatch_named(&ambiguous, name).is_err());
+            assert!(ambiguous.dispatched.borrow().is_empty());
+        }
     }
 
     #[test]

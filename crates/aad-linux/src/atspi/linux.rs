@@ -753,7 +753,7 @@ impl LinuxBackend {
         {
             actions.push("focus".into());
         }
-        let invoke_action = actions::unique_activation(&action_metadata);
+        let invoke_action = actions::unique_activation(&action_metadata, native_role);
         if (actionable || (gtk4_semantic && native_role == atspi::Role::Button))
             && invoke_action.is_some()
         {
@@ -1187,7 +1187,9 @@ impl AtspiBackend for LinuxBackend {
     fn invoke(&self, target: &NativeRef, deadline: Instant) -> Result<Value, AutomationError> {
         self.check_cancelled(false)?;
         let actions = self.canonical_actions(target, deadline)?;
-        let selected = actions::unique_activation(&actions).ok_or_else(|| {
+        let role = zbus::block_on(self.accessible(target)?.get_role())
+            .map_err(|error| native_failure("Accessible.GetRole", target, error))?;
+        let selected = actions::unique_activation(&actions, role).ok_or_else(|| {
             driver_error(
                 "DRIVER.ACTION_UNSUPPORTED",
                 "invoke has no unique qualified native action",
