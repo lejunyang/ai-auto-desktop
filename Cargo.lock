@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "aad-browser"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "aad-linux",
  "aad-macos",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "aad-cli"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "aad-browser",
  "aad-control",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "aad-control"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "aad-browser",
  "aad-core",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "aad-core"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "indexmap 2.14.1",
  "serde",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "aad-desktop"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "aad-core",
  "aad-platform",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "aad-gui"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "aad-control",
  "aad-core",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "aad-linux"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "aad-core",
  "aad-platform",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "aad-macos"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "aad-core",
  "aad-platform",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "aad-mcp"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "aad-browser",
  "aad-control",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "aad-ocr"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "aad-core",
  "aad-plugin",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "aad-platform"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "aad-plugin"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "aad-core",
  "serde",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "aad-probe"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "aad-linux",
  "aad-macos",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "aad-runtime"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "aad-core",
  "aad-plugin",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "aad-windows"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "aad-core",
  "aad-desktop",

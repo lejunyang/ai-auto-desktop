@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.9"
+version = "0.0.10"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
@@ -29,19 +29,19 @@ repository = "https://github.com/lejunyang/ai-auto-desktop"
 # `version` alongside `path`: inside the workspace the path wins, but
 # `cargo publish` rejects a path dependency that names no version, and the
 # published crate needs the registry version to resolve for downstream users.
-aad-core = { path = "crates/aad-core", version = "0.0.9" }
-aad-platform = { path = "crates/aad-platform", version = "0.0.9" }
-aad-windows = { path = "crates/aad-windows", version = "0.0.9" }
-aad-linux = { path = "crates/aad-linux", version = "0.0.9" }
-aad-macos = { path = "crates/aad-macos", version = "0.0.9" }
-aad-desktop = { path = "crates/aad-desktop", version = "0.0.9" }
-aad-plugin = { path = "crates/aad-plugin", version = "0.0.9" }
-aad-runtime = { path = "crates/aad-runtime", version = "0.0.9" }
-aad-ocr = { path = "crates/aad-ocr", version = "0.0.9" }
-aad-browser = { path = "crates/aad-browser", version = "0.0.9" }
-aad-control = { path = "crates/aad-control", version = "0.0.9" }
-aad-probe = { path = "crates/aad-probe", version = "0.0.9" }
-aad-mcp = { path = "crates/aad-mcp", version = "0.0.9" }
+aad-core = { path = "crates/aad-core", version = "0.0.10" }
+aad-platform = { path = "crates/aad-platform", version = "0.0.10" }
+aad-windows = { path = "crates/aad-windows", version = "0.0.10" }
+aad-linux = { path = "crates/aad-linux", version = "0.0.10" }
+aad-macos = { path = "crates/aad-macos", version = "0.0.10" }
+aad-desktop = { path = "crates/aad-desktop", version = "0.0.10" }
+aad-plugin = { path = "crates/aad-plugin", version = "0.0.10" }
+aad-runtime = { path = "crates/aad-runtime", version = "0.0.10" }
+aad-ocr = { path = "crates/aad-ocr", version = "0.0.10" }
+aad-browser = { path = "crates/aad-browser", version = "0.0.10" }
+aad-control = { path = "crates/aad-control", version = "0.0.10" }
+aad-probe = { path = "crates/aad-probe", version = "0.0.10" }
+aad-mcp = { path = "crates/aad-mcp", version = "0.0.10" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
