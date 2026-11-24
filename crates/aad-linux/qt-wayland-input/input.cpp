@@ -3,9 +3,11 @@
 #include <QAccessible>
 #include <QApplication>
 #include <QDBusConnection>
+#include <QDragEnterEvent>
 #include <QGenericPlugin>
 #include <QKeyEvent>
 #include <QLineEdit>
+#include <QMimeData>
 #include <QMouseEvent>
 #include <QPointer>
 #include <QScopedValueRollback>
@@ -33,13 +35,14 @@ QWidget *widgetFor(const QString &path) {
     return widget;
 }
 
-QWidget *boundWidget(const QString &target, const QString &window) {
+QWidget *boundWidget(const QString &target, const QString &window, bool requireActive = true) {
     auto *widget = widgetFor(target);
     auto *top = widgetFor(window);
     if (!widget || !top || !top->isWindow() || widget->window() != top ||
-        !widget->isEnabled() || !widget->isVisible() || QApplication::activeWindow() != top ||
+        !widget->isEnabled() || !widget->isVisible() || top->isMinimized() ||
         !top->windowHandle() || !top->windowHandle()->isExposed() ||
-        QGuiApplication::focusWindow() != top->windowHandle() ||
+        (requireActive && (QApplication::activeWindow() != top ||
+                           QGuiApplication::focusWindow() != top->windowHandle())) ||
         QApplication::activePopupWidget() || QWidget::mouseGrabber() || QWidget::keyboardGrabber())
         return nullptr;
     auto *modal = QApplication::activeModalWidget();
@@ -93,6 +96,34 @@ bool inTime(qulonglong deadline) {
     return clock_gettime(CLOCK_MONOTONIC, &now) == 0 &&
            qulonglong(now.tv_sec) * 1000000000 + qulonglong(now.tv_nsec) < deadline;
 }
+
+class DropReceiverGuard : public QObject {
+    QPointer<QWidget> receiver;
+    QEvent *phase = nullptr;
+    bool observed = false;
+public:
+    explicit DropReceiverGuard(QWidget *widget) : receiver(widget) {
+        qApp->installEventFilter(this);
+    }
+    bool deliver(QWidget *address, QEvent &event, bool permit = true) {
+        observed = false;
+        phase = &event;
+        if (!permit) receiver.clear();
+        event.ignore();
+        const bool handled = QCoreApplication::sendEvent(address, &event);
+        phase = nullptr;
+        return handled && observed && event.isAccepted();
+    }
+    bool eventFilter(QObject *object, QEvent *event) override {
+        if (event != phase) return false;
+        if (object == receiver) {
+            observed = true;
+            return false;
+        }
+        event->ignore();
+        return true;
+    }
+};
 
 struct Chord {
     Qt::KeyboardModifiers modifiers;
@@ -161,7 +192,7 @@ public:
     }
 public slots:
     QStringList PointerModes() const {
-        return {"wheel", "hover", "click", "drag_same_widget"};
+        return {"wheel", "hover", "click", "drag_same_widget", "text_copy_drop"};
     }
 
     bool PointMatches(const QString &target, const QString &window, int px, int py) const {
@@ -213,6 +244,19 @@ public slots:
             }
         }
         return flags;
+    }
+
+    QByteArray DropRoles(const QStringList &targets, const QStringList &windows) const {
+        if (targets.size() != windows.size() || targets.size() > 5000) return {};
+        QByteArray roles(targets.size(), 0);
+        for (int index = 0; index < targets.size(); ++index) {
+            auto *widget = boundWidget(targets[index], windows[index], false);
+            if (!widget) continue;
+            auto *edit = qobject_cast<QLineEdit *>(widget);
+            roles[index] = (edit && edit->dragEnabled() && edit->hasSelectedText() ? 1 : 0) |
+                           (widget->acceptDrops() ? 2 : 0);
+        }
+        return roles;
     }
 
     // 0 = refused before dispatch, 1 = press began but pair unconfirmed,
@@ -273,6 +317,50 @@ public slots:
         if (!widget || widget != boundWidget(target, window) || !hits(widget, end)) return 1;
         sendMouse(widget, end, QEvent::MouseButtonRelease, which, Qt::NoButton, modifiers);
         return 2;
+    }
+
+    int DropText(const QString &sourceId, const QString &sourceWindow, int startX, int startY,
+                 const QString &destId, const QString &destWindow, int endX, int endY,
+                 int button, const QStringList &modifierNames, qulonglong deadline) {
+        Qt::KeyboardModifiers modifiers;
+        if (delivering || button != 1 || !parseModifiers(modifierNames, modifiers) ||
+            (modifiers != Qt::NoModifier && modifiers != Qt::ControlModifier)) return 0;
+        QScopedValueRollback<bool> busy(delivering, true);
+        const QPoint start(startX, startY), end(endX, endY);
+        QPointer<QLineEdit> source = qobject_cast<QLineEdit *>(boundWidget(sourceId, sourceWindow));
+        QPointer<QWidget> dest = boundWidget(destId, destWindow, false);
+        if (!source || !dest || source == dest || !source->dragEnabled() || !source->hasSelectedText()) return 0;
+        const int first = source->selectionStart();
+        const QString selection = source->selectedText();
+        if (selection.size() > 65536) return 0;
+        const QPoint local = dest->mapFromGlobal(end);
+        const auto endpointsMatch = [&] {
+            if (!source || !dest || source != boundWidget(sourceId, sourceWindow) ||
+                dest != boundWidget(destId, destWindow, false) || !dest->acceptDrops() ||
+                QApplication::mouseButtons() != Qt::NoButton ||
+                !hits(source, start) || !hits(dest, end) || dest->mapFromGlobal(end) != local ||
+                !source->dragEnabled() || source->selectionStart() != first ||
+                source->selectedText() != selection) return false;
+            const int index = source->cursorPositionAt(source->mapFromGlobal(start));
+            return index >= first && index < first + selection.size();
+        };
+        if (!endpointsMatch() || !inTime(deadline)) return 0;
+        QMimeData payload;
+        payload.setText(selection);
+        QDragEnterEvent enter(local, Qt::CopyAction, &payload, Qt::LeftButton, modifiers);
+        if (enter.source()) return 0;
+        DropReceiverGuard guard(dest);
+        if (!guard.deliver(dest, enter)) return 1;
+        QDragMoveEvent move(local, Qt::CopyAction, &payload, Qt::LeftButton, modifiers);
+        if (enter.dropAction() != Qt::CopyAction || !endpointsMatch() || !inTime(deadline) ||
+            !guard.deliver(dest, move) || move.dropAction() != Qt::CopyAction ||
+            !endpointsMatch() || !inTime(deadline)) {
+            QDragLeaveEvent leave;
+            if (dest) guard.deliver(dest, leave, endpointsMatch());
+            return 1;
+        }
+        QDropEvent drop(local, Qt::CopyAction, &payload, Qt::LeftButton, modifiers);
+        return guard.deliver(dest, drop) && drop.dropAction() == Qt::CopyAction ? 2 : 1;
     }
 };
 }

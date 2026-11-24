@@ -175,6 +175,12 @@ pub trait AtspiBackend: Send + Sync {
     fn supports_cross_resource_drag(&self) -> bool {
         false
     }
+    fn qt_text_drop(&self, _request: DragBetweenRequest<'_>) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "directed Qt drop is unavailable",
+        ))
+    }
     fn drag_between(
         &self,
         _request: DragBetweenRequest<'_>,
@@ -1419,6 +1425,7 @@ impl AtspiProvider {
             }
         }
         // The destination of a drag is re-verified exactly like the source.
+        let mut qt_drop = None;
         let destination = if action == "drag" {
             let mut to_args = Map::new();
             to_args.insert(
@@ -1435,11 +1442,29 @@ impl AtspiProvider {
                 &fresh,
                 deadline,
             )?;
-            if node["provenance"]["wayland_input_window"].is_string()
-                && (to_native != native || !path.is_empty() || hold_ms.is_some())
-            {
-                return Err(driver_error("DRIVER.ACTION_UNSUPPORTED",
-                    "Qt Wayland drag requires two endpoints on the same widget, without waypoints or hold"));
+            if node["provenance"]["wayland_input_window"].is_string() {
+                if !path.is_empty() || hold_ms.is_some() {
+                    return Err(driver_error(
+                        "DRIVER.ACTION_UNSUPPORTED",
+                        "Wayland widget drag does not support waypoints or hold",
+                    ));
+                }
+                if to_native != native {
+                    if node["provenance"]["qt_text_drag_source"] != true
+                        || to_node["provenance"]["qt_text_drop_target"] != true
+                        || to_node["states"]["protected"] != false
+                        || to_node["provenance"]["value_redacted"] != false
+                        || native.bus_name != to_native.bus_name
+                    {
+                        return Err(driver_error(
+                            "DRIVER.ACTION_UNSUPPORTED",
+                            "both Qt text drop endpoints must be proven",
+                        ));
+                    }
+                    let top = input_window(&fresh, &to_id)
+                        .ok_or_else(|| stale("missing destination window"))?;
+                    qt_drop = Some((to_native, top, process_id(&to_node, &fresh)?));
+                }
             }
             let to_point = point_in(
                 parse_bounds(to_node.get("bounds"))?,
@@ -1631,6 +1656,29 @@ impl AtspiProvider {
                             },
                             validate,
                         );
+                    }
+                    if let Some((destination_native, destination_window, destination_pid)) = qt_drop
+                    {
+                        return self.backend.qt_text_drop(DragBetweenRequest {
+                            source: DragBetweenEndpoint {
+                                target: &native,
+                                window: window
+                                    .as_ref()
+                                    .ok_or_else(|| stale("missing source window"))?,
+                                point: pointer.expect("drag source"),
+                                process_id: process,
+                            },
+                            destination: DragBetweenEndpoint {
+                                target: &destination_native,
+                                window: &destination_window,
+                                point: destination.expect("drag destination"),
+                                process_id: destination_pid,
+                            },
+                            button,
+                            modifiers: &modifiers,
+                            hold_ms,
+                            deadline,
+                        });
                     }
                     self.backend.drag_modified(
                         &native,

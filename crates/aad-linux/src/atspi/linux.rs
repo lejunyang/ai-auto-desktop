@@ -988,6 +988,37 @@ impl AtspiBackend for LinuxBackend {
         self.run_drag_between(request, validate)
     }
 
+    fn qt_text_drop(
+        &self,
+        request: super::DragBetweenRequest<'_>,
+    ) -> Result<Value, AutomationError> {
+        let source = request.source;
+        let destination = request.destination;
+        if !crate::wayland_portal::is_wayland_session()
+            || source.process_id != destination.process_id
+            || request.button != 1
+            || request.hold_ms.is_some()
+        {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "Qt text drop requires a same-process left drag without hold",
+            ));
+        }
+        self.wayland_input(
+            source.target,
+            Some(source.window),
+            source.process_id,
+            wayland_input::Event::DropText {
+                destination: destination.target,
+                window: destination.window,
+                from: source.point,
+                to: destination.point,
+                modifiers: request.modifiers,
+            },
+            request.deadline,
+        )
+    }
+
     fn cancellation_scope(
         &self,
         token: &super::CancellationToken,

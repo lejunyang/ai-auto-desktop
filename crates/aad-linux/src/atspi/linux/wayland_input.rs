@@ -7,6 +7,13 @@ const INTERFACE: &str = "org.aiautodesktop.QtWaylandInput1";
 pub(super) enum Event<'a> {
     Click((i32, i32)),
     Key(&'a [String]),
+    DropText {
+        destination: &'a NativeRef,
+        window: &'a WindowAnchor,
+        from: (i32, i32),
+        to: (i32, i32),
+        modifiers: &'a [String],
+    },
     Gesture((i32, i32), Gesture, &'a [String]),
     Drag {
         from: (i32, i32),
@@ -55,7 +62,7 @@ impl LinuxBackend {
             .as_ref()
             .and_then(|proxy| {
                 proxy
-                    .call::<_, _, Vec<u8>>("Capabilities", &(targets, &windows))
+                    .call::<_, _, Vec<u8>>("Capabilities", &(&targets, &windows))
                     .ok()
             })
             .filter(|flags| flags.len() == windows.len());
@@ -74,6 +81,17 @@ impl LinuxBackend {
         let gestures = ["wheel", "hover"]
             .iter()
             .all(|m| modes.iter().any(|v| v == m));
+        let drop_roles = modes
+            .iter()
+            .any(|mode| mode == "text_copy_drop")
+            .then(|| {
+                proxy
+                    .as_ref()?
+                    .call::<_, _, Vec<u8>>("DropRoles", &(&targets, &windows))
+                    .ok()
+            })
+            .flatten()
+            .filter(|roles| roles.len() == targets.len());
         remaining(deadline, false)?;
         self.check_cancelled(false)?;
         let windows: Vec<_> = windows.into_iter().map(str::to_owned).collect();
@@ -81,9 +99,11 @@ impl LinuxBackend {
             node.provenance
                 .insert("coordinate_space".into(), json!("unproven_toolkit"));
             let flag = flags.as_ref().map_or(0, |flags| flags[i]);
+            let drop_role = drop_roles.as_ref().map_or(0, |roles| roles[i]);
             let state = |name: &str| node.states.get(name).copied().flatten();
             if window.is_empty()
-                || flag == 0
+                || (flag == 0 && drop_role & 2 == 0)
+                || drop_role > 3
                 || flag > 3
                 || state("protected") != Some(false)
                 || !["enabled", "sensitive", "visible", "showing"]
@@ -106,6 +126,14 @@ impl LinuxBackend {
                 if modes.iter().any(|mode| mode == "drag_same_widget") {
                     node.actions.push("drag".into());
                 }
+            }
+            if flag & 2 != 0 && drop_role & 1 != 0 {
+                node.provenance
+                    .insert("qt_text_drag_source".into(), json!(true));
+            }
+            if drop_role & 2 != 0 {
+                node.provenance
+                    .insert("qt_text_drop_target".into(), json!(true));
             }
             node.provenance
                 .insert("coordinate_space".into(), json!("qt_wayland_logical"));
@@ -145,8 +173,40 @@ impl LinuxBackend {
         let until = monotonic_deadline_ns(deadline.min(Instant::now() + Duration::from_secs(2)))?;
         self.check_cancelled(false)?;
         let mut events = 2;
+        let mut interface = "QtWidgets.sendEvent";
         let mut dwell = None;
         let reply: zbus::Result<i32> = match event {
+            Event::DropText {
+                destination,
+                window,
+                from,
+                to,
+                modifiers,
+            } => {
+                if destination.bus_name != target.bus_name
+                    || window.native.bus_name != target.bus_name
+                {
+                    return Err(denied());
+                }
+                events = 3;
+                interface = "QtWidgets.DropText";
+                proxy.call(
+                    "DropText",
+                    &(
+                        object,
+                        top,
+                        from.0,
+                        from.1,
+                        destination.object_path.as_str(),
+                        window.native.object_path.as_str(),
+                        to.0,
+                        to.1,
+                        1_i32,
+                        modifiers,
+                        until,
+                    ),
+                )
+            }
             Event::Drag {
                 from: (x, y),
                 to: (end_x, end_y),
@@ -242,10 +302,8 @@ impl LinuxBackend {
                 }
                 self.check_cancelled(true)?;
                 remaining(deadline, true)?;
-                Ok(
-                    json!({"native_interface":"QtWidgets.sendEvent", "synthetic_input":true,
-                    "target_window":top, "dispatched":true, "events":events}),
-                )
+                Ok(json!({"native_interface":interface, "synthetic_input":true,
+                    "target_window":top, "dispatched":true, "events":events}))
             }
             _ => Err(driver_error(
                 "DRIVER.UNKNOWN_EFFECT",

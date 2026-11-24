@@ -50,7 +50,8 @@ Use `aad snapshot $resourceId` to find widget names and their current capabiliti
 | `click` | Left, middle or right button, single or double click, at an optional fraction. Clicks and drags accept Ctrl, Shift, Alt and Meta through the control API. |
 | `scroll` | One wheel event at the requested fraction, with 1–30 detents along one of four directions. The widget decides how far to scroll. |
 | `hover` | One widget-local hover move with optional dwell. During dwell the backend rechecks the hit. The system cursor stays in place. |
-| `drag` | A press, one held-button move and a release. Use the same observed widget for both endpoints. The plugin checks the straight path for covering children before press and again before move. The longer axis may span up to 8192 logical pixels. |
+| `drag`, same widget | A press, one held-button move and a release. The plugin checks the straight path for covering children before press and again before move. The longer axis may span up to 8192 logical pixels. |
+| `drag`, different widgets | Copy selected plain text from a drag-enabled, non-password `QLineEdit` in the active window into an exact `acceptDrops()` widget. Both must belong to the same observed application; the destination may be in another exposed, non-minimized window. Use the left button with no modifiers or Ctrl. |
 
 ```powershell
 aad do scroll $resourceId --name 'Invoice scroll' --direction down --notches 2 --fx .78 --fy .5
@@ -65,6 +66,8 @@ For a modified click, use the following `action` in a control `act` request with
 {"type":"click","button":"right","count":2,"fraction":{"fx":1,"fy":0},"modifiers":["ctrl","shift"]}
 ```
 
-The provider pins the widget and window to the observed application's unique AT-SPI bus owner. The GUI thread checks that the same top-level window is active and exposed, and revalidates the receiver between event phases. Loss of proof after dispatch begins yields an unknown effect. Hit testing covers the addressed window's own widget hierarchy. Independent Wayland windows can share a coordinate origin, so this check cannot establish compositor-wide visibility.
+The provider pins both widgets and their respective windows to the observed application's unique AT-SPI bus owner. The GUI thread rechecks identity, exposure and widget hits between phases. An inactive drop target is not eligible for standalone clicks or keys. Hit testing covers each addressed window's own widget hierarchy; no compositor-wide visibility or shared origin is assumed.
 
-The control actions for wheel and hover carry no modifier field. The Qt drag call carries one widget ID and two endpoints, so it can verify a straight path within that widget. It has no field for waypoints or a second receiver. Timed holds would need a cancellable target-side release while the GUI thread continues processing focus and geometry changes. The plugin handles press, move and release synchronously. IME composition and seat-wide input are outside its capabilities.
+For a cross-widget drag, start within the selection. The plugin copies the actual selection (up to 65,536 UTF-16 units) into in-process MIME data; it never reads the clipboard or sends the payload over D-Bus. It dispatches drag-enter, drag-move and drop to the destination and requires acceptance of the copy. An ignored enter cannot fall through to a parent drop handler. Loss of proof or rejection after delivery starts is an unknown effect, not a successful drop. This is a directed copy, not a seat drag: no source deletion, compositor pointer motion, or `QDrag` source object. Handlers that require such an object, arbitrary MIME, cross-process drops, Qt Quick, waypoints and timed holds are not supported.
+
+To qualify a build from the repository, build `tests/linux/qt_wayland_fixture.pro` with the same qmake as the plugin and run `python3 tests/linux/verify_qt_wayland.py <aad> <fixture-executable> <plugin-root>`. The runner creates a private virtual KWin and D-Bus session. Run the two ABI checks and the existing `verify-wayland-form.ps1` regression serially.

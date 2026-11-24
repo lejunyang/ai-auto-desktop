@@ -42,6 +42,20 @@ def verify(aad, fixture, plugin_root):
                         call("do", "key", rid, "--name", "Invoice source", "--keys", "ctrl,a")
                         wait_for(lambda: "SELECTION selected invoice 2037" in log.read_text().splitlines()[before:],
                                  "selected source text")
+                        def drag(target, *, end=".5", success=True):
+                            return call("do", "drag", rid, "--name", "Invoice source", "--to-name", target,
+                                        "--fx", ".15", "--fy", ".5", "--to-fx", end, "--to-fy", ".5", success=success)
+                        initial = log.read_text()
+                        drag("Same window receiver", end="0", success=False)
+                        assert log.read_text() == initial, "covered endpoint changed the UI"
+                        drag("Same window receiver")
+                        wait_for(lambda: emitted("LOCAL selected invoice 2037"), "same-window dropped text")
+                        drag("Other window receiver")
+                        wait_for(lambda: emitted("REMOTE selected invoice 2037"), "other-window dropped text")
+                        failure = drag("Refusing receiver", success=False)
+                        assert json.loads(failure.stdout)["error"]["effect"] == "unknown", failure.stdout
+                        assert emitted("REFUSED") and not emitted("WRONG RECEIVER"), log.read_text()
+                        call("do", "click", rid, "--name", "Other window receiver", success=False)
                         call("do", "click", rid, "--name", "Submit invoice")
                         wait_for(lambda: emitted("CLICK"), "button activation")
                         call("do", "scroll", rid, "--name", "Invoice scroll", "--direction", "down")
