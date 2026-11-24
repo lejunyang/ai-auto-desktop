@@ -21,6 +21,59 @@ fn editor(client: &mut Client, ctx: &Ctx, args: &Value) -> Result<Value> {
 }
 
 impl Guard {
+    /// A published object can be located even when its centre is outside a
+    /// scrollport. Ask Chromium to reveal only that point on the retained node.
+    pub(super) fn reveal(&self, client: &mut Client, ctx: &Ctx, args: &Value) -> Result<()> {
+        self.check(client, ctx, args)?;
+        let session = ctx.session.as_deref();
+        let node = run(
+            client,
+            session,
+            "Runtime.evaluate",
+            json!({
+                "contextId":ctx.id,"expression":format!("globalThis.__aadControlV1.element({args})"),
+                "returnByValue":false
+            }),
+        )?;
+        let object = node["result"]["objectId"]
+            .as_str()
+            .filter(|_| node["result"]["subtype"] == "node")
+            .ok_or_else(stale)?;
+        let result = (|| {
+            let model = run(
+                client,
+                session,
+                "DOM.getBoxModel",
+                json!({"objectId":object}),
+            )?;
+            let offset = |axis: &str, fraction: &str| -> Result<f64> {
+                let size = model["model"][axis]
+                    .as_f64()
+                    .filter(|v| *v >= 2.)
+                    .ok_or_else(stale)?;
+                let f = args["fraction"][fraction].as_f64().ok_or_else(stale)?;
+                Ok((size * f - 0.5).clamp(0., size - 1.))
+            };
+            let rect =
+                json!({"x":offset("width","fx")?,"y":offset("height","fy")?,"width":1,"height":1});
+            ctx.commit_input(client)?;
+            run(
+                client,
+                session,
+                "DOM.scrollIntoViewIfNeeded",
+                json!({"objectId":object,"rect":rect}),
+            )?;
+            Ok(())
+        })();
+        let _ = run(
+            client,
+            session,
+            "Runtime.releaseObject",
+            json!({"objectId":object}),
+        );
+        result
+    }
+
     /// Re-read after pointer arrival, since hover handlers can redraw a canvas.
     pub(super) fn check(&self, client: &mut Client, ctx: &Ctx, args: &Value) -> Result<()> {
         let same = match self {

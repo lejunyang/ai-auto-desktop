@@ -3345,7 +3345,15 @@ fn pointer(
     if let Action::Click { hold_ms, .. } = action {
         hold_preflight(action_context, *hold_ms)?;
     }
-    let point = landing(client, context, args)?;
+    let point = match (landing(client, context, args), guard) {
+        (Err(err), Some(editor @ canvas_objects::Guard::Editor(_)))
+            if err.code == "CONTROL.OCCLUDED" =>
+        {
+            editor.reveal(client, context, args)?;
+            landing(client, context, args).map_err(|e| e.with_effect("contextual"))?
+        }
+        (result, _) => result?,
+    };
     let (x, y) = route.page_point(client, point)?;
     let modifiers = match action {
         Action::Click { modifiers, .. } => pointer_modifiers(modifiers),

@@ -82,4 +82,12 @@ test('find and click full-canvas objects after scrolling and zooming a large boa
   assert.deepEqual(await page.cdp.eval('hits'),Array(6).fill(true));
   await page.cdp.eval(`document.body.insertAdjacentHTML('beforeend','<div style="position:fixed;left:60px;top:60px;width:7px;height:8px;background:red;pointer-events:none"></div>');true`);
   await assert.rejects(read(),e=>JSON.parse(e.stdout).code==='CONTROL.CANVAS_SCOPE_UNPROVEN');
+  await page.cdp.call('Emulation.setPageScaleFactor',{pageScaleFactor:1});
+  await page.cdp.eval(`document.body.lastElementChild.remove();cv.style.transform='none';show(.75);
+    cv.dataset.aadScene=JSON.stringify({objects:[{id:'review',kind:'rectangle',label:'REVIEW',
+      box:{fx:1700/3600,fy:760/1600,fw:270/3600,fh:105/1600}}],edges:[]});view.scrollTo(0,0);true`);
+  await click({id:'review'});
+  assert.deepEqual(await page.cdp.eval('hits'),Array(7).fill(true));
+  assert.ok((await page.cdp.eval('view.scrollLeft'))>800);
+
 });
