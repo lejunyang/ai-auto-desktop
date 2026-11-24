@@ -31,6 +31,9 @@ pub(crate) fn read_capture(
     for key in ["format", "data", "width", "height", "clipped"] {
         read[key] = shot[key].clone();
     }
+    if let Some(region) = shot.get("canvas_region") {
+        read["canvas_region"] = region.clone();
+    }
     Ok(read)
 }
 

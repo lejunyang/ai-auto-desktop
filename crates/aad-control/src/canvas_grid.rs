@@ -55,20 +55,29 @@ impl Session {
             )
         })?;
         let timeout = context.remaining()?;
-        let (image, _) = crate::capture_cancellable(context, move || {
+        let (image, shot) = crate::capture_cancellable(context, move || {
             browser.visible_canvas(&observation.raw, &node, timeout)
         })?;
         context.remaining()?;
-        let mut result = read_cells(&image, spec, context)?;
+        let view = crate::canvas_objects::Region::read(&shot["canvas_region"])?;
+        let mut result = read_cells(&image, view, spec, context)?;
+        result["visible_region"] = json!(view);
         result["target"] = json!(target);
         Ok(result)
     }
 }
 
-fn read_cells(image: &RgbaImage, spec: &Spec, context: &Context) -> Result<Value> {
+fn read_cells(
+    image: &RgbaImage,
+    view: crate::canvas_objects::Region,
+    spec: &Spec,
+    context: &Context,
+) -> Result<Value> {
     let (width, height) = image.dimensions();
     let columns = spec.columns.len() as u32;
-    if height / spec.rows < 4 || width / columns < 4 {
+    if f64::from(height) / (view.fh * f64::from(spec.rows)) < 4.0
+        || f64::from(width) / (view.fw * f64::from(columns)) < 4.0
+    {
         return Err(error(
             "CONTROL.INVALID_REQUEST",
             "each canvas cell needs at least four pixels in each dimension",
@@ -78,18 +87,39 @@ fn read_cells(image: &RgbaImage, spec: &Spec, context: &Context) -> Result<Value
     let ocr = OcrProvider::new()?;
     let mut cells = Vec::new();
     let mut reasons = Vec::new();
-    if declared > MAX_CELLS {
-        reasons.push("cell_limit");
+    if view.fw < 1. || view.fh < 1. {
+        reasons.push("viewport_clip");
     }
     let mut uncertain_cells = 0;
-    for index in 0..declared.min(MAX_CELLS) {
+    let span = |i: u32, count: u32, origin: f64, range: f64, pixels: u32| {
+        let (start, end) = (
+            f64::from(i) / f64::from(count),
+            f64::from(i + 1) / f64::from(count),
+        );
+        if start + 1e-9 < origin || end > origin + range + 1e-9 {
+            return None;
+        }
+        let at = |f: f64| {
+            (((f - origin) / range * f64::from(pixels) + 1e-9)
+                .floor()
+                .clamp(0., f64::from(pixels))) as u32
+        };
+        Some((at(start), at(end) - at(start)))
+    };
+    for index in 0..declared {
         context.remaining()?;
         let row = index as u32 / columns;
         let col = index as u32 % columns;
-        let left = width * col / columns;
-        let top = height * row / spec.rows;
-        let w = width * (col + 1) / columns - left;
-        let h = height * (row + 1) / spec.rows - top;
+        let Some((left, w)) = span(col, columns, view.fx, view.fw, width) else {
+            continue;
+        };
+        let Some((top, h)) = span(row, spec.rows, view.fy, view.fh, height) else {
+            continue;
+        };
+        if cells.len() == MAX_CELLS {
+            reasons.push("cell_limit");
+            break;
+        }
         // The outer pixel of each cell is reserved for a thin grid rule.
         let crop = imageops::crop_imm(image, left + 1, top + 1, w - 2, h - 2).to_image();
         let mut text = String::new();

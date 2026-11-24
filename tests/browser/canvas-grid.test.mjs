@@ -50,6 +50,15 @@ test('read a visible canvas ledger using real cell OCR through the CLI', {
   assert.equal(result.dataset_complete,null);
   t.diagnostic(JSON.stringify({texts:result.cells.map(c=>c.text),uncertain_cells:result.uncertain_cells}));
 
+  // Clip the first row and column completely, and half of the last
+  // column. Keep the declared indices of the fully readable cells.
+  await page.cdp.eval(`const pane=document.createElement('div');pane.style='overflow:scroll;width:360px;height:135px';
+    el.replaceWith(pane);pane.append(el);el.style.display='block';pane.scrollTo(200,60);true`);
+  const partial=await read();
+  assert.deepEqual(partial.cells.map(c=>[c.row,c.column,c.text]),[[2,'amount','840'],[3,'amount','317']]);
+  assert.deepEqual(partial.truncation_reasons,['viewport_clip']);
+  await page.cdp.eval('pane.replaceWith(el);true');
+
   // With a broken engine configuration, a scope error proves rejection
   // happened before even constructing the OCR provider.
   const noOcr={...process.env,OCR_TESSERACT_COMMAND:'invalid JSON'};

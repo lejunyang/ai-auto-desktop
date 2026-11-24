@@ -2719,6 +2719,7 @@ impl Backend for BrowserBackend {
                 _=>{}
             }
             if trusted {
+                if guard.is_some() { args["noscroll"]=json!(true); }
                 return pointer(client,&context,&route,&args,action,action_context,guard);
             }
             if let Action::Upload {files}=action {

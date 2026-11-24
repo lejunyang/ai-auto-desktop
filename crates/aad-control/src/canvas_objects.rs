@@ -2,6 +2,31 @@
 use crate::{error, Result};
 use serde::{Deserialize, Serialize};
 
+/// A visible crop or object box in fractions of the full canvas.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub(crate) struct Region {
+    pub fx: f64,
+    pub fy: f64,
+    pub fw: f64,
+    pub fh: f64,
+}
+
+impl Region {
+    pub(crate) fn read(raw: &serde_json::Value) -> Result<Self> {
+        serde_json::from_value(raw.clone())
+            .map_err(|_| error("CONTROL.BAD_PROVIDER_OUTPUT", "missing canvas region"))
+    }
+
+    pub(crate) fn project(self, b: Self) -> Self {
+        Self {
+            fx: self.fx + b.fx * self.fw,
+            fy: self.fy + b.fy * self.fh,
+            fw: b.fw * self.fw,
+            fh: b.fh * self.fh,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {

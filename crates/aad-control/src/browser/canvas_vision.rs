@@ -81,7 +81,7 @@ fn request<'a>(shot: &'a Value, description: &'a str) -> Result<Request<'a>> {
     let width = shot["width"].as_u64().ok_or_else(invalid)?;
     let height = shot["height"].as_u64().ok_or_else(invalid)?;
     if shot["format"] != "png"
-        || shot["clipped"] != false
+        || (shot["clipped"] != false && !shot["canvas_proof"].is_object())
         || !(1..=2048).contains(&width)
         || !(1..=2048).contains(&height)
         || width * height > 2_000_000

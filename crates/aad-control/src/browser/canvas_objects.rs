@@ -9,7 +9,7 @@ pub(crate) struct Scene {
 
 pub(super) enum Guard {
     Editor(Value),
-    Pixels(String),
+    Pixels(Value),
 }
 
 fn editor(client: &mut Client, ctx: &Ctx, args: &Value) -> Result<Value> {
@@ -25,7 +25,9 @@ impl Guard {
     pub(super) fn check(&self, client: &mut Client, ctx: &Ctx, args: &Value) -> Result<()> {
         let same = match self {
             Self::Editor(graph) => editor(client, ctx, args)? == *graph,
-            Self::Pixels(hash) => canvas_grid::scope(client, ctx, args, true)?["sha256"] == *hash,
+            Self::Pixels(proof) => {
+                canvas_grid::capture_region(client, ctx, args)?.1["canvas_proof"] == *proof
+            }
         };
         if same {
             Ok(())
@@ -85,10 +87,11 @@ impl BrowserBackend {
             }
         }
         let (image, shot) = self.visible_canvas(snapshot, node, left()?)?;
-        let guard = Guard::Pixels(format!("{:x}", Sha256::digest(image.as_raw())));
+        let guard = Guard::Pixels(shot["canvas_proof"].clone());
         if source == Source::Vision {
-            let graph =
+            let mut graph =
                 canvas_vision::detect(&shot, options.description.as_deref().unwrap(), left()?)?;
+            project_objects(&mut graph, &shot)?;
             let mut scene = Scene::new(graph, "vision", guard);
             if options.preview {
                 scene.preview(&shot)?;
@@ -118,12 +121,27 @@ impl BrowserBackend {
             })?;
         left()?;
         graph["label_source"] = label_source;
+        project_objects(&mut graph, &shot)?;
         let mut scene = Scene::new(graph, "flowchart", guard);
         if options.preview {
             scene.preview(&shot)?;
         }
         Ok(scene)
     }
+}
+
+fn project_objects(graph: &mut Value, shot: &Value) -> Result<()> {
+    use crate::canvas_objects::Region;
+    let region = Region::read(&shot["canvas_region"])?;
+    for object in graph["objects"]
+        .as_array_mut()
+        .ok_or_else(|| error("CONTROL.BAD_PROVIDER_OUTPUT", "missing canvas objects"))?
+    {
+        object["box"] = json!(region.project(Region::read(&object["box"])?));
+    }
+    graph["visible_region"] = shot["canvas_region"].clone();
+    graph["clipped"] = shot["clipped"].clone();
+    Ok(())
 }
 
 impl Scene {
@@ -137,6 +155,7 @@ impl Scene {
         let mut svg = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}"><image width="{w}" height="{h}" href="data:image/png;base64,{png}"/>"#
         );
+        let view = crate::canvas_objects::Region::read(&shot["canvas_region"])?;
         for (index, obj) in self.public["objects"]
             .as_array_mut()
             .ok_or_else(bad)?
@@ -144,9 +163,14 @@ impl Scene {
             .enumerate()
         {
             let b = &obj["box"];
-            let px =
-                |key: &str, span: u64| b[key].as_f64().map(|f| f * span as f64).ok_or_else(bad);
-            let (x, y, width, height) = (px("fx", w)?, px("fy", h)?, px("fw", w)?, px("fh", h)?);
+            let obj_box = crate::canvas_objects::Region::read(b)?;
+            let x = (obj_box.fx - view.fx) / view.fw * w as f64;
+            let y = (obj_box.fy - view.fy) / view.fh * h as f64;
+            let width = obj_box.fw / view.fw * w as f64;
+            let height = obj_box.fh / view.fh * h as f64;
+            if x + width <= 0. || y + height <= 0. || x >= w as f64 || y >= h as f64 {
+                continue;
+            }
             let n = index + 1;
             let tx = (x + 2.).min((w as f64 - 18.).max(0.));
             let ty = (y + 15.).min(h as f64);
@@ -162,7 +186,7 @@ impl Scene {
         let mut hash = Sha256::new();
         hash.update(graph.to_string());
         if let Guard::Pixels(pixels) = &guard {
-            hash.update(pixels);
+            hash.update(pixels.to_string());
         }
         graph["digest"] = json!(format!("{:x}", hash.finalize()));
         Self {

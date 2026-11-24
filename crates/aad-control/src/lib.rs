@@ -2490,18 +2490,25 @@ fn digest_of(shot: &Value) -> String {
 /// element's box (never screen or image coordinates), the image's digest
 /// instead of the image.
 fn text_answer(read: &Value, provider: &str) -> Value {
+    use canvas_objects::Region;
     let width = read["width"].as_f64().filter(|w| *w > 0.0).unwrap_or(1.0);
     let height = read["height"].as_f64().filter(|h| *h > 0.0).unwrap_or(1.0);
     let round = |value: f64| (value.clamp(0.0, 1.0) * 10_000.0).round() / 10_000.0;
+    let view = Region::read(&read["canvas_region"]).ok();
     let shape = |span: &Value| {
         let number = |key: &str| span["bounds"][key].as_f64().unwrap_or_default();
+        let b = Region {
+            fx: number("x") / width,
+            fy: number("y") / height,
+            fw: number("width") / width,
+            fh: number("height") / height,
+        };
+        let b = view.map_or(b, |region| region.project(b));
         let mut result = json!({
             "text": span["text"],
             "box": {
-                "fx": round(number("x") / width),
-                "fy": round(number("y") / height),
-                "fw": round(number("width") / width),
-                "fh": round(number("height") / height),
+                "fx": round(b.fx), "fy": round(b.fy),
+                "fw": round(b.fw), "fh": round(b.fh),
             },
         });
         if let Some(score) = span["confidence"].as_f64() {
@@ -2530,7 +2537,7 @@ fn text_answer(read: &Value, provider: &str) -> Value {
         .filter_map(|line| line["text"].as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    json!({
+    let mut answer = json!({
         "provider": provider,
         "engine": read["engine"],
         "language": read["language"],
@@ -2539,7 +2546,11 @@ fn text_answer(read: &Value, provider: &str) -> Value {
         "digest": digest_of(read),
         "clipped": read["clipped"] == true,
         "read_only": true,
-    })
+    });
+    if let Some(region) = read.get("canvas_region") {
+        answer["visible_region"] = region.clone();
+    }
+    answer
 }
 
 fn validate_action(action: &Action, access: &browser_access::BrowserAccess) -> Result<()> {
