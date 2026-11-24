@@ -2636,9 +2636,8 @@ impl Backend for BrowserBackend {
                 preview: false,
                 ..options.clone()
             };
-            let scene = self.read_objects(snapshot, node, &options, action_context.remaining()?)?;
-            resolved_click = scene.click(query)?;
-            object_guard = scene.guard;
+            (resolved_click, object_guard) =
+                self.resolve_object_click(snapshot, node, &options, query, action_context)?;
             (&resolved_click, Some(&object_guard))
         } else {
             (action, None)

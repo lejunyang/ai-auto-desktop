@@ -87,11 +87,18 @@ test('find and click full-canvas objects after scrolling and zooming a large boa
     const style=document.createElement('style');style.textContent='#cover::before{content:"";position:absolute;width:6px;height:6px;background:red}';cover.append(style);true`);
   await assert.rejects(read(),e=>JSON.parse(e.stdout).code==='CONTROL.CANVAS_SCOPE_UNPROVEN');
   await page.cdp.call('Emulation.setPageScaleFactor',{pageScaleFactor:1});
-  await page.cdp.eval(`document.body.lastElementChild.remove();cv.style.transform='none';show(.75);
+  await page.cdp.eval(`document.body.lastElementChild.remove();cv.style.transform='none';show(.75);view.scrollTo(0,0);true`);
+  const view_hint={fx:.515,fy:.51};
+  await assert.rejects(click({label:'UNKNOWN',view_hint}),e=>JSON.parse(e.stdout).error.code==='CONTROL.NOT_FOUND');
+  assert.equal(await page.cdp.eval('hits.length'),6);
+  await page.cdp.eval('view.scrollTo(0,0);true');
+  await click({label:'REVIEW',view_hint});
+  assert.deepEqual(await page.cdp.eval('hits'),Array(7).fill(true));
+  await page.cdp.eval(`
     cv.dataset.aadScene=JSON.stringify({objects:[{id:'review',kind:'rectangle',label:'REVIEW',
       box:{fx:1700/3600,fy:760/1600,fw:270/3600,fh:105/1600}}],edges:[]});view.scrollTo(0,0);true`);
   await click({id:'review'});
-  assert.deepEqual(await page.cdp.eval('hits'),Array(7).fill(true));
+  assert.deepEqual(await page.cdp.eval('hits'),Array(8).fill(true));
   assert.ok((await page.cdp.eval('view.scrollLeft'))>800);
 
 });

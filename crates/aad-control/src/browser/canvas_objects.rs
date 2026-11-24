@@ -21,8 +21,7 @@ fn editor(client: &mut Client, ctx: &Ctx, args: &Value) -> Result<Value> {
 }
 
 impl Guard {
-    /// A published object can be located even when its centre is outside a
-    /// scrollport. Ask Chromium to reveal only that point on the retained node.
+    /// Revalidate the observed scene before scrolling its retained canvas.
     pub(super) fn reveal(&self, client: &mut Client, ctx: &Ctx, args: &Value) -> Result<()> {
         self.check(client, ctx, args)?;
         let session = ctx.session.as_deref();
@@ -98,6 +97,63 @@ fn stale() -> AutomationError {
 }
 
 impl BrowserBackend {
+    pub(super) fn resolve_object_click(
+        &self,
+        snapshot: &Value,
+        node: &Value,
+        options: &Options,
+        query: &Query,
+        action: &crate::Context,
+    ) -> Result<(Action, Guard)> {
+        let read = || self.read_objects(snapshot, node, options, action.remaining()?);
+        let mut scene = read()?;
+        let click = match (scene.click(query), query.view_hint) {
+            (Err(err), Some(hint))
+                if err.code == "CONTROL.NOT_FOUND" && scene.public["clipped"] == true =>
+            {
+                let meta = &snapshot["metadata"];
+                if self
+                    .browser_input(Instant::now() + action.remaining()?)?
+                    .instance
+                    != meta["browser_instance_id"]
+                {
+                    return Err(stale());
+                }
+                let page_id = meta["page_id"].as_str().ok_or_else(stale)?;
+                let frame_id = meta["frame_id"].as_str().ok_or_else(stale)?;
+                self.with_page_state(page_id, action.remaining()?, |page| {
+                    if let Some(dialog) = &page.dialog {
+                        return Err(dialog_open(dialog));
+                    }
+                    let entry = self.locate(page, frame_id)?;
+                    if !entry.main() || entry.frame["loaderId"] != meta["loader_id"] {
+                        return Err(stale());
+                    }
+                    let id = meta["context_id"].as_i64().ok_or_else(stale)?;
+                    let mut ctx = Ctx::new(entry.session, id);
+                    let frames = frame_map(page)?;
+                    ctx.input = Some(InputAccess::new(self.access.clone(), &frames, frame_id)?);
+                    ctx.action = Some(action);
+                    let args = json!({
+                        "document_token": snapshot["document_token"],
+                        "observation": snapshot["snapshot_id"],
+                        "node_id": node["node_id"],
+                        "action": "click_object",
+                        "fraction": hint
+                    });
+                    refresh_closed_roots(&mut page.client, &ctx, Some(&args), true)?;
+                    scene.guard.reveal(&mut page.client, &ctx, &args)
+                })?;
+                scene = read().map_err(|err| err.with_effect("contextual"))?;
+                scene
+                    .click(query)
+                    .map_err(|err| err.with_effect("contextual"))?
+            }
+            (result, _) => result?,
+        };
+        Ok((click, scene.guard))
+    }
+
     pub(crate) fn read_objects(
         &self,
         snapshot: &Value,
@@ -249,6 +305,15 @@ impl Scene {
     }
 
     pub(super) fn click(&self, query: &Query) -> Result<Action> {
+        if query.view_hint.is_some_and(|hint| {
+            self.public["source"] != "flowchart"
+                || query.digest.is_some()
+                || query.id.is_some()
+                || !(0.0..=1.0).contains(&hint.fx)
+                || !(0.0..=1.0).contains(&hint.fy)
+        }) {
+            return Err(error("CONTROL.INVALID_REQUEST","view_hint requires a semantic flowchart query and canvas fractions from zero to one"));
+        }
         let fields = [
             &query.id,
             &query.label,

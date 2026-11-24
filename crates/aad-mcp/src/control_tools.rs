@@ -90,6 +90,7 @@ fn action_schema() -> Value {
                 "id":{"type":"string"}, "kind":{"type":"string"}, "label":{"type":"string"},
                 "region":{"enum":["top_left","top_right","bottom_left","bottom_right"]},
                 "min_confidence":{"type":"number","minimum":0,"maximum":1},
+                "view_hint":fraction_schema("Centre of a previously seen flowchart view to reveal and search if the object is missing"),
                 "after":{"type":"string"}, "before":{"type":"string"}, "digest":{"type":"string"}
             }}
         }), &["query"]),

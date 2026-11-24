@@ -89,6 +89,9 @@ pub struct Query {
     pub before: Option<String>,
     pub region: Option<Quadrant>,
     pub min_confidence: Option<f64>,
+    /// Centre of a previously seen crop. Used to scroll and search once more.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_hint: Option<crate::Fraction>,
     /// Pin a candidate selected from a particular read.
     pub digest: Option<String>,
 }
