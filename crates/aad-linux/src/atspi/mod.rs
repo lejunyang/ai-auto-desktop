@@ -1274,13 +1274,15 @@ impl AtspiProvider {
             Self::revalidate_target(args, &record, &fresh, deadline)?;
         // On a Chromium checkbox the default action can reverse while the
         // object, role and locator all remain identical.
-        if pin_invoke_name
-            && observed["provenance"]["native_invoke_name"]
-                != resolved["provenance"]["native_invoke_name"]
-        {
-            return Err(stale(
-                "the observed native activation changed before dispatch",
-            ));
+        if pin_invoke_name {
+            let before = observed["provenance"]["native_invoke_name"].as_str();
+            let after = resolved["provenance"]["native_invoke_name"].as_str();
+            let role_specific = |name| matches!(name, Some("jump" | "check" | "uncheck"));
+            if before != after && (role_specific(before) || role_specific(after)) {
+                return Err(stale(
+                    "the observed native activation changed before dispatch",
+                ));
+            }
         }
         Ok((fresh, fresh_id, resolved, native))
     }
