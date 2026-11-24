@@ -39,6 +39,15 @@ export interface Fraction {
 export type Action =
   | { type: "focus" | "invoke" | "back" | "forward" | "reload" }
   | { type: "click"; button?: "left" | "right" | "middle"; count?: 1 | 2; fraction?: Fraction }
+  | {
+      type: "click_object";
+      query: {
+        id?: string; label?: string; kind?: string; after?: string; before?: string;
+        region?: "top_left" | "top_right" | "bottom_left" | "bottom_right";
+        min_confidence?: number; digest?: string; view_hint?: Fraction;
+      };
+      options?: { source?: "auto" | "editor" | "flowchart" | "vision"; description?: string; language?: string };
+    }
   | { type: "fill"; value?: string }
   | { type: "type_text"; text?: string; mode?: "unicode" | "keys" }
   | { type: "key"; keys: string[] }

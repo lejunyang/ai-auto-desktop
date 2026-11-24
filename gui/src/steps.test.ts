@@ -26,6 +26,17 @@ describe("drafts become steps", () => {
     expect(title(step)).toBe("右键点击 Button 「保存」");
   });
 
+  it("names a recorded canvas node and its distinguishing connection", () => {
+    const board = { name: "结算图" };
+    expect(draftProblem(blankDraft("click_object"))).toContain("标签");
+    const step = toStep({ ...blankDraft("click_object"), objectLabel: "审批" }, app, board, []);
+    expect(step.action).toEqual({ type: "click_object", query: { label: "审批" } });
+    step.action = { type: "click_object", query: { label: "审批", after: "付款", view_hint: { fx: .4, fy: .5 } } };
+    expect(title(step)).toBe("在 「结算图」 点击「审批」（「付款」 → 「审批」）");
+    step.action = { type: "click_object", query: { id: "approved" }, options: { source: "editor" } };
+    expect(title(step)).toBe("在 「结算图」 点击「approved」");
+  });
+
   it("turns secret text into a run-time input that is never saved", () => {
     const draft = { ...blankDraft("fill"), text: "hunter2", asInput: true };
     const step = toStep(draft, app, { role: "Edit", name: "密码" }, []);

@@ -62,6 +62,10 @@ const problem = computed(() => draftProblem(draft.value));
         <label class="inline"><input v-model="draft.double" type="checkbox" /> 双击</label>
       </template>
 
+      <label v-if="draft.choice === 'click_object'" class="wide">对象标签
+        <input v-model="draft.objectLabel" placeholder="例如：审批" />
+      </label>
+
       <template v-if="draft.choice === 'fill' || draft.choice === 'type_text'">
         <label class="wide">文字
           <input v-model="draft.text" :disabled="draft.asInput" :placeholder="draft.asInput ? '运行时再输入' : ''" />

@@ -10,6 +10,7 @@ export type Choice = ActionType | "wait_present" | "wait_absent";
 export const LABELS: Record<Choice, string> = {
   invoke: "触发",
   click: "点击",
+  click_object: "点击画布对象",
   fill: "填写",
   type_text: "输入文字",
   key: "按键",
@@ -28,7 +29,7 @@ export const LABELS: Record<Choice, string> = {
 };
 
 const ORDER: ActionType[] = [
-  "invoke", "click", "fill", "type_text", "key", "select", "check",
+  "invoke", "click", "click_object", "fill", "type_text", "key", "select", "check",
   "scroll", "hover", "drag", "focus", "navigate", "back", "forward", "reload",
 ];
 
@@ -41,6 +42,7 @@ export function choicesFor(node: ElementNode): Choice[] {
 /** The form behind the composer: one field per parameter any action takes. */
 export interface Draft {
   choice: Choice;
+  objectLabel: string;
   button: "left" | "right" | "middle";
   double: boolean;
   text: string;
@@ -60,7 +62,7 @@ export interface Draft {
 
 export function blankDraft(choice: Choice): Draft {
   return {
-    choice, button: "left", double: false, text: "", asInput: false, mode: "unicode",
+    choice, objectLabel: "", button: "left", double: false, text: "", asInput: false, mode: "unicode",
     keys: "", direction: "down", notches: 3, ms: 500, option: "", checked: true,
     url: "https://", withinMs: 5000, to: null,
   };
@@ -69,6 +71,8 @@ export function blankDraft(choice: Choice): Draft {
 /** Why a draft cannot become a step yet, or null when it can. */
 export function draftProblem(draft: Draft): string | null {
   switch (draft.choice) {
+    case "click_object":
+      return draft.objectLabel.trim() ? null : "填写对象在画布上的标签";
     case "key":
       return parseKeys(draft.keys).length ? null : "写下按键，例如 ctrl,a";
     case "select":
@@ -97,6 +101,8 @@ function action(draft: Draft): Action | undefined {
       if (draft.double) click.count = 2;
       return click;
     }
+    case "click_object":
+      return { type: "click_object", query: { label: draft.objectLabel.trim() } };
     case "fill":
       return draft.asInput ? { type: "fill" } : { type: "fill", value: draft.text };
     case "type_text":
@@ -179,6 +185,12 @@ export function title(step: Step): string {
   switch (action.type) {
     case "click":
       return `${action.count === 2 ? "双击" : action.button && action.button !== "left" ? BUTTONS[action.button] + "点击" : "点击"} ${target}`;
+    case "click_object": {
+      const { id, label, kind, after, before } = action.query;
+      const object = label || id || action.options?.description || kind;
+      const path = [after, object, before].filter(Boolean).map(name => `「${name}」`).join(" → ");
+      return `在 ${target} 点击${object ? `「${object}」` : "画布对象"}${after || before ? `（${path}）` : ""}`;
+    }
     case "fill":
       return `在 ${target} 填写${secret || `「${action.value ?? ""}」`}`;
     case "type_text":
