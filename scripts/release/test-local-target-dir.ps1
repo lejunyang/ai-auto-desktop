@@ -7,6 +7,7 @@ try {
     Copy-Item "$PSScriptRoot/build-local-linux.ps1", "$PSScriptRoot/package-cli.ps1" "$fixture/scripts/release"
     New-Item -ItemType Directory "$fixture/crates/aad-linux" -Force | Out-Null
     Copy-Item "$PSScriptRoot/../../crates/aad-linux/qt-wayland-input" "$fixture/crates/aad-linux" -Recurse
+    Copy-Item "$PSScriptRoot/../../crates/aad-linux/gtk3-wayland-input" "$fixture/crates/aad-linux" -Recurse
     Set-Content "$fixture/README.md" 'fixture'
     function global:git {
         if ($args[0] -eq 'rev-parse') { 'fixture-commit' }
@@ -46,6 +47,12 @@ try {
         & "$fixture/scripts/release/build-local-linux.ps1" -OutputDirectory "$fixture/dist"
         New-Item -ItemType Directory "$fixture/unpacked" -Force | Out-Null
         & tar -xzf "$fixture/dist/aad-0.0.4-x86_64-unknown-linux-gnu.tar.gz" -C "$fixture/unpacked"
+        foreach ($source in @('build.ps1', 'entry.c', 'scroll.h', 'README.md')) {
+            $packed = "$fixture/unpacked/aad-0.0.4-x86_64-unknown-linux-gnu/gtk3-wayland-input/$source"
+            if ((Get-FileHash $packed).Hash -ne (Get-FileHash "$fixture/crates/aad-linux/gtk3-wayland-input/$source").Hash) {
+                throw "GTK source kit mismatch in $source"
+            }
+        }
         foreach ($name in @('aad', 'aad-browser')) {
             $content = Get-Content "$fixture/unpacked/aad-0.0.4-x86_64-unknown-linux-gnu/$name" -Raw
             if ($content -notmatch 'freshly-built' -or $content -match 'stale-same-version') { throw "Stale $name packaged" }

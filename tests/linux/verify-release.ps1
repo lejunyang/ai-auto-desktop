@@ -20,6 +20,11 @@ try {
     & tar -xzf $archivePath -C $scratch
     if ($LASTEXITCODE -ne 0) { throw 'Cannot extract the release archive' }
     $root = Join-Path $scratch "aad-$Version-$Target"
+    foreach ($source in @('entry.c', 'scroll.h', 'build.ps1', 'README.md')) {
+        if (!(Test-Path -LiteralPath (Join-Path $root "gtk3-wayland-input/$source") -PathType Leaf)) {
+            throw "Missing GTK 3 Wayland source kit member $source"
+        }
+    }
     foreach ($source in @('input.pro', 'input.cpp', 'input.json', 'build.ps1', 'README.md')) {
         if (!(Test-Path -LiteralPath (Join-Path $root "qt-wayland-input/$source") -PathType Leaf)) {
             throw "Missing Qt Wayland input source kit file $source"

@@ -58,6 +58,10 @@ try {
         Copy-Item (Join-Path $helpers 'x11_xtest_helper') (Join-Path $staging 'aad-linux-xtest-helper')
         Copy-Item (Join-Path $helpers 'x11_capture_helper') (Join-Path $staging 'aad-linux-capture-helper')
         $qtKit = Join-Path $staging 'qt-wayland-input'
+        $gtkKit = New-Item -ItemType Directory (Join-Path $staging 'gtk3-wayland-input')
+        foreach ($file in @('entry.c', 'scroll.h', 'build.ps1', 'README.md')) {
+            Copy-Item -LiteralPath (Join-Path $repository "crates/aad-linux/gtk3-wayland-input/$file") $gtkKit.FullName
+        }
         New-Item -ItemType Directory $qtKit | Out-Null
         foreach ($file in @('input.pro', 'input.cpp', 'input.json', 'build.ps1', 'README.md')) {
             Copy-Item -LiteralPath (Join-Path $repository "crates/aad-linux/qt-wayland-input/$file") $qtKit
