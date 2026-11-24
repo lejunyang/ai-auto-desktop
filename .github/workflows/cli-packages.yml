@@ -80,8 +80,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends g++ pkg-config libx11-dev libxtst-dev musl-tools bubblewrap
           if ($LASTEXITCODE) { throw 'Linux build dependency installation failed' }
           if ('${{ matrix.target }}'.EndsWith('-linux-gnu')) {
-            sudo apt-get install -y --no-install-recommends qtbase5-dev qt5-qmake
-            if ($LASTEXITCODE) { throw 'Qt 5 development package installation failed' }
+            sudo apt-get install -y --no-install-recommends qtbase5-dev qt5-qmake qt6-base-dev qmake6
+            if ($LASTEXITCODE) { throw 'Qt development package installation failed' }
           }
 
       - name: Build the CLI with the osdk-selected Rust toolchain

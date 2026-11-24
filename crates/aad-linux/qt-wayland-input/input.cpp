@@ -1,4 +1,4 @@
-// Opt-in Qt 5 Widgets generic plugin. All checks and both event phases run
+// Opt-in Qt Widgets generic plugin. All checks and both event phases run
 // on the target application's GUI thread, addressed to the observed QWidget.
 #include <QAccessible>
 #include <QApplication>
@@ -193,7 +193,11 @@ public slots:
         const QPoint point(px, py);
         if (!widget || !hits(widget, point) || !inTime(deadline)) return 0;
         const QPoint local = widget->mapFromGlobal(point);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 3, 0)
+        QHoverEvent event(QEvent::HoverMove, local, point, local);
+#else
         QHoverEvent event(QEvent::HoverMove, local, local);
+#endif
         QCoreApplication::sendEvent(widget, &event);
         return 2;
     }

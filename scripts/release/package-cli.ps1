@@ -45,7 +45,7 @@ $staging = Join-Path $scratch $name
 $unpacked = Join-Path $scratch 'verify'
 New-Item -ItemType Directory -Path $staging, $unpacked -Force | Out-Null
 $windowsTarget = $Target.EndsWith('-windows-msvc')
-$qtBinary = $null
+$qtBinaries = @{}
 $executable = 'aad'
 if ($windowsTarget) { $executable = 'aad.exe' }
 $browserHelper = 'aad-browser'
@@ -66,9 +66,11 @@ try {
             if (!$Target.EndsWith('-linux-gnu') -or (& uname -m).Trim() -cne $Target.Split('-')[0]) {
                 throw 'Build the bundled Qt plugin on the native GNU Linux release runner'
             }
-            $qtBinary = & (Join-Path $qtKit 'build.ps1') -BuildDirectory (Join-Path $scratch 'qt-build')
-            $generic = New-Item -ItemType Directory -Force (Join-Path $staging 'qt5-plugins/generic')
-            Copy-Item -LiteralPath $qtBinary $generic.FullName
+            foreach ($major in @('5','6')) {
+                $qtBinaries[$major] = & (Join-Path $qtKit 'build.ps1') -QtMajor $major -BuildDirectory (Join-Path $scratch "qt$major-build")
+                $generic = New-Item -ItemType Directory -Force (Join-Path $staging "qt$major-plugins/generic")
+                Copy-Item -LiteralPath $qtBinaries[$major] $generic.FullName
+            }
         }
     }
     if ($Target.EndsWith('-apple-darwin')) {
@@ -113,10 +115,10 @@ try {
         $packedHash = (Get-FileHash (Join-Path $unpacked "$name/$binary") -Algorithm SHA256).Hash
         if ($sourceHash -ne $packedHash) { throw "Packaged $binary differs from build output" }
     }
-    if ($qtBinary) {
-        $packedQt = Join-Path $unpacked "$name/qt5-plugins/generic/libaadwaylandinput.so"
-        if ((Get-FileHash $qtBinary).Hash -ne (Get-FileHash $packedQt).Hash) {
-            throw 'Packaged Qt Wayland plugin differs from build output'
+    foreach ($major in $qtBinaries.Keys) {
+        $packedQt = Join-Path $unpacked "$name/qt$major-plugins/generic/libaadwaylandinput.so"
+        if ((Get-FileHash $qtBinaries[$major]).Hash -ne (Get-FileHash $packedQt).Hash) {
+            throw "Packaged Qt $major Wayland plugin differs from build output"
         }
     }
     $cli = Join-Path $unpacked "$name/$executable"

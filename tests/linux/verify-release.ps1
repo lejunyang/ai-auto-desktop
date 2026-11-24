@@ -26,8 +26,16 @@ try {
         }
     }
     $binaries = @('aad', 'aad-browser', 'aad-linux-xtest-helper', 'aad-linux-capture-helper')
-    $qtPlugin = 'qt5-plugins/generic/libaadwaylandinput.so'
-    if (Test-Path -LiteralPath (Join-Path $root $qtPlugin) -PathType Leaf) { $binaries += $qtPlugin }
+    foreach ($major in @('5','6')) {
+        $qtPlugin = "qt$major-plugins/generic/libaadwaylandinput.so"
+        if (Test-Path -LiteralPath (Join-Path $root $qtPlugin) -PathType Leaf) {
+            $needed = & readelf --dynamic (Join-Path $root $qtPlugin)
+            if ($LASTEXITCODE -or ($needed -join "`n") -notmatch "NEEDED.*libQt${major}Widgets\.so") {
+                throw "Qt $major plugin does not match its deployment directory"
+            }
+            $binaries += $qtPlugin
+        }
+    }
     foreach ($name in $binaries) {
         $binary = Join-Path $root $name
         if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw "Missing $name" }

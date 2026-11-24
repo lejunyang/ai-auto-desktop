@@ -1,17 +1,17 @@
-# Window-addressed input for Qt 5 Widgets on Wayland
+# Window-addressed input for Qt 5 and Qt 6 Widgets on Wayland
 
-Start the target application with the `aad-wayland-input` generic plugin to enable focused keys, clicks, wheel scrolling, hover and same-widget drags. The app must run on native Wayland with Qt 5 Widgets and the Qt AT-SPI bridge. The CLI and app must share the accessibility bus.
+Start the target Qt Widgets application with the `aad-wayland-input` generic plugin. The app must run on native Wayland with the Qt AT-SPI bridge. The CLI and app must share the accessibility bus.
 
 ## Launch an application
 
-GNU Linux release archives include the plugin in `qt5-plugins/generic`. From the extracted archive directory, run this in PowerShell on the Wayland desktop:
+GNU Linux release archives include separate `qt5-plugins/generic` and `qt6-plugins/generic` builds. Select the directory matching the application's Qt major version. For a Qt 5 KDialog, from the extracted archive directory:
 
 ```powershell
 $qtPlugins = (Resolve-Path ./qt5-plugins).Path
 env "QT_PLUGIN_PATH=$qtPlugins" QT_QPA_GENERIC_PLUGINS=aad-wayland-input QT_QPA_PLATFORM=wayland QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 kdialog --inputbox 'Invoice number' 'INV-2037'
 ```
 
-Use the same per-process environment to launch another Qt 5 Widgets app. For single-instance apps, start a fresh process that loads the plugin. An app that ships its own Qt may require a plugin built with its Qt development kit.
+Use the same per-process environment to launch another Widgets app. For single-instance apps, start a fresh process that loads the plugin. An app that ships its own Qt may require a plugin built with its Qt development kit.
 
 From a second PowerShell terminal in the same desktop session, select KDialog's resource ID from `aad apps`. Use the focused field's observed role and the button name from `aad snapshot`. For the English input box:
 
@@ -38,7 +38,7 @@ $qtPlugins = Join-Path $HOME '.local/share/aad/qt5-plugins'
 pwsh -NoProfile -File ./build.ps1 -BuildDirectory $qtPlugins
 ```
 
-Use this `$qtPlugins` in the launch command above. Each target process opts in at startup. The GNU local release builder also accepts `-BuildQtWaylandPlugin` to bundle the binary.
+For Qt 6, install `qt6-base-dev`, `qmake6` and `qt6-wayland`; build with `-QtMajor 6` into a separate `qt6-plugins` directory. `-Qmake` can select a matching SDK executable. Use the matching `$qtPlugins` in the launch command above. Each target process opts in at startup. The GNU local release builder accepts `-BuildQtWaylandPlugin` to bundle both binaries.
 
 ## Actions on an observed widget
 
