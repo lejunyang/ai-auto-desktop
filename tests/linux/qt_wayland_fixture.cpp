@@ -25,9 +25,12 @@ class DropWindow : public QWidget {
     }
 };
 
+int itemFixture(QApplication &app);
+
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
     if (!app.platformName().startsWith("wayland")) return 2;
+    if (app.arguments().contains("--items")) return itemFixture(app);
     QWidget other;
     other.setWindowTitle("Qt directed input");
     QVBoxLayout otherLayout(&other);

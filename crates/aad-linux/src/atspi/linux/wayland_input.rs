@@ -4,10 +4,16 @@ use super::*;
 const PATH: &str = "/org/aiautodesktop/QtWaylandInput1";
 const INTERFACE: &str = "org.aiautodesktop.QtWaylandInput1";
 
+pub(super) enum CopySource {
+    SelectedText,
+    ModelItem,
+}
+
 pub(super) enum Event<'a> {
     Click((i32, i32)),
     Key(&'a [String]),
-    DropText {
+    CopyDrop {
+        source: CopySource,
         destination: &'a NativeRef,
         window: &'a WindowAnchor,
         from: (i32, i32),
@@ -70,7 +76,6 @@ impl LinuxBackend {
         // pointer gestures independently without changing their wire contract.
         let modes = flags
             .as_ref()
-            .filter(|f| f.iter().any(|v| v & 2 != 0))
             .and_then(|_| {
                 proxy
                     .as_ref()?
@@ -81,9 +86,8 @@ impl LinuxBackend {
         let gestures = ["wheel", "hover"]
             .iter()
             .all(|m| modes.iter().any(|v| v == m));
-        let drop_roles = modes
-            .iter()
-            .any(|mode| mode == "text_copy_drop")
+        let item_drops = modes.iter().any(|mode| mode == "model_item_copy_drop");
+        let drop_roles = (item_drops || modes.iter().any(|mode| mode == "text_copy_drop"))
             .then(|| {
                 proxy
                     .as_ref()?
@@ -101,9 +105,10 @@ impl LinuxBackend {
             let flag = flags.as_ref().map_or(0, |flags| flags[i]);
             let drop_role = drop_roles.as_ref().map_or(0, |roles| roles[i]);
             let state = |name: &str| node.states.get(name).copied().flatten();
+            let item_source = item_drops && drop_role == 4 && state("selected") == Some(true);
             if window.is_empty()
-                || (flag == 0 && drop_role & 2 == 0)
-                || drop_role > 3
+                || (flag == 0 && drop_role & 2 == 0 && !item_source)
+                || (drop_role > 3 && !item_source)
                 || flag > 3
                 || state("protected") != Some(false)
                 || !["enabled", "sensitive", "visible", "showing"]
@@ -131,9 +136,18 @@ impl LinuxBackend {
                 node.provenance
                     .insert("qt_text_drag_source".into(), json!(true));
             }
+            if item_source {
+                node.actions.push("drag".into());
+                node.provenance
+                    .insert("qt_model_item_drag_source".into(), json!(true));
+            }
             if drop_role & 2 != 0 {
                 node.provenance
                     .insert("qt_text_drop_target".into(), json!(true));
+                if item_drops {
+                    node.provenance
+                        .insert("qt_model_item_drop_target".into(), json!(true));
+                }
             }
             node.provenance
                 .insert("coordinate_space".into(), json!("qt_wayland_logical"));
@@ -141,6 +155,39 @@ impl LinuxBackend {
                 .insert("wayland_input_window".into(), json!(window));
         }
         Ok(())
+    }
+
+    pub(super) fn wayland_copy_drop(
+        &self,
+        request: super::super::DragBetweenRequest<'_>,
+        kind: CopySource,
+    ) -> Result<Value, AutomationError> {
+        let source = request.source;
+        let destination = request.destination;
+        if !crate::wayland_portal::is_wayland_session()
+            || source.process_id != destination.process_id
+            || request.button != 1
+            || request.hold_ms.is_some()
+        {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "Qt copy drop requires a same-process left drag without hold",
+            ));
+        }
+        self.wayland_input(
+            source.target,
+            Some(source.window),
+            source.process_id,
+            Event::CopyDrop {
+                source: kind,
+                destination: destination.target,
+                window: destination.window,
+                from: source.point,
+                to: destination.point,
+                modifiers: request.modifiers,
+            },
+            request.deadline,
+        )
     }
 
     pub(super) fn wayland_input(
@@ -176,7 +223,8 @@ impl LinuxBackend {
         let mut interface = "QtWidgets.sendEvent";
         let mut dwell = None;
         let reply: zbus::Result<i32> = match event {
-            Event::DropText {
+            Event::CopyDrop {
+                source,
                 destination,
                 window,
                 from,
@@ -189,9 +237,13 @@ impl LinuxBackend {
                     return Err(denied());
                 }
                 events = 3;
-                interface = "QtWidgets.DropText";
+                let (method, native_interface) = match source {
+                    CopySource::SelectedText => ("DropText", "QtWidgets.DropText"),
+                    CopySource::ModelItem => ("DropModelItem", "QtWidgets.DropModelItem"),
+                };
+                interface = native_interface;
                 proxy.call(
-                    "DropText",
+                    method,
                     &(
                         object,
                         top,

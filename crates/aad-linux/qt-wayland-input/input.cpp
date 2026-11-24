@@ -7,6 +7,7 @@
 #include <QGenericPlugin>
 #include <QKeyEvent>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QPointer>
@@ -15,9 +16,11 @@
 #include <QWindow>
 #include <climits>
 #include <ctime>
+#include <memory>
+#include <typeinfo>
 
 namespace {
-QWidget *widgetFor(const QString &path) {
+QAccessibleInterface *accessibleFor(const QString &path) {
     static const QString prefix = QStringLiteral("/org/a11y/atspi/accessible/");
     if (!path.startsWith(prefix)) return nullptr;
     bool ok = false;
@@ -25,18 +28,22 @@ QWidget *widgetFor(const QString &path) {
     if (!ok || id <= INT_MAX || prefix + QString::number(id) != path) return nullptr;
     auto *iface = QAccessible::accessibleInterface(id);
     if (!iface || !iface->isValid()) return nullptr;
+    const auto state = iface->state();
+    return state.passwordEdit || state.disabled || state.invisible || state.offscreen ? nullptr : iface;
+}
+
+QWidget *widgetFor(const QString &path) {
+    auto *iface = accessibleFor(path);
+    if (!iface) return nullptr;
     auto *widget = qobject_cast<QWidget *>(iface->object());
     // Virtual accessible children may share a backing QObject.
     if (!widget || QAccessible::queryAccessibleInterface(widget) != iface) return nullptr;
-    const auto state = iface->state();
-    if (state.passwordEdit || state.disabled || state.invisible || state.offscreen) return nullptr;
     if (auto *edit = qobject_cast<QLineEdit *>(widget); edit && edit->echoMode() != QLineEdit::Normal)
         return nullptr;
     return widget;
 }
 
-QWidget *boundWidget(const QString &target, const QString &window, bool requireActive = true) {
-    auto *widget = widgetFor(target);
+QWidget *inWindow(QWidget *widget, const QString &window, bool requireActive) {
     auto *top = widgetFor(window);
     if (!widget || !top || !top->isWindow() || widget->window() != top ||
         !widget->isEnabled() || !widget->isVisible() || top->isMinimized() ||
@@ -49,6 +56,10 @@ QWidget *boundWidget(const QString &target, const QString &window, bool requireA
     return modal && modal != top ? nullptr : widget;
 }
 
+QWidget *boundWidget(const QString &target, const QString &window, bool requireActive = true) {
+    return inWindow(widgetFor(target), window, requireActive);
+}
+
 bool focused(QWidget *widget) {
     return widget->hasFocus() && QApplication::focusWidget() == widget;
 }
@@ -59,6 +70,77 @@ bool hits(QWidget *widget, QPoint point) {
     if (!widget->visibleRegion().contains(local)) return false;
     auto *hit = top->childAt(top->mapFromGlobal(point));
     return (hit ? hit : top) == widget;
+}
+
+// A subclass can replace startDrag or the view's drop policy even without Q_OBJECT.
+QListView *standardList(QWidget *widget) {
+    if (!widget || (typeid(*widget) != typeid(QListView) && typeid(*widget) != typeid(QListWidget)))
+        return nullptr;
+    return static_cast<QListView *>(widget);
+}
+
+struct ListItem {
+    QPointer<QListView> view;
+    QPersistentModelIndex index;
+};
+
+ListItem selectedItemAt(const QString &path, const QString &window, const QPoint &point) {
+    auto *item = accessibleFor(path);
+    if (!item || item->role() != QAccessible::ListItem || !item->rect().contains(point)) return {};
+    auto *cell = item->tableCellInterface();
+    auto *parent = item->parent();
+    auto *view = parent ? standardList(qobject_cast<QWidget *>(parent->object())) : nullptr;
+    if (!cell || !view || !inWindow(view, window, true) ||
+        QAccessible::queryAccessibleInterface(view) != parent ||
+        !hits(view->viewport(), point) || parent->childAt(point.x(), point.y()) != item ||
+        !view->dragEnabled() || view->dragDropMode() == QAbstractItemView::InternalMove ||
+        !view->model() || !view->model()->supportedDragActions().testFlag(Qt::CopyAction) ||
+        !view->selectionModel()) return {};
+    const QModelIndex index = view->indexAt(view->viewport()->mapFromGlobal(point));
+    if (!index.isValid() || index.row() != cell->rowIndex() || index.column() != cell->columnIndex() ||
+        !index.flags().testFlag(Qt::ItemIsEnabled) || !index.flags().testFlag(Qt::ItemIsDragEnabled) ||
+        !cell->isSelected()) return {};
+    const auto ranges = view->selectionModel()->selection();
+    if (ranges.size() != 1 || ranges.first().topLeft() != index || ranges.first().bottomRight() != index)
+        return {};
+    return {view, index};
+}
+
+// An observed list owns its viewport. Only empty viewport space belongs to
+// the list itself. A row, editor or overlay needs its own observed identity.
+QWidget *dropReceiver(QWidget *widget, const QPoint &point) {
+    if (!widget || !widget->acceptDrops()) return nullptr;
+    if (auto *list = standardList(widget)) {
+        auto *viewport = list->viewport();
+        if (!viewport->acceptDrops() || !hits(viewport, point) ||
+            list->indexAt(viewport->mapFromGlobal(point)).isValid() ||
+            list->dragDropMode() == QAbstractItemView::InternalMove || !list->model() ||
+            !list->model()->supportedDropActions().testFlag(Qt::CopyAction)) return nullptr;
+        return viewport;
+    }
+    return hits(widget, point) ? widget : nullptr;
+}
+
+// Materialize the model's advertised wire formats while the original index
+// is pinned. Never hand a receiver a model-owned object or lazy item pointer.
+bool copyItemMime(const ListItem &item, QMimeData &payload) {
+    auto *model = item.index.model();
+    if (!model) return false;
+    const QStringList declared = model->mimeTypes();
+    if (!item.index.isValid()) return false;
+    std::unique_ptr<QMimeData> mime(model->mimeData({item.index}));
+    if (!mime) return false;
+    const QStringList formats = mime->formats();
+    if (formats.isEmpty() || formats.size() > 16) return false;
+    int remaining = 1024 * 1024;
+    for (const QString &format : formats) {
+        if (format.isEmpty() || !declared.contains(format) || payload.hasFormat(format)) return false;
+        const QByteArray bytes = mime->data(format);
+        if (bytes.isEmpty() || bytes.size() > remaining) return false;
+        payload.setData(format, QByteArray(bytes.constData(), bytes.size()));
+        remaining -= int(bytes.size());
+    }
+    return true;
 }
 
 // Check every logical pixel on this bounded segment before the press, and
@@ -192,7 +274,7 @@ public:
     }
 public slots:
     QStringList PointerModes() const {
-        return {"wheel", "hover", "click", "drag_same_widget", "text_copy_drop"};
+        return {"wheel", "hover", "click", "drag_same_widget", "text_copy_drop", "model_item_copy_drop"};
     }
 
     bool PointMatches(const QString &target, const QString &window, int px, int py) const {
@@ -251,7 +333,13 @@ public slots:
         QByteArray roles(targets.size(), 0);
         for (int index = 0; index < targets.size(); ++index) {
             auto *widget = boundWidget(targets[index], windows[index], false);
-            if (!widget) continue;
+            if (!widget) {
+                auto *item = accessibleFor(targets[index]);
+                if (item && item->role() == QAccessible::ListItem &&
+                    selectedItemAt(targets[index], windows[index], item->rect().center()).index.isValid())
+                    roles[index] = 4;
+                continue;
+            }
             auto *edit = qobject_cast<QLineEdit *>(widget);
             roles[index] = (edit && edit->dragEnabled() && edit->hasSelectedText() ? 1 : 0) |
                            (widget->acceptDrops() ? 2 : 0);
@@ -322,45 +410,87 @@ public slots:
     int DropText(const QString &sourceId, const QString &sourceWindow, int startX, int startY,
                  const QString &destId, const QString &destWindow, int endX, int endY,
                  int button, const QStringList &modifierNames, qulonglong deadline) {
+        return copyDrop(false, sourceId, sourceWindow, {startX, startY}, destId, destWindow,
+                        {endX, endY}, button, modifierNames, deadline);
+    }
+
+    int DropModelItem(const QString &sourceId, const QString &sourceWindow, int startX, int startY,
+                      const QString &destId, const QString &destWindow, int endX, int endY,
+                      int button, const QStringList &modifierNames, qulonglong deadline) {
+        return copyDrop(true, sourceId, sourceWindow, {startX, startY}, destId, destWindow,
+                        {endX, endY}, button, modifierNames, deadline);
+    }
+private:
+    int copyDrop(bool modelItem, const QString &sourceId, const QString &sourceWindow, QPoint start,
+                 const QString &destId, const QString &destWindow, QPoint end,
+                 int button, const QStringList &modifierNames, qulonglong deadline) {
         Qt::KeyboardModifiers modifiers;
         if (delivering || button != 1 || !parseModifiers(modifierNames, modifiers) ||
             (modifiers != Qt::NoModifier && modifiers != Qt::ControlModifier)) return 0;
         QScopedValueRollback<bool> busy(delivering, true);
-        const QPoint start(startX, startY), end(endX, endY);
-        QPointer<QLineEdit> source = qobject_cast<QLineEdit *>(boundWidget(sourceId, sourceWindow));
         QPointer<QWidget> dest = boundWidget(destId, destWindow, false);
-        if (!source || !dest || source == dest || !source->dragEnabled() || !source->hasSelectedText()) return 0;
-        const int first = source->selectionStart();
-        const QString selection = source->selectedText();
-        if (selection.size() > 65536) return 0;
-        const QPoint local = dest->mapFromGlobal(end);
+        QPointer<QWidget> receiver = dropReceiver(dest, end);
+        if (!receiver) return 0;
+        const QPoint local = receiver->mapFromGlobal(end);
+        auto *destList = standardList(dest);
+        QPointer<QAbstractItemModel> destModel = destList ? destList->model() : nullptr;
+        QPointer<QLineEdit> edit;
+        ListItem item;
+        QString selection;
+        int first = -1;
+        bool dataChanged = false;
+        QObject watch;
+        if (modelItem) {
+            item = selectedItemAt(sourceId, sourceWindow, start);
+            if (!item.index.isValid() || item.view == dest) return 0;
+            connect(item.index.model(), &QAbstractItemModel::dataChanged, &watch,
+                    [&dataChanged] { dataChanged = true; });
+        } else {
+            edit = qobject_cast<QLineEdit *>(boundWidget(sourceId, sourceWindow));
+            if (!edit || edit == dest || !edit->hasSelectedText()) return 0;
+            first = edit->selectionStart();
+            selection = edit->selectedText();
+            if (selection.size() > 65536) return 0;
+        }
+        const auto destinationMatches = [&] {
+            return dest && receiver && dest == boundWidget(destId, destWindow, false) &&
+                   dropReceiver(dest, end) == receiver && receiver && receiver->mapFromGlobal(end) == local &&
+                   (!destList || (dest && destModel && destList->model() == destModel));
+        };
         const auto endpointsMatch = [&] {
-            if (!source || !dest || source != boundWidget(sourceId, sourceWindow) ||
-                dest != boundWidget(destId, destWindow, false) || !dest->acceptDrops() ||
-                QApplication::mouseButtons() != Qt::NoButton ||
-                !hits(source, start) || !hits(dest, end) || dest->mapFromGlobal(end) != local ||
-                !source->dragEnabled() || source->selectionStart() != first ||
-                source->selectedText() != selection) return false;
-            const int index = source->cursorPositionAt(source->mapFromGlobal(start));
+            if (!destinationMatches() || QApplication::mouseButtons() != Qt::NoButton) return false;
+            if (modelItem) {
+                const auto current = selectedItemAt(sourceId, sourceWindow, start);
+                return !dataChanged && item.index.isValid() && current.index == item.index &&
+                       current.view == item.view;
+            }
+            if (!edit || edit != boundWidget(sourceId, sourceWindow) || !edit->dragEnabled() ||
+                !hits(edit, start) || edit->selectionStart() != first || edit->selectedText() != selection)
+                return false;
+            const int index = edit->cursorPositionAt(edit->mapFromGlobal(start));
             return index >= first && index < first + selection.size();
         };
         if (!endpointsMatch() || !inTime(deadline)) return 0;
         QMimeData payload;
-        payload.setText(selection);
+        if (modelItem) {
+            if (!copyItemMime(item, payload) || !endpointsMatch() || !inTime(deadline)) return 0;
+        } else {
+            payload.setText(selection);
+        }
         QDragEnterEvent enter(local, Qt::CopyAction, &payload, Qt::LeftButton, modifiers);
         if (enter.source()) return 0;
-        DropReceiverGuard guard(dest);
-        if (!guard.deliver(dest, enter)) return 1;
+        DropReceiverGuard guard(receiver);
+        if (!guard.deliver(receiver, enter)) return 1;
         QDragMoveEvent move(local, Qt::CopyAction, &payload, Qt::LeftButton, modifiers);
         if (enter.dropAction() != Qt::CopyAction || !endpointsMatch() || !inTime(deadline) ||
-            !guard.deliver(dest, move) || move.dropAction() != Qt::CopyAction ||
+            !guard.deliver(receiver, move) || move.dropAction() != Qt::CopyAction ||
             !endpointsMatch() || !inTime(deadline)) {
             QDragLeaveEvent leave;
-            if (dest) guard.deliver(dest, leave, endpointsMatch());
+            if (receiver) guard.deliver(receiver, leave, destinationMatches());
             return 1;
         }
         QDropEvent drop(local, Qt::CopyAction, &payload, Qt::LeftButton, modifiers);
-        return guard.deliver(dest, drop) && drop.dropAction() == Qt::CopyAction ? 2 : 1;
+        return guard.deliver(receiver, drop) && drop.dropAction() == Qt::CopyAction ? 2 : 1;
     }
 };
 }

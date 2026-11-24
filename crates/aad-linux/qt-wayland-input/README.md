@@ -51,13 +51,14 @@ Use `aad snapshot $resourceId` to find widget names and their current capabiliti
 | `scroll` | One wheel event at the requested fraction, with 1–30 detents along one of four directions. The widget decides how far to scroll. |
 | `hover` | One widget-local hover move with optional dwell. During dwell the backend rechecks the hit. The system cursor stays in place. |
 | `drag`, same widget | A press, one held-button move and a release. The plugin checks the straight path for covering children before press and again before move. The longer axis may span up to 8192 logical pixels. |
-| `drag`, different widgets | Copy selected plain text from a drag-enabled, non-password `QLineEdit` in the active window into an exact `acceptDrops()` widget. Both must belong to the same observed application; the destination may be in another exposed, non-minimized window. Use the left button with no modifiers or Ctrl. |
+| `drag`, different widgets | Copy selected text from a drag-enabled, non-password `QLineEdit`, or copy the single selected item of a standard `QListView` or `QListWidget`. The source must be in the active window. The destination can be in another exposed window of the same application. Use the left button with no modifiers or Ctrl. |
 
 ```powershell
 aad do scroll $resourceId --name 'Invoice scroll' --direction down --notches 2 --fx .78 --fy .5
 aad do hover $resourceId --name 'Invoice scroll' --fx 1 --fy 1 --ms 120
 aad do click $resourceId --name 'Mouse pad' --button right --count 2 --fx 1 --fy 0
 aad do drag $resourceId --name 'Drag selection' --to-name 'Drag selection' --fx 0 --fy .5 --to-fx 1 --to-fy .5
+aad do drag $resourceId --name 'Invoice 2037' --to-name 'Remote basket'
 ```
 
 For a modified click, use the following `action` in a control `act` request with the target handle from that session's `observe` response.
@@ -68,6 +69,8 @@ For a modified click, use the following `action` in a control `act` request with
 
 The provider pins both widgets and their respective windows to the observed application's unique AT-SPI bus owner. The GUI thread rechecks identity, exposure and widget hits between phases. An inactive drop target is not eligible for standalone clicks or keys. Hit testing covers each addressed window's own widget hierarchy; no compositor-wide visibility or shared origin is assumed.
 
-For a cross-widget drag, start within the selection. The plugin copies the actual selection (up to 65,536 UTF-16 units) into in-process MIME data; it never reads the clipboard or sends the payload over D-Bus. It dispatches drag-enter, drag-move and drop to the destination and requires acceptance of the copy. An ignored enter cannot fall through to a parent drop handler. Loss of proof or rejection after delivery starts is an unknown effect, not a successful drop. This is a directed copy, not a seat drag: no source deletion, compositor pointer motion, or `QDrag` source object. Handlers that require such an object, arbitrary MIME, cross-process drops, Qt Quick, waypoints and timed holds are not supported.
+For a text drag, start within the selection. The plugin copies up to 65,536 UTF-16 units. For a list drag, address the selected item by its observed identity. The accessible child, the view's hit at the start point and the single selected model index must agree. The model must offer `Qt::CopyAction`. The plugin asks it for the MIME data for that index and copies the bytes of its declared formats. The limit is 16 nonempty formats and 1 MiB total. Custom models can supply their own formats. Custom view subclasses, multiple selections and internal-move lists are outside this path.
+
+Address an accepting widget or empty viewport space in a receiving standard list. The plugin sends drag-enter, drag-move and drop in process, checking the endpoints between phases and requiring copy acceptance. An ignored enter cannot fall through to a parent. Rejection or loss of proof after dispatch begins returns an unknown effect. The clipboard, compositor pointer and source model stay outside the transport. Receivers that require a live `QDrag` source object, cross-process drops, Qt Quick, waypoints and timed holds are unsupported.
 
 To qualify a build from the repository, build `tests/linux/qt_wayland_fixture.pro` with the same qmake as the plugin and run `python3 tests/linux/verify_qt_wayland.py <aad> <fixture-executable> <plugin-root>`. The runner creates a private virtual KWin and D-Bus session. Run the two ABI checks and the existing `verify-wayland-form.ps1` regression serially.

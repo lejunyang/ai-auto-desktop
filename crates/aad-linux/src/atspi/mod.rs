@@ -181,6 +181,15 @@ pub trait AtspiBackend: Send + Sync {
             "directed Qt drop is unavailable",
         ))
     }
+    fn qt_model_item_drop(
+        &self,
+        _request: DragBetweenRequest<'_>,
+    ) -> Result<Value, AutomationError> {
+        Err(driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "directed Qt model item drop is unavailable",
+        ))
+    }
     fn drag_between(
         &self,
         _request: DragBetweenRequest<'_>,
@@ -1460,20 +1469,23 @@ impl AtspiProvider {
                     ));
                 }
                 if to_native != native {
-                    if node["provenance"]["qt_text_drag_source"] != true
-                        || to_node["provenance"]["qt_text_drop_target"] != true
+                    let text_copy = node["provenance"]["qt_text_drag_source"] == true
+                        && to_node["provenance"]["qt_text_drop_target"] == true;
+                    let item_copy = node["provenance"]["qt_model_item_drag_source"] == true
+                        && to_node["provenance"]["qt_model_item_drop_target"] == true;
+                    if !(text_copy || item_copy)
                         || to_node["states"]["protected"] != false
                         || to_node["provenance"]["value_redacted"] != false
                         || native.bus_name != to_native.bus_name
                     {
                         return Err(driver_error(
                             "DRIVER.ACTION_UNSUPPORTED",
-                            "both Qt text drop endpoints must be proven",
+                            "both Qt copy drop endpoints must be proven",
                         ));
                     }
                     let top = input_window(&fresh, &to_id)
                         .ok_or_else(|| stale("missing destination window"))?;
-                    qt_drop = Some((to_native, top, process_id(&to_node, &fresh)?));
+                    qt_drop = Some((to_native, top, process_id(&to_node, &fresh)?, item_copy));
                 }
             }
             let to_point = point_in(
@@ -1667,9 +1679,14 @@ impl AtspiProvider {
                             validate,
                         );
                     }
-                    if let Some((destination_native, destination_window, destination_pid)) = qt_drop
+                    if let Some((
+                        destination_native,
+                        destination_window,
+                        destination_pid,
+                        item_copy,
+                    )) = qt_drop
                     {
-                        return self.backend.qt_text_drop(DragBetweenRequest {
+                        let request = DragBetweenRequest {
                             source: DragBetweenEndpoint {
                                 target: &native,
                                 window: window
@@ -1688,7 +1705,12 @@ impl AtspiProvider {
                             modifiers: &modifiers,
                             hold_ms,
                             deadline,
-                        });
+                        };
+                        return if item_copy {
+                            self.backend.qt_model_item_drop(request)
+                        } else {
+                            self.backend.qt_text_drop(request)
+                        };
                     }
                     self.backend.drag_modified(
                         &native,
