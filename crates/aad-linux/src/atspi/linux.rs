@@ -26,6 +26,7 @@ mod drag_between;
 mod drag_path;
 pub(super) mod file_dialog;
 mod focus_discovery;
+mod gtk3_input;
 pub(super) mod gtk4_picker;
 pub(super) mod kde_picker;
 mod table;
@@ -1341,6 +1342,16 @@ impl AtspiBackend for LinuxBackend {
         }
     }
 
+    fn widget_hit(
+        &self,
+        target: &NativeRef,
+        top: &str,
+        point: (i32, i32),
+        deadline: Instant,
+    ) -> Result<bool, AutomationError> {
+        self.gtk3_hit(target, top, point, deadline)
+    }
+
     fn parent(
         &self,
         node: &NativeRef,
@@ -1466,6 +1477,17 @@ impl AtspiBackend for LinuxBackend {
                     "DRIVER.ACTION_UNSUPPORTED",
                     "Qt widget pointer holds are unavailable",
                 ));
+            }
+            if matches!(gesture, Gesture::Wheel { .. })
+                && self.gtk3_application(&target.bus_name)?
+            {
+                return self.gtk3_input(
+                    target,
+                    window,
+                    wayland_input::Event::Gesture(point, gesture, modifiers),
+                    process_id,
+                    deadline,
+                );
             }
             return self.wayland_input(
                 target,
@@ -1647,6 +1669,15 @@ impl AtspiBackend for LinuxBackend {
                     "DRIVER.ACTION_UNSUPPORTED",
                     "Wayland widget keys do not support a hold duration",
                 ));
+            }
+            if self.gtk3_application(&target.bus_name)? {
+                return self.gtk3_input(
+                    target,
+                    window,
+                    wayland_input::Event::Key(keys),
+                    process_id,
+                    deadline,
+                );
             }
             return self.wayland_input(
                 target,

@@ -235,6 +235,16 @@ impl LinuxBackend {
         snapshot: &mut BackendSnapshot,
         deadline: Instant,
     ) -> Result<(), AutomationError> {
+        if crate::wayland_portal::is_wayland_session()
+            && snapshot.application.get("toolkit_name") == Some(&json!("gtk"))
+            && snapshot
+                .application
+                .get("toolkit_version")
+                .and_then(Value::as_str)
+                .is_some_and(|version| version.starts_with("3."))
+        {
+            return self.qualify_gtk3_input(snapshot, deadline);
+        }
         if snapshot
             .application
             .get("toolkit_name")

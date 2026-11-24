@@ -334,7 +334,18 @@ impl Backend for NativeBackend {
     fn node_capabilities(&self, node: &Value) -> Vec<String> {
         ACTION_NAMES
             .iter()
+            .copied()
             .filter(|name| {
+                if let Some(modes) = node["provenance"]["wayland_pointer_modes"].as_array() {
+                    let mode = match *name {
+                        "scroll" => Some("wheel"),
+                        "hover" => Some("hover"),
+                        _ => None,
+                    };
+                    if mode.is_some_and(|mode| !modes.iter().any(|m| m == mode)) {
+                        return false;
+                    }
+                }
                 node["actions"]
                     .as_array()
                     .is_some_and(|native| native.iter().any(|v| v == self.native_name(name)))

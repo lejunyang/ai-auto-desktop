@@ -453,6 +453,16 @@ pub trait AtspiBackend: Send + Sync {
             "AT-SPI point lookup is unavailable",
         ))
     }
+    /// Hit-test a window-local point in the target's own GTK widget tree.
+    fn widget_hit(
+        &self,
+        _target: &NativeRef,
+        _top: &str,
+        _point: (i32, i32),
+        _deadline: Instant,
+    ) -> Result<bool, AutomationError> {
+        Ok(false)
+    }
     /// The element's parent, or `None` above the application.
     fn parent(
         &self,
@@ -1390,7 +1400,7 @@ impl AtspiProvider {
             if !modes.iter().any(|value| value == mode) {
                 return Err(driver_error(
                     "DRIVER.ACTION_UNSUPPORTED",
-                    "Qt plugin does not offer the requested pointer gesture",
+                    "Wayland target does not offer the requested pointer gesture",
                 ));
             }
         }
@@ -2102,6 +2112,25 @@ impl AtspiProvider {
         point: (i32, i32),
         deadline: Instant,
     ) -> Result<(), AutomationError> {
+        let node = record.public["nodes"]
+            .as_array()
+            .and_then(|nodes| nodes.iter().find(|n| n["node_id"] == node_id));
+        if let Some(node) =
+            node.filter(|n| n["provenance"]["coordinate_space"] == "gtk_window_logical")
+        {
+            if let Some(top) = node["provenance"]["wayland_input_window"].as_str() {
+                if self
+                    .backend
+                    .widget_hit(&record.handles[node_id], top, point, deadline)?
+                {
+                    return Ok(());
+                }
+            }
+            return Err(driver_error(
+                "DRIVER.POINT_NOT_PROVEN",
+                "GTK could not prove the window-local wheel hit",
+            ));
+        }
         let allowed = descendants(record, node_id);
         // Start at the top-most ancestor that takes part in hit testing (has
         // bounds, unlike the application object above the windows): a lookup
