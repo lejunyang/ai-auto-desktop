@@ -265,6 +265,15 @@ fn collect_events(
 
 const BROWSER: &str = "browser.cdp";
 
+pub(crate) fn valid_view_hint(hint: &Value) -> bool {
+    hint.as_object().is_some_and(|fields| fields.len() == 2)
+        && ["fx", "fy"].iter().all(|key| {
+            hint[key]
+                .as_f64()
+                .is_some_and(|fraction| (0.0..=1.0).contains(&fraction))
+        })
+}
+
 fn canvas_action(action: &Value) -> Option<Value> {
     if action["kind"] != "canvas_click"
         || action["trusted"] != true
@@ -276,8 +285,12 @@ fn canvas_action(action: &Value) -> Option<Value> {
     let evidence = &action["canvas"];
     let fields = evidence["query"].as_object()?;
     if fields.is_empty()
-        || fields.values().any(|v| {
-            v.as_str()
+        || fields.iter().any(|(key, value)| {
+            if key == "view_hint" {
+                return !valid_view_hint(value);
+            }
+            value
+                .as_str()
                 .is_none_or(|s| s.trim().is_empty() || s.len() > 1024 || s.contains("${{"))
         })
     {
@@ -298,10 +311,12 @@ fn canvas_action(action: &Value) -> Option<Value> {
             ()
         }
         "flowchart"
-            if fields
-                .keys()
-                .all(|k| matches!(k.as_str(), "label" | "kind" | "after" | "before"))
-                && (fields.contains_key("label") || fields.contains_key("kind")) =>
+            if fields.keys().all(|k| {
+                matches!(
+                    k.as_str(),
+                    "label" | "kind" | "after" | "before" | "view_hint"
+                )
+            }) && (fields.contains_key("label") || fields.contains_key("kind")) =>
         {
             ()
         }
@@ -655,6 +670,31 @@ impl Recording {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_hint_only_accompanies_a_semantic_pixel_selector() {
+        let action = |source: &str, query: Value| {
+            canvas_action(
+                &json!({"kind":"canvas_click","trusted":true,"tag":"canvas","dom_event":"click",
+                "canvas":{"source":source,"query":query}}),
+            )
+        };
+        let hint = json!({"fx":0.25,"fy":0.75});
+        let query = json!({"label":"Ready","view_hint":hint});
+        assert_eq!(action("flowchart", query.clone()).unwrap()["query"], query);
+        assert!(action("editor", json!({"id":"ready","view_hint":hint})).is_none());
+        assert!(action("flowchart", json!({"view_hint":hint})).is_none());
+        for invalid in [
+            Value::Null,
+            json!({"fx":0.5}),
+            json!({"fx":"0.5","fy":0.75}),
+            json!({"fx":-0.1,"fy":0.75}),
+            json!({"fx":0.5,"fy":1.01}),
+            json!({"fx":0.5,"fy":0.75,"extra":"not evidence"}),
+        ] {
+            assert!(action("flowchart", json!({"kind":"rectangle","view_hint":invalid})).is_none());
+        }
+    }
 
     #[test]
     fn normalized_browser_steps_keep_their_actual_evidence_rows() {

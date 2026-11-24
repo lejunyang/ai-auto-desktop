@@ -125,7 +125,12 @@
           });
         }).catch(()=>null));
         setTimeout(()=>proofs.delete(seq),10000);
-        return {source:'flowchart',fx,fy,rw,rh};
+        const evidence={source:'flowchart',fx,fy,rw,rh};
+        if (left>Math.ceil(box.left) || top>Math.ceil(box.top) ||
+            left+width<Math.floor(box.right) || top+height<Math.floor(box.bottom)) {
+          evidence.view_hint={fx:(left-box.left+width/2)/box.width,fy:(top-box.top+height/2)/box.height};
+        }
+        return evidence;
       } catch { return {reason:'capture_failed'}; }
     }
   };

@@ -45,12 +45,19 @@ fn recognize(png: &str, evidence: &Value) -> Option<Value> {
             other => other,
         }
     });
-    query(
+    let mut selector = query(
         result.ok()?,
         evidence["fx"].as_f64()?,
         evidence["fy"].as_f64()?,
         &format!("{:x}", Sha256::digest(image.as_raw())),
-    )
+    )?;
+    if let Some(hint) = evidence.get("view_hint") {
+        if !crate::recording::valid_view_hint(hint) {
+            return None;
+        }
+        selector["view_hint"] = hint.clone();
+    }
+    Some(selector)
 }
 
 fn query(mut graph: Value, fx: f64, fy: f64, hash: &str) -> Option<Value> {
