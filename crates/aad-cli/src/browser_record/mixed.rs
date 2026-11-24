@@ -158,17 +158,20 @@ fn record(args: &Start) -> Result<Value> {
         selected.push(json!({"resource_id":id,"window":window,"dialogs":dialogs}));
     }
     let browser_dir = args.out.join("browser");
-    let mut recorder = recording::Recorder::start(recording::Options {
-        port: args.cdp_port,
-        page: args.page.clone(),
-        out: browser_dir.clone(),
-        seconds: args.seconds,
-        redact_network: true,
-        screenshots: false,
-        body_limit: 0,
-        max_bytes: 64 * 1024 * 1024,
-        follow_popups: false,
-    })?;
+    let mut recorder = aad_control::browser::export::start_recording(
+        recording::Options {
+            port: args.cdp_port,
+            page: args.page.clone(),
+            out: browser_dir.clone(),
+            seconds: args.seconds,
+            redact_network: true,
+            screenshots: false,
+            body_limit: 0,
+            max_bytes: 64 * 1024 * 1024,
+            follow_popups: false,
+        },
+        None,
+    )?;
     // On Linux Chromium TimeTicks and Watch both use CLOCK_MONOTONIC. Bracket
     // the sample to report the precision of alignment with DOM Date.now().
     let (offset, browser_precision) = if provider == native::PROVIDER {

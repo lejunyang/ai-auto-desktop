@@ -56,6 +56,7 @@
   };
   const listen = (name, handler) => { document.addEventListener(name, handler, true); listeners.push([name,handler]); };
   const targetOf = event => (event.composedPath?.()[0] || event.target);
+  const canvasObjects = /*AAD_CANVAS*/null;
   const isFile = el => el?.tagName === 'INPUT' && el.type === 'file';
   const fileTargets = new WeakMap();
   const usedFileTargets = new WeakSet();
@@ -74,6 +75,11 @@
   };
   listen('click', event => {
     const origin = targetOf(event);
+    if (binding && origin?.tagName === 'CANVAS') {
+      const evidence = canvasObjects?.click(origin, event, sequence + 1);
+      emit('canvas_click', origin, null, event.isTrusted, 'click', {...describe(origin),canvas:evidence ?? null});
+      return;
+    }
     const el = origin?.closest?.('button,a,input,select,[role="button"],[role="tab"],[tabindex]') || origin;
     const label = origin?.closest?.('label');
     const field = isFile(origin) ? origin : (!origin?.closest?.('button,a,input,select,textarea') && label?.control);
@@ -135,6 +141,7 @@
         const rect=el.getBoundingClientRect();
         if (rect.bottom<0 || rect.right<0 || rect.top>innerHeight || rect.left>innerWidth) continue;
         if (nodes.length >= 100) { truncated=true; break; }
+        if (el.tagName === 'CANVAS') canvasObjects?.prime(el);
         nodes.push(file || element(el));
       }
       if (truncated) break;
@@ -144,9 +151,10 @@
   };
   globalThis.__aadCdp = {
     version:3, installed:true, documentId, snapshot, isDirty:()=>dirty,
+    canvasProof:canvasObjects?.proof,
     take:()=>queue.splice(0),
     takeReport:()=>{ const report={events:queue.splice(0),dropped}; dropped=0; return report; },
-    stop:()=>{ if (binding) document.dispatchEvent(new Event(binding + '_save_stop')); for (const [name,fn] of listeners) document.removeEventListener(name,fn,true); observer?.disconnect(); queue.length=0; delete globalThis.__aadCdp; }
+    stop:()=>{ if (binding) document.dispatchEvent(new Event(binding + '_save_stop')); for (const [name,fn] of listeners) document.removeEventListener(name,fn,true); observer?.disconnect(); canvasObjects?.stop(); queue.length=0; delete globalThis.__aadCdp; }
   };
   return true;
 })()

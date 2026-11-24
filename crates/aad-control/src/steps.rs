@@ -213,6 +213,10 @@ impl Step {
                 {
                     return Err(invalid("save_as requires a browser.cdp trigger (click or enter) and a run-supplied destination input"));
                 }
+            } else if name == "click_object" {
+                if self.app.provider.as_deref() != Some(crate::browser::PROVIDER) {
+                    return Err(invalid("click_object requires a browser.cdp canvas"));
+                }
             } else if !ACTION_NAMES.contains(&name) {
                 return Err(invalid(format!(
                     "step {} has no known action type",

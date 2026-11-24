@@ -182,6 +182,13 @@ fn collect_events(
         *next += 1;
         let mut input = None;
         let action = match event["kind"].as_str().unwrap_or_default() {
+            "canvas_click" if app.provider.as_deref() == Some(BROWSER) => {
+                let Some(action) = canvas_action(&event["observed"]) else {
+                    batch.skipped.push(json!({"reason":"canvas_object_unresolved","source_row":event["source_row"]}));
+                    continue;
+                };
+                action
+            }
             "click" => {
                 let mut action = json!({"type": "click"});
                 if let Some(button) = event["button"].as_str().filter(|b| *b != "left") {
@@ -257,6 +264,51 @@ fn collect_events(
 }
 
 const BROWSER: &str = "browser.cdp";
+
+fn canvas_action(action: &Value) -> Option<Value> {
+    if action["kind"] != "canvas_click"
+        || action["trusted"] != true
+        || action["tag"] != "canvas"
+        || action["dom_event"] != "click"
+    {
+        return None;
+    }
+    let evidence = &action["canvas"];
+    let fields = evidence["query"].as_object()?;
+    if fields.is_empty()
+        || fields.values().any(|v| {
+            v.as_str()
+                .is_none_or(|s| s.trim().is_empty() || s.len() > 1024 || s.contains("${{"))
+        })
+    {
+        return None;
+    }
+    match evidence["source"].as_str()? {
+        "editor"
+            if fields.len() == 1
+                && fields.get("id").and_then(Value::as_str).is_some_and(|id| {
+                    id.len() <= 64
+                        && id.bytes().enumerate().all(|(index, byte)| {
+                            byte.is_ascii_alphanumeric()
+                                || byte == b'_'
+                                || index != 0 && b".:-".contains(&byte)
+                        })
+                }) =>
+        {
+            ()
+        }
+        "flowchart"
+            if fields
+                .keys()
+                .all(|k| matches!(k.as_str(), "label" | "kind" | "after" | "before"))
+                && (fields.contains_key("label") || fields.contains_key("kind")) =>
+        {
+            ()
+        }
+        _ => return None,
+    }
+    Some(json!({"type":"click_object","query":fields,"options":{"source":evidence["source"]}}))
+}
 
 /// The page a recorded browser action happened on, as a step names it: the
 /// address up to its path, so a query or fragment that changes per visit
@@ -397,6 +449,16 @@ pub fn from_browser_steps(steps_jsonl: &str, next: &mut usize) -> Batch {
         }
         let at_ms = action["at_ms"].clone();
         let mut event = match kind {
+            "canvas_click" | "click" if kind == "canvas_click" || action["tag"] == "canvas" => {
+                if node.to_string().contains("${{") || page.contains("${{") {
+                    batch
+                        .skipped
+                        .push(json!({"reason":"canvas_object_unresolved","source_row":step["id"]}));
+                    runs.push((App::default(), Vec::new()));
+                    continue;
+                }
+                json!({"kind":"canvas_click","observed":action,"node":node,"at_ms":at_ms})
+            }
             "save_as" => {
                 json!({"kind":"save_as","trigger":action["trigger"],"source":action["source"],"node":node,"at_ms":at_ms})
             }

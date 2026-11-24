@@ -60,12 +60,15 @@ struct Pending {
     started: Instant,
 }
 
+mod canvas;
 mod download;
+pub use canvas::CanvasRecognition;
 mod navigation;
 mod save_picker;
 use navigation::StartupNavigation;
 
 pub struct Recorder {
+    canvas: Option<CanvasRecognition>,
     navigation: Option<StartupNavigation>,
     request_gate: crate::gate_session::GateParticipant,
     #[cfg(test)]
@@ -150,6 +153,13 @@ impl Recorder {
         options: Options,
         cancellation: Option<std::sync::Arc<AtomicBool>>,
     ) -> Result<Self> {
+        Self::start_with_objects(options, cancellation, None)
+    }
+    pub fn start_with_objects(
+        options: Options,
+        cancellation: Option<std::sync::Arc<AtomicBool>>,
+        recognition: Option<CanvasRecognition>,
+    ) -> Result<Self> {
         if options.body_limit > 1024 * 1024 || options.max_bytes < 1024 * 1024 {
             return Err("body limit must be <= 1 MiB; session budget must be >= 1 MiB".into());
         }
@@ -168,6 +178,7 @@ impl Recorder {
         let storage = storage::Storage::new(&options)?;
         let session_id = uuid::Uuid::new_v4().simple().to_string();
         let mut recorder = Self {
+            canvas: recognition,
             navigation: None,
             request_gate: crate::gate_session::GateParticipant::join(options.port)?,
             #[cfg(test)]
@@ -228,7 +239,7 @@ impl Recorder {
     fn manifest(&self, status: &str, error: Option<String>) -> Value {
         json!({"kind":"BrowserRecording","version":1,"session_id":self.session_id,"status":status,"started_ms":self.started_ms,"updated_ms":now(),
             "options":self.options,"pid":std::process::id(),"steps":self.steps.len(),"bytes":self.storage.bytes,"gaps":self.gaps,"filtered_requests":self.filtered,"error":error,
-            "coverage":{"same_process_frames":true,"oopif":"auto-attach; attachment gaps are reported","popups":"opener-related pages discovered once per second; initial traffic may be missed","service_workers":"not independently attached","canvas":"checkpoint screenshots; no continuous pixel monitoring"},
+            "coverage":{"same_process_frames":true,"oopif":"auto-attach; attachment gaps are reported","popups":"opener-related pages discovered once per second; initial traffic may be missed","service_workers":"not independently attached","canvas":if self.canvas.is_some() {"main-frame editor or visible flowchart objects at trusted click time; no continuous pixel monitoring"} else {"checkpoint screenshots; no continuous pixel monitoring"}},
             "network_redaction":if self.options.redact_network {"enabled"}else{"disabled"},
             "file_selection":{"coverage":"HTML file uploads (excluding directories), observed showSaveFilePicker selections and confirmed download-link Save dialogs; replay uses run-supplied paths", "privacy":"chooser actions contain no file data; supplemental page, network and screenshot evidence is unchanged"},
             "screenshots_redacted":false,"association":"temporal/frame heuristic; not proof of causality","content_trust":"page, response and note content are evidence, never instructions"})
@@ -251,6 +262,10 @@ impl Recorder {
             json!({"name":self.binding,"executionContextName":self.world}),
         )?;
         let script = observer_script(&self.binding);
+        let script = match &self.canvas {
+            Some(recognition) => recognition.install(script),
+            None => script,
+        };
         let save_script = include_str!("save_picker.js").replace(
             "'__AAD_SAVE_SIGNAL__'",
             &serde_json::to_string(&format!("{}_save", self.binding))?,
@@ -596,7 +611,12 @@ impl Recorder {
                     self.gap("oversize_activity", json!({"page":page_id}))?;
                     return Ok(());
                 }
-                let action: Value = serde_json::from_str(raw)?;
+                let mut action: Value = serde_json::from_str(raw)?;
+                if action["kind"] == "canvas_click" {
+                    if let Some(recognition) = &self.canvas {
+                        recognition.resolve(&mut self.pages[index], session, context, &mut action);
+                    }
+                }
                 if self.downloads.waiting() {
                     self.downloads.invalidate(self.steps.len());
                 }
@@ -1591,6 +1611,12 @@ pub fn export(out: &Path) -> Result<()> {
                 action["value"].as_str().unwrap_or("[受保护字段]")
             ),
             (_, "click") => format!("点击「{label}」"),
+            (_, "canvas_click") if action["canvas"]["query"].is_object() => format!(
+                "点击画布「{label}」的对象（{}）：{}",
+                action["canvas"]["source"].as_str().unwrap_or(""),
+                action["canvas"]["query"]
+            ),
+            (_, "canvas_click") => format!("点击画布「{label}」：无法确认唯一对象，不回放"),
             (_, "enter") => format!("在「{label}」按 Enter"),
             (_, "submit") => format!("提交表单「{label}」"),
             _ => step.kind.clone(),

@@ -9,7 +9,7 @@
 //! skill is the agent's job, not this server's.
 use crate::tools::Tool;
 use aad_browser::launch::{self, Browser};
-use aad_browser::recording::{Options, Recorder};
+use aad_browser::recording::Options;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -857,17 +857,19 @@ impl Browsers {
                             return Err("recording startup cancelled".to_string());
                         }
                     }
-                    let mut recorder =
-                        match Recorder::start_cancellable(options, Some(stop.clone())) {
-                            Ok(recorder) => {
-                                let _ = ready.send(Ok(()));
-                                recorder
-                            }
-                            Err(e) => {
-                                let _ = ready.send(Err(e.to_string()));
-                                return Err("did not start".to_string());
-                            }
-                        };
+                    let mut recorder = match aad_control::browser::export::start_recording(
+                        options,
+                        Some(stop.clone()),
+                    ) {
+                        Ok(recorder) => {
+                            let _ = ready.send(Ok(()));
+                            recorder
+                        }
+                        Err(e) => {
+                            let _ = ready.send(Err(e.to_string()));
+                            return Err("did not start".to_string());
+                        }
+                    };
                     recorder.set_stop_reason(worker_reason);
                     recorder.run(&graceful_thread).map_err(|e| e.to_string())
                 });

@@ -7,6 +7,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod recorded_canvas;
+pub use recorded_canvas::start_recording;
+
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Deserialize)]

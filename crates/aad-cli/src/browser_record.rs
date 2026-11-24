@@ -190,17 +190,20 @@ pub fn run(command: &Command) -> recording::Result<Value> {
                     args.page.clone().ok_or("--page or --browser is required")?,
                 ),
             };
-            let recorder = recording::Recorder::start(Options {
-                port,
-                page: page.clone(),
-                out: args.out.clone(),
-                seconds: args.seconds,
-                redact_network: args.redact_network,
-                screenshots: !args.no_screenshots,
-                body_limit: args.body_limit,
-                max_bytes: args.max_bytes,
-                follow_popups: !args.no_follow_popups,
-            })?;
+            let recorder = aad_control::browser::export::start_recording(
+                Options {
+                    port,
+                    page: page.clone(),
+                    out: args.out.clone(),
+                    seconds: args.seconds,
+                    redact_network: args.redact_network,
+                    screenshots: !args.no_screenshots,
+                    body_limit: args.body_limit,
+                    max_bytes: args.max_bytes,
+                    follow_popups: !args.no_follow_popups,
+                },
+                None,
+            )?;
             eprintln!("Recording page {} into {}; Ctrl+C or browser-record stop finishes the walkthrough.",page,args.out.display());
             let result = match (&browser, &args.url) {
                 (Some(browser), Some(url)) => recorder.run_from_blank(browser, url, &cancel),
