@@ -738,6 +738,13 @@ impl LinuxBackend {
         let actionable = states.is_none_or(|states| {
             states.contains(State::Enabled) && states.contains(State::Sensitive)
         });
+        // GTK 4.8 reports sensitivity for enabled widgets but omits ENABLED.
+        // Qualify only the target-addressed operations for which we can prove
+        // the role. In particular a masked GtkEntry can have the Text role.
+        let gtk4_semantic = toolkit == Some("GTK")
+            && toolkit_version.starts_with("4.")
+            && crate::wayland_portal::is_wayland_session()
+            && states.is_some_and(|s| s.contains(State::Visible) && s.contains(State::Sensitive));
         let mut actions = Vec::new();
         if actionable
             && states.is_none_or(|states| states.contains(State::Focusable))
@@ -746,10 +753,20 @@ impl LinuxBackend {
             actions.push("focus".into());
         }
         let invoke_action = actions::unique_activation(&action_metadata);
-        if actionable && invoke_action.is_some() {
+        if (actionable || (gtk4_semantic && native_role == atspi::Role::Button))
+            && invoke_action.is_some()
+        {
             actions.push("invoke".into());
         }
-        if actionable && interfaces.contains(Interface::EditableText) && !protected {
+        let gtk4_editor = gtk4_semantic
+            && native_role == atspi::Role::Text
+            && states.is_some_and(|s| {
+                s.contains(State::Editable)
+                    && s.contains(State::MultiLine)
+                    && !s.contains(State::ReadOnly)
+            });
+        if (actionable || gtk4_editor) && interfaces.contains(Interface::EditableText) && !protected
+        {
             actions.push("set_text".into());
         }
         if protected
