@@ -45,7 +45,7 @@ return page.clickObject(
 
 大画布可以放在滚动容器里，也可以用 CSS 缩放。滚到下一块后，再次调用 `page.readObjects` 或按标签调用 `page.clickObject`。像素识别返回当前视野里的对象，`visible_region` 标明这块视野在整张画布上的位置，对象和文字的边界都按整张画布计算。预览只显示这次读到的部分。视野发生变化后，需要用新的读取结果按候选 ID 点击。
 
-编辑器模式直接读取公开的对象数据，点击时目标位置必须能接收指针事件。[尺寸、显示比例和遮挡要求](testing/canvas-grid-ocr.md#capture-requirements)
+编辑器模式直接读取公开的对象数据。如果匹配对象在滚屏外，驱动会把它滚进视野，复核后再点击。[尺寸、显示比例和遮挡要求](testing/canvas-grid-ocr.md#capture-requirements)
 
 ### 发布编辑器数据
 

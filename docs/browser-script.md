@@ -47,6 +47,20 @@ MCP 使用同名参数。在一次 `browser_script` 调用中传 `source`（上�
 
 成功时返回 `result`、`page_calls`、`completed_actions` 和 `elapsed_ms`。页面调用出错后整段停止，报告保留之前已完成的动作数，以及驱动报告的错误和动作效果。读状态失败时，可以先用 `page.present` 判断可选字段是否存在。
 
+## 在 Wayland 上操作 Electron 应用窗口
+
+让目标应用启用本机回环 CDP 端口，用 `aad browser pages --cdp-port 9222` 查看窗口对应的页面。对于 `app://`、`electron://` 和 VS Code 的 `vscode-file://` 页面，用 `--allow-app-document` 指定已经打开的完整文档地址。操作仍然绑定到该窗口内观察到的控件。多个窗口地址相同时，从 `control_targets` 或 `aad apps` 选择对应的浏览器资源 ID，在脚本命令中用 `--resource-id` 指定窗口。
+
+下面的例子从只有一个工作台窗口的 VS Code 实例读取控件。若有多个窗口，使用资源 ID 选择其中一个。
+
+```powershell
+$pages = (aad browser pages --cdp-port 9222 | ConvertFrom-Json).pages
+$appUrl = $pages | Where-Object { $_.url -like 'vscode-file://vscode-app/*/workbench.html' } | Select-Object -ExpandProperty url -Unique
+aad browser read --browser-port 9222 --url $appUrl --allow-app-document $appUrl --view nodes
+```
+
+在 `aad browser script` 上加同一个授权和 `--allow-input` 即可执行按键和指针动作。MCP 或持久控制服务在启动时传入 `--allow-app-document`。本机 VS Code 的验收实际点击了搜索侧栏，在已聚焦的搜索框中写入 `Invoice-2037`，按 Ctrl+A 选中了 12 个字符，随后按退格清空。应用原生菜单、系统文件窗口另走桌面驱动。[Wayland 上的 VS Code 验收](../tests/linux/verify-electron-wayland.mjs)
+
 ## 给报销单添加附件
 
 把以下代码存为 `attach.js`。“添加附件”是网页上的上传按钮，点下后由网页打开文件选择器。脚本一次完成点击和选文件。网站若另外要求点“提交报销”，可在收到附件回显后继续写该步骤。
