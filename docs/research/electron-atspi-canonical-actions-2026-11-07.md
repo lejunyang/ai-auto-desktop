@@ -60,3 +60,26 @@ osdk exec -- dbus-run-session -- cargo test --locked -p aad-atspi `
 Chromium [ViewAXPlatformNodeDelegate::HitTestSync](https://github.com/chromium/chromium/blob/main/ui/views/accessibility/view_ax_platform_node_delegate.cc) 的逆序子节点命中逻辑可以解释为何占满窗口的 sibling 影响访问性命中。仅直接查询目标子树无法证明没有其他 sibling 覆盖；不能按类名跳过该节点或用重复查询冒充遮挡证明。
 
 两种恢复路径分别是明确语义动作和明确视觉 surface。它们不等于任意 Electron 控件都支持语义操作，也不保证任意自绘应用的精确节点指针命中。[待验证] 其他 Electron 版本、不同桌面环境及更多控件需要各自的真实效果验证。
+
+## Wayland 上的链接与复选框
+
+2026-11-25 在私有 KWin Wayland 5.27.5、AT-SPI 2.46.0 上验收。独立测试应用使用本机 VS Code 1.146.0 附带的 Electron 43.8.6，单独加载一页包含链接和两个复选框的 HTML。测试使用独立 D-Bus、Wayland socket 和 profile，以 `--ozone-platform=wayland` 启动并清除 `DISPLAY`。输入全部经过 `aad control serve --allow-input` 的 `desktop.linux_atspi` provider。
+
+| 已观察的控件 | `invoke` 派发的原生动词 | 渲染进程独立回读 |
+| --- | --- | --- |
+| Open invoice details 链接 | `jump` | 页面 fragment 从空变为 `#details` |
+| 未选中的 Approve invoice 复选框 | `check` | 选中，收到一次目标框的 `change` |
+| 同一复选框，重新观察为已选中 | `uncheck` | 取消选中，两次事件依次记录 `true`、`false`，相邻框一直为 `false` |
+
+第二个 control 会话在勾选前观察同一控件。第一个会话完成勾选并释放输入租约后，第二个会话使用旧引用得到 `DRIVER.STALE_SNAPSHOT`，事件数仍为一。重新观察后，唯一总线名和对象路径与勾选前相同，默认动词已变为 `uncheck`。
+
+原生角色为 Link 时允许 `jump`，CheckBox 时允许 `check` 或 `uncheck`。观察和派发均要求候选激活动词唯一。涉及这三个动词的变化需要重新观察，普通激活动词仍按原规则绑定本次身份校验读到的规范名称。`DoAction` 前还会复核动作数和槽位上的名称。
+
+从仓库根目录运行以下命令，需 Linux、Python 3、KWin Wayland、D-Bus、AT-SPI 和本机 Electron 运行时。脚本默认从 `/usr/share/code/code` 创建临时运行目录，在渲染进程监听 DOM 事件并写出独立回执。桌面验收需串行调度。[验收脚本](../../tests/linux/verify-electron-atspi.py)
+
+```powershell
+osdk exec -- cargo build --locked -p aad-cli
+python3 tests/linux/verify-electron-atspi.py --aad ./target/debug/aad
+```
+
+本轮覆盖独立 Electron 应用中暴露上述角色和动词的 HTML 控件。其他 Electron 版本、自绘控件和原生菜单的对应能力均 **[待验证]**。VS Code 工作台的定向指针和按键另有文档级 CDP 验收。[工作台启动与授权](../browser-script.md#在-wayland-上操作-electron-应用窗口)
