@@ -296,9 +296,9 @@ fn canvas_action(action: &Value) -> Option<Value> {
     {
         return None;
     }
-    match evidence["source"].as_str()? {
-        "editor"
-            if fields.len() == 1
+    let valid = match evidence["source"].as_str()? {
+        "editor" => {
+            fields.len() == 1
                 && fields.get("id").and_then(Value::as_str).is_some_and(|id| {
                     id.len() <= 64
                         && id.bytes().enumerate().all(|(index, byte)| {
@@ -306,23 +306,21 @@ fn canvas_action(action: &Value) -> Option<Value> {
                                 || byte == b'_'
                                 || index != 0 && b".:-".contains(&byte)
                         })
-                }) =>
-        {
-            ()
+                })
         }
-        "flowchart"
-            if fields.keys().all(|k| {
+        "flowchart" => {
+            fields.keys().all(|key| {
                 matches!(
-                    k.as_str(),
+                    key.as_str(),
                     "label" | "kind" | "after" | "before" | "view_hint"
                 )
-            }) && (fields.contains_key("label") || fields.contains_key("kind")) =>
-        {
-            ()
+            }) && (fields.contains_key("label") || fields.contains_key("kind"))
         }
-        _ => return None,
-    }
-    Some(json!({"type":"click_object","query":fields,"options":{"source":evidence["source"]}}))
+        _ => false,
+    };
+    valid.then(
+        || json!({"type":"click_object","query":fields,"options":{"source":evidence["source"]}}),
+    )
 }
 
 /// The page a recorded browser action happened on, as a step names it: the
