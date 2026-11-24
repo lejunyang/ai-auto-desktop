@@ -50,6 +50,13 @@ pub struct Grants {
     /// Allow one internal origin, e.g. chrome://settings. Repeatable; no wildcards.
     #[arg(long = "allow-browser-internal-origin", value_name = "ORIGIN")]
     browser_internal_origins: Vec<String>,
+    /// Attach to one open Electron renderer with this exact app document URL. Repeatable.
+    #[arg(
+        long = "allow-app-document",
+        value_name = "URL",
+        conflicts_with = "browser_bidi_port"
+    )]
+    app_documents: Vec<String>,
     /// Permit replacing protected fields with server-owned secret bindings.
     /// Also requires --allow-input. Ordinary fill/type/paste stay prohibited.
     #[arg(long)]
@@ -91,6 +98,7 @@ impl Grants {
                 &self.browser_file_dirs,
                 &self.browser_internal_origins,
             )
+            .and_then(|access| access.with_app_documents(&self.app_documents))
             .map_err(|error| invalid(error.message))?,
         })
     }
@@ -155,6 +163,7 @@ impl Grants {
             || self.allow_cookie_values
             || !self.browser_file_dirs.is_empty()
             || !self.browser_internal_origins.is_empty()
+            || !self.app_documents.is_empty()
             || self.allow_secret_input
             || !self.secret_env.is_empty()
     }

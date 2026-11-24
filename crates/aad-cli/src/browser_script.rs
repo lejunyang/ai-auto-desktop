@@ -17,13 +17,24 @@ pub struct PageArgs {
     /// Chromium CDP port on localhost (default 9222).
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..), conflicts_with="browser_bidi_port")]
     browser_port: Option<u16>,
+    /// Attach to one open Electron renderer with this exact app document URL. Repeatable.
+    #[arg(
+        long = "allow-app-document",
+        value_name = "URL",
+        conflicts_with = "browser_bidi_port"
+    )]
+    app_documents: Vec<String>,
     /// Firefox WebDriver BiDi port on localhost.
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     browser_bidi_port: Option<u16>,
 }
 
 impl PageArgs {
-    pub fn session(&self, mut policy: Policy) -> (&'static str, Session) {
+    pub fn session(&self, mut policy: Policy) -> Result<(&'static str, Session), Value> {
+        policy.browser_access = policy
+            .browser_access
+            .with_app_documents(&self.app_documents)
+            .map_err(|e| e.to_json())?;
         let (provider, cdp) = if self.browser_bidi_port.is_some() {
             (aad_control::browser_bidi::PROVIDER, None)
         } else {
@@ -33,10 +44,10 @@ impl PageArgs {
             )
         };
         policy.providers = [provider.to_owned()].into();
-        (
+        Ok((
             provider,
             Session::native_with_browsers(policy, cdp, self.browser_bidi_port),
-        )
+        ))
     }
 }
 
@@ -85,7 +96,7 @@ pub fn run(args: &Args) -> Result<Value, Value> {
         allow_input: args.allow_input,
         upload_roots: args.upload_dirs.clone(),
         ..Policy::default()
-    });
+    })?;
     let session = match (&args.allow_upload_tree, &args.upload_tree_stage) {
         (Some(source), Some(stage)) => session
             .with_upload_tree(source, stage)

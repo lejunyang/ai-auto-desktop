@@ -30,6 +30,7 @@ impl crate::Session {
 pub struct BrowserAccess {
     file_roots: Vec<PathBuf>,
     internal_origins: BTreeSet<String>,
+    app_documents: BTreeSet<String>,
 }
 
 fn internal_scheme(scheme: &str) -> bool {
@@ -94,6 +95,27 @@ impl BrowserAccess {
         Ok(policy)
     }
 
+    /// Attach to an already-open Electron document using its exact renderer URL.
+    pub fn with_app_documents(mut self, documents: &[String]) -> Result<Self> {
+        for raw in documents {
+            let url = parse(raw)?;
+            if !matches!(url.scheme(), "app" | "vscode-file" | "electron")
+                || url
+                    .host_str()
+                    .is_none_or(|host| host.is_empty() || host.contains('*'))
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.port().is_some()
+                || raw.contains('*')
+            {
+                return Err(error("CONTROL.INVALID_REQUEST",
+                    "choose an exact app://, electron:// or vscode-file:// document URL with a host"));
+            }
+            self.app_documents.insert(url.to_string());
+        }
+        Ok(self)
+    }
+
     /// Navigation is explicit; script/data/blob URLs are never accepted here.
     /// File aliases are resolved to their canonical file URL before dispatch.
     pub fn navigation_url(&self, raw: &str) -> Result<String> {
@@ -147,6 +169,9 @@ impl BrowserAccess {
         // (e.g. OAuth redirects and data frames). Do not revoke their origin.
         let url = Url::parse(raw)
             .map_err(|_| error("POLICY.DENIED", "browser document has no valid current URL"))?;
+        if self.app_documents.contains(url.as_str()) {
+            return Ok(());
+        }
         if url.scheme() == "about"
             && matches!(url.path(), "blank" | "srcdoc")
             && url.query().is_none()
@@ -284,6 +309,36 @@ mod tests {
             "devtools://devtools",
         ] {
             assert!(BrowserAccess::new(&[], &[grant.into()]).is_err(), "{grant}");
+        }
+    }
+
+    #[test]
+    fn electron_attach_grant_matches_one_existing_document() {
+        let app = "vscode-file://vscode-app/workbench.html?window=3";
+        let policy = BrowserAccess::default()
+            .with_app_documents(&[app.into()])
+            .unwrap();
+        assert!(policy.check_document(app).is_ok());
+        assert!(policy.navigation_url(app).is_err());
+        for other in [
+            "vscode-file://vscode-app/workbench.html?window=4",
+            "vscode-file://vscode-app/other.html",
+            "vscode-file://other/workbench.html?window=3",
+        ] {
+            assert!(policy.check_document(other).is_err());
+        }
+        for grant in [
+            "file:///etc/passwd",
+            "chrome://settings/",
+            "javascript:alert(1)",
+            "app://*/ui",
+            "app://user@local/main",
+            "electron://renderer:321/main",
+            "app://renderer/*",
+        ] {
+            assert!(BrowserAccess::default()
+                .with_app_documents(&[grant.into()])
+                .is_err());
         }
     }
 
