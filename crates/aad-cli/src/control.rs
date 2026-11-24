@@ -246,7 +246,7 @@ pub enum ControlCommand {
     },
     /// Serve one private NDJSON session on inherited authenticated stdin/stdout.
     /// Use SSH for a remote machine; this command has no network listener.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Proxy a persistent session through trusted operator-supplied argv.
     /// Missing request session IDs are bound to this connection by the client.
     Connect(ConnectArgs),
