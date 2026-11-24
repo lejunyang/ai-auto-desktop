@@ -164,6 +164,20 @@ aad run 后台开权限 --permission desktop.input --permission desktop.observe
 
 每一步按页面地址（到路径为止，去掉查询和锚点）找页面，按控制会话自己的角色和名字找元素：录制脚本和控制会话用同一份命名规则（`aad-browser/src/naming.js`），所以录下的名字回放时能找到同一个元素。页面和它里面的同站 iframe 地址前缀相同时，选地址完全一致的那个。连续输入合并成一次填写，点进输入框或勾选框的那一下并入它引起的修改，勾选框和单选框记成勾选，Enter 记成按键，表单提交不单独成步（引起它的点击或 Enter 已经是一步）；密码框的内容不保存，改成运行时输入。回放前浏览器要已经打开那个页面（例如 MCP 的 `browser_open`）。这个版本以前的录制没有控制会话的定位，转换时列在 `skipped` 里。
 
+### 画布上的对象移动后，仍点击同一个对象
+
+录制器只为主文档画布上的可信、无修饰键左键点击导出 `click_object`。有 `data-aad-scene` 的编辑器画布按点击时发布的对象框核对命中，保存唯一的稳定 `id`。即使两个对象同名、后来互换位置或改名，只要编辑器保持该 ID，回放仍能定位它。
+
+没有发布对象的流程图则只识别**点击瞬间可见的区域**。例如两个框都叫 `REVIEW`，只有一个紧跟 `PAY`，导出的动作是：
+
+```json
+{"type":"click_object","query":{"label":"REVIEW","after":"PAY"},"options":{"source":"flowchart"}}
+```
+
+录制器在该帧上用回放的匹配规则验证标签、形状和已确认的直接前后关系；不保存点击坐标、临时像素 ID，也不在页面重绘后补猜。点击背景、遮挡或透明画布、对象重叠、无效编辑器数据、同名且关系仍相同等不能确认唯一命中的情况，都会在导出的 `skipped` 中标为 `canvas_object_unresolved`，不会退回到点画布中心。回放时像素查询仅搜索**当前视图**；目标移到屏外时请先滚动或缩放，让目标及查询所需的邻接对象可见。关系消失或变得不唯一时，回放失败而不发出点击。
+
+`--no-screenshots` 关闭检查点截图，不关闭这种对象识别。像素识别在点击处理程序内冻结已核验的可见画面，不调用带 `clip` 的 CDP 截图；临时图像最多 200 万像素、每边不超过 2048，编码超过 768 KiB 即放弃。步骤和动作证据只保存选择条件或跳过原因，不保存这张图或页面发布的整张对象表。普通截图和网络证据仍遵循各自的录制配置。
+
 ### 回放时换一份附件
 
 网页通过 HTML 文件输入框打开选择器时，可以手动选择文件。录制器将确认的选择导出为一个 `upload` 步骤，回放时再指定这一批要用的文件。用 `aad browser record steps` 查看该步的 `input.name`。例如录到的名字是 `rec1_files`，可这样换一份附件再运行：
@@ -278,6 +292,8 @@ osdk exec --tool rust -- cargo clippy --locked -p aad-browser -p aad-cli --all-t
 $env:AAD_TEST_CHROME = '/usr/bin/google-chrome'
 # 默认使用 target/debug/aad；AAD_TEST_CLI 可改指其他构建。Linux CI 每次提交都会运行。
 node --test --test-concurrency=1 tests/browser/launch.test.mjs tests/browser/observer.test.mjs tests/browser/recording.test.mjs
+# 对象录制：独立临时 profile，可信输入；检查重绘、重名关系、Recipe 回放、遮挡和跨 DPR 滚动。
+node --test --test-concurrency=1 tests/browser/record-canvas-objects.test.mjs
 ```
 
 Windows 11 + Chrome 本机串行 7/7 通过（2026-11-07）。Windows 上 Node 无法向子进程发送 Ctrl+C，生命周期用例改用 `browser-record stop` 优雅停止。本机 Edge 以相同参数启动后在 CDP 就绪前即以退出码 0 退出（无相关组策略），原因未查，Edge 下的这组用例 **[待验证]**。
