@@ -10,6 +10,12 @@ import {fixture} from './fixture.mjs';
 
 const chromium = {skip:!process.env.AAD_TEST_CHROME,timeout:60000};
 const exec = promisify(execFile);
+function assertHintedQuery(query,label,expectedHint) {
+  const {view_hint,...selector}=query;
+  assert.deepEqual(selector,{label});
+  assert.deepEqual(Object.keys(view_hint).sort(),['fx','fy']);
+  for (const key of ['fx','fy']) assert.ok(Math.abs(view_hint[key]-expectedHint[key])<1e-12,`unexpected ${key}: ${view_hint[key]}`);
+}
 async function until(check) {
   for (let tries=0;tries<120;tries++) {
     if (await check().catch(()=>false)) return;
@@ -26,15 +32,15 @@ async function setup(t, source) {
       const nodes=[['pay','PAY',20,35],['approved','REVIEW',300,35],['other','REVIEW',300,150]];
       let edge=true, moveOnClick=true; const hits=[];
       function draw(){
-        ctx.fillStyle='white';ctx.fillRect(0,0,620,260);ctx.fillStyle=ctx.strokeStyle='#151515';ctx.lineWidth=3;ctx.font='bold 24px sans-serif';
+        ctx.fillStyle='white';ctx.fillRect(0,0,canvas.width,canvas.height);ctx.fillStyle=ctx.strokeStyle='#151515';ctx.lineWidth=3;ctx.font='bold 24px sans-serif';
         for(const [,label,x,y] of nodes){ctx.strokeRect(x,y,140,65);ctx.fillText(label,x+15,y+42)}
         const middle=nodes[0][3]+33;
         if(edge){ctx.beginPath();ctx.moveTo(160,middle);ctx.lineTo(298,middle);ctx.stroke();
           ctx.beginPath();ctx.moveTo(298,middle);ctx.lineTo(284,middle-7);ctx.lineTo(284,middle+7);ctx.closePath();ctx.fill()}
-        if (${source==='editor'}) canvas.dataset.aadScene=JSON.stringify({objects:nodes.map(([id,label,x,y])=>({id,label,kind:'rectangle',box:{fx:x/620,fy:y/260,fw:140/620,fh:65/260}})),edges:[{from:'pay',to:'approved'}]});
+        if (${source==='editor'}) canvas.dataset.aadScene=JSON.stringify({objects:nodes.map(([id,label,x,y])=>({id,label,kind:'rectangle',box:{fx:x/canvas.width,fy:y/canvas.height,fw:140/canvas.width,fh:65/canvas.height}})),edges:[{from:'pay',to:'approved'}]});
       }
       draw();canvas.onclick=e=>{
-        const r=canvas.getBoundingClientRect(),px=(e.clientX-r.left)*620/r.width,py=(e.clientY-r.top)*260/r.height;
+        const r=canvas.getBoundingClientRect(),px=(e.clientX-r.left)*canvas.width/r.width,py=(e.clientY-r.top)*canvas.height/r.height;
         const hit=nodes.find(([,,x,y])=>x<=px && px<x+140 && y<=py && py<y+65);
         hits.push([e.isTrusted,hit?.[0]]);
         if(moveOnClick){moveOnClick=false; for(const node of nodes)node[3]=185-node[3]; draw()}
@@ -53,7 +59,7 @@ async function setup(t, source) {
   let clickNumber=0;
   const click=async(id)=>{
     const point=await page.cdp.eval(`(()=>{const node=nodes.find(([id])=>id===${JSON.stringify(id)});const rect=canvas.getBoundingClientRect();
-      const x=rect.left+(node[2]+24)*rect.width/620,y=rect.top+(node[3]+26)*rect.height/260;if(document.elementFromPoint(x,y)!==canvas)throw Error('fixture point covered');return {x,y}})()`);
+      const x=rect.left+(node[2]+24)*rect.width/canvas.width,y=rect.top+(node[3]+26)*rect.height/canvas.height;if(document.elementFromPoint(x,y)!==canvas)throw Error('fixture point covered');return {x,y}})()`);
     await page.cdp.call('Input.dispatchMouseEvent',{type:'mouseMoved',...point});
     const marker=`pointer ready ${++clickNumber}`;
     await run('browser-record','mark','--out',out,'--note',marker);
@@ -131,11 +137,50 @@ for(const transform of ['none','scale(.85)'])test(`DPR and scroll (${transform})
   await click('approved');
   const {exported,rows}=await finish(1);
   assert.deepEqual(await page.cdp.eval('[devicePixelRatio,view.scrollLeft,view.scrollTop,...hits]'),[2,300,12,[true,'approved']]);
-  assert.deepEqual(exported.steps.map(s=>s.action.query),[{label:'READY'}],JSON.stringify(rows));
+  const expectedHint=await page.cdp.eval(`(()=>{const box=canvas.getBoundingClientRect();return {
+    fx:(view.scrollLeft+view.clientWidth/2)/box.width,fy:(view.scrollTop+view.clientHeight/2)/box.height}})()`);
+  assert.equal(rows[0].action.canvas.source,'flowchart');
+  assertHintedQuery(rows[0].action.canvas.query,'READY',expectedHint);
+  assert.equal(exported.steps.length,1);
+  assertHintedQuery(exported.steps[0].action.query,'READY',expectedHint);
   await dpi(1.5);
   await page.cdp.eval('view.scrollTop=145;true');
   assert.equal((await replay()).status,'succeeded');
   assert.deepEqual(await page.cdp.eval('[devicePixelRatio,...hits]'),[1.5,[true,'approved'],[true,'approved']]);
+});
+
+for(const source of ['flowchart','editor'])test(`${source}: replay from the top after the clicked object swaps places below the fold`,chromium,async t=>{
+  const {page,click,finish,replay,out,run}=await setup(t,source);
+  const expectedHint=await page.cdp.eval(`const view=document.createElement('div');view.style='width:570px;height:225px;overflow:auto';
+    canvas.before(view);view.append(canvas);canvas.height=1300;canvas.style.display='block';
+    moveOnClick=false;edge=false;nodes[1]=['approved','READY',60,880];nodes[2]=['other','WAIT',320,880];draw();
+    canvas.addEventListener('click',()=>{[nodes[1][2],nodes[2][2]]=[nodes[2][2],nodes[1][2]];draw()},{once:true});
+    view.scrollTop=820;({fx:view.clientWidth/2/canvas.width,fy:(820+view.clientHeight/2)/canvas.height})`);
+  await click('approved');
+  assert.deepEqual(await page.cdp.eval('[nodes[1][2],...hits]'),[320,[true,'approved']]);
+  const {exported,rows}=await finish(1);
+  assert.equal(rows[0].action.canvas.source,source);
+  assert.equal(exported.steps.length,1);
+  const {query,...action}=exported.steps[0].action;
+  assert.deepEqual(action,{type:'click_object',options:{source}});
+  for(const selector of [rows[0].action.canvas.query,query]){
+    if(source==='flowchart') assertHintedQuery(selector,'READY',expectedHint);
+    else assert.deepEqual(selector,{id:'approved'});
+  }
+  const recipe=join(out,'from-top.yaml');
+  await run('recipe',exported.saved.recording_path,'--out',recipe);
+  const startAtTop=async()=>{
+    assert.deepEqual(await page.cdp.eval('view.scrollTop=0;[view.scrollTop,nodes[1][3]>view.clientHeight,nodes[2][3]>view.clientHeight]'),[0,true,true]);
+  };
+  await startAtTop();
+  assert.equal((await replay(recipe)).status,'succeeded');
+  assert.deepEqual(await page.cdp.eval('[view.scrollTop>0,...hits]'),[true,[true,'approved'],[true,'approved']]);
+  if(source==='flowchart'){
+    await page.cdp.eval('nodes[1][1]="DONE";draw()');
+    await startAtTop();
+    await assert.rejects(replay(recipe));
+    assert.equal(await page.cdp.eval('hits.length'),2);
+  }
 });
 
 test('a pointer-transparent overlay elsewhere on the canvas rules out pixel evidence',chromium,async t=>{
