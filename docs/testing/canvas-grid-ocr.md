@@ -27,7 +27,7 @@ Use the page's exact URL or select its observed browser resource with `--resourc
 
 ## Read the result
 
-Each cell includes its one-based row, column name, text, confidence, uncertainty flag, and bounds. Bounds are measured in pixels from the top left of the canvas. The crop omits one pixel on each edge to exclude thin grid rules. For example, the second cell of a 600 × 180 three-by-three canvas occupies the following rectangle.
+Each cell includes its one-based row, column name, text, confidence, uncertainty flag, and bounds. Bounds are measured in sampled pixels from the top left of the visible crop. The returned `visible_region` locates that crop in fractions of the full canvas. The crop omits one pixel on each edge to exclude thin grid rules. For example, the second cell of a 600 × 180 three-by-three canvas occupies the following rectangle.
 
 ```json
 {"left":200,"top":0,"width":200,"height":60}
@@ -35,13 +35,13 @@ Each cell includes its one-based row, column name, text, confidence, uncertainty
 
 `confidence` is the lowest Tesseract word score in the cell, on a scale of 0 to 1. A score below 0.80, missing text, or a truncated value sets `uncertain` to true. A uniform or unreadable cell has null text and confidence. Numbers remain strings so callers can inspect the original OCR output.
 
-The spec accepts 1–256 rows and 1–32 distinct column names. Each cell must measure at least 4 × 4 pixels. The result contains up to 64 cells in row-major order and up to 256 characters per cell. Compare `declared_cells`, `returned_cells`, and `truncation_reasons` (`cell_limit` or `cell_text_limit`). Even when `truncated` is false, `dataset_complete` is null. The read covers one visible bitmap and has no evidence about additional rows in the application.
+The spec accepts 1–256 rows and 1–32 distinct column names. Each cell must measure at least 4 × 4 pixels. The result contains up to 64 cells in row-major order and up to 256 characters per cell. Compare `declared_cells`, `returned_cells`, and `truncation_reasons` (`viewport_clip`, `cell_limit`, or `cell_text_limit`). Even when `truncated` is false, `dataset_complete` is null. The read covers one visible bitmap and has no evidence about additional rows in the application.
 
 ## Capture requirements
 
-The canvas must be opaque, origin-clean, in the main document, and entirely visible. Its bitmap must map directly to the screen at one device pixel per CSS pixel, with integral placement, ordinary untransformed layout, and no canvas padding or border. The maximum is 2,048 pixels per side and 2,000,000 pixels in total. Chromium must support compositor visibility tracking and Web Crypto, available in secure contexts such as HTTPS or loopback.
+The reader uses the portion of the canvas visible through the page, its scroll containers and the viewport. Scrolling reveals new rows. CSS resizing, positive axis-aligned scaling and high-DPI displays preserve the declared row and column numbering. Only fully visible cells are returned. The original canvas can exceed the sampling limit of 2,048 pixels per side and 2,000,000 pixels per read.
 
-The reader checks the observed element and capture protections before taking a viewport clip, then rechecks the element and visibility. OCR starts only when the decoded pixels match the digest of the observed canvas bitmap. A protected overlap or an unprovable clip returns an error. The page stays at its current scroll position.
+Chromium checks the observed canvas and its intersection before and after capture. At unit scale the PNG from the compositor must match the canvas bitmap. For scaled or clipped views the reader samples the visible rectangle from the canvas, verifies the bitmap and rejects overlapping content. An opaque, origin-clean canvas in the main document, rectangular clipping, and Web Crypto (HTTPS or loopback) are required. Rotation, perspective, padding, borders and protected overlaps prevent capture. Reads preserve the current scroll position and zoom.
 
 ## Linux acceptance
 
@@ -49,7 +49,7 @@ With Tesseract and `prlimit` installed, set `AAD_TEST_CHROME` to a Chrome for Te
 
 ```powershell
 cargo build --locked -p aad-cli
-node --test --test-concurrency=1 tests/browser/canvas-grid.test.mjs tests/browser/canvas-text.test.mjs
+node --test --test-concurrency=1 tests/browser/canvas-grid.test.mjs tests/browser/canvas-text.test.mjs tests/browser/canvas-viewport.test.mjs
 ```
 
 The headless fixture compares the returned text and cell bounds with the expected ledger, including an unreadable cell. It also checks ambiguity, offscreen placement, pointer-transparent occlusion, a password overlap, bitmap transparency, a cross-origin image, and truncation at 64 cells. [Browser fixture](../../tests/browser/canvas-grid.test.mjs)
