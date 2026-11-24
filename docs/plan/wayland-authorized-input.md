@@ -2,6 +2,8 @@
 
 更新于 2026-11-22。本文涵盖 Qt 5 Widgets 窗口定向输入及 RemoteDesktop 授权传输。
 
+GTK 3 定向键盘和滚轮、GTK 4 语义输入已在本机私有 KWin 会话验收，见 [GTK Wayland 输入范围与效果](../research/gtk-wayland-input.md)。
+
 ## 已验证的 Qt 5 Widgets 输入
 
 启用目标侧插件后，`aad do key` 在已聚焦控件上发送 Qt 按键事件，`aad do click` 支持在通过窗口内命中检查的位置单击、双击左键、中键或右键。控制端重新观察元素，核对原窗口、AT-SPI 唯一总线名与进程，并将请求发往同一应用连接。应用 GUI 线程把目标和窗口路径还原成实际 QWidget，校验当前窗口、焦点或命中后同步派发，释放前复核。Qt 5 自身的 AT-SPI 适配器使用同一套对象 ID 和 D-Bus 连接。[Qt 对象路径解析](https://raw.githubusercontent.com/qt/qtbase/5.15/src/platformsupport/linuxaccessibility/atspiadaptor.cpp) · [Qt 辅助功能连接](https://raw.githubusercontent.com/qt/qtbase/5.15/src/platformsupport/linuxaccessibility/dbusconnection.cpp)
