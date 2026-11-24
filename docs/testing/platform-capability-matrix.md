@@ -1,6 +1,6 @@
 # 平台能力验收矩阵
 
-更新于 2026-11-22。本机已验证 Linux/KDE/X11，另在隔离的 KWin Wayland compositor 中运行了原生 GTK 表单和 Chromium 的 GTK、KDE 文件窗口。
+更新于 2026-11-25。本机已验证 Linux/KDE/X11，另在隔离的 KWin Wayland compositor 中运行了原生 GTK 表单和 Chromium 的 GTK、KDE 文件窗口。
 实现存在、目标 cfg 编译通过、隔离 fixture 通过、真实应用流程通过是不同证据，不互相替代。
 完整变更及未完成工作见 [能力补齐计划](../plan/capability-completion-2026-11-07.md)。
 Electron 的两条恢复路径见 [规范动作与窗口 surface 验证](../research/electron-atspi-canonical-actions-2026-11-07.md)；截图的 scope 边界见 [完整窗口保护说明](../research/scoped-capture-window-protection.md)。
@@ -17,8 +17,10 @@ Electron 的两条恢复路径见 [规范动作与窗口 surface 验证](../rese
 | 本机 Qt/X11 应用缩放 | `597656c` 按准确窗口身份校准逻辑/物理坐标；单显示器 Qt 1/1.5/2 倍应用缩放下的实际点击、F2 与局部 PNG；歧义和 scope 拒绝；8 项标题编码检查；Dolphin 中文目录重命名与 KWrite 中文文件保存经磁盘回读通过 | **[待真机验收]** 混合 DPI 多屏、旋转与热插拔；非 Qt 缩放不在此次校准范围；不证明 Wayland 支持 |
 | 本机 Qt/X11 局部截图 | `2e00547` 私下检查完整所属窗口；4/4 公开入口检查，无覆盖及非重叠密码框时 PNG 像素与尺寸正确，scope 外普通/密码控件覆盖时拒绝；原 scope 继续有效 | 未把私有检查升级为外部节点操作授权；无法完整观察所属窗口时仍拒绝截图；不代表所有第三方自绘界面都能证明无遮挡 |
 | 原生 KWin Wayland 与 GTK 3 | 独立 compositor、关闭 X11 显示连接，经公开 CLI 枚举应用、填写发票号、触发保存。应用回执同时记录了发票号和 GdkWaylandDisplay。[复现入口](../../tests/linux/verify-wayland-form.ps1) | 其他应用的控件语义、物理键鼠、多屏和授权撤销行为需分别验收。 |
+| KWin Wayland GTK 定向输入 | GTK 3.24.38 的应用模块定向发送按键和四向滚轮。已观察到全选后替换、滑块数值变化和按下后焦点变化的处理。GTK 4.8.3 通过控件接口激活按钮、填写多行文本。[控件与模块](../research/gtk-wayland-input.md) | GTK 4 的原始按键与鼠标事件、任意 GTK 控件的拖放。 |
+| KWin Wayland Electron 工作台 | 用 CDP 选定 VS Code 1.146.0 的工作台文档，真实指针点击搜索侧栏，搜索框收到了 Ctrl+A 和退格，选区和内容均有独立回读。[启动和授权](../browser-script.md#在-wayland-上操作-electron-应用窗口) | 未开放 CDP 的应用需依赖其无障碍控件。Electron 原生菜单和跨应用拖放需桌面端支持。 |
 | KWin Wayland 文件窗口 | 选择网页附件、读取原生文件句柄、另存为新文件、选择已有目录。GTK 和 KDE 均核对了实际内容或系统返回的目录 URI。[命令与窗口条件](../browser-recording.md#在已经打开的文件选择器里选文件) | 更多桌面和本地化窗口。 |
-| Wayland 屏幕共享与输入 | `aad assist --desktop --view-only` 可请求共享一块显示器。已验证 PipeWire 流选择、撤销和真实 KWin 共享窗口的取消。Qt 5 Widgets 应用可在启动时加载插件，向观察到的前台控件发按键和指针事件。[插件用法与范围](../../crates/aad-linux/qt-wayland-input/README.md) | **[待验证]** 操作员在真实共享窗口同意后，从查看端核对画面。其他工具包的通用键鼠输入、跨窗口手势和 compositor 级命中校验。[授权输入路线](../plan/wayland-authorized-input.md) |
+| Wayland 屏幕共享与输入 | `aad assist --desktop --view-only` 可请求共享一块显示器。已验证 PipeWire 流选择、撤销和真实 KWin 共享窗口的取消。Qt 5.15.8 和 Qt 6.4.2 的 Widgets 插件可向已确认的控件发按键和指针事件，已验证同进程跨控件及跨窗口复制文本和标准列表项。[插件用法与范围](../../crates/aad-linux/qt-wayland-input/README.md) | **[待验证]** 操作员在真实共享窗口同意后，从查看端核对画面。跨进程拖放和 compositor 级命中校验。[授权输入路线](../plan/wayland-authorized-input.md) |
 
 ## 可以复现的本机检查
 
