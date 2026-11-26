@@ -142,6 +142,13 @@ int main() {
             if (physical) args.insert(args.end(), {"--mode", "keys"});
             const std::string framed = physical ? "text 2\naB" : "text 4\na汉";
             const auto no_proof = invoke(args, false, {}, framed);
+            if (no_proof.code != kExitTargetMismatch || no_proof.presses || no_proof.releases ||
+                before != keyboard_map()) {
+                std::cerr << "Unacknowledged " << (physical ? "keys" : "Unicode")
+                          << " frame exited " << no_proof.code << " with " << no_proof.presses
+                          << " presses, " << no_proof.releases << " releases, restored map="
+                          << (before == keyboard_map()) << ": " << no_proof.output;
+            }
             RequireWindow(no_proof.code == kExitTargetMismatch && no_proof.presses == 0 &&
                           no_proof.releases == 0 && before == keyboard_map(),
                           "typing dispatched before the first ACK");

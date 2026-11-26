@@ -1,0 +1,398 @@
+"""Verify X11 element focus through aad MCP, on a private Xvfb and D-Bus."""
+import argparse
+from contextlib import ExitStack
+import ctypes as c
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+PROVIDER = "desktop.linux_atspi"
+
+
+def emit(stream, kind, **data):
+    print(json.dumps(dict(monotonic_ns=time.monotonic_ns(), kind=kind, **data)),
+          file=stream, flush=True)
+
+
+class X11:
+    def __init__(self):
+        self.api = c.CDLL("libX11.so.6")
+        unsigned, integer, pointer = c.c_ulong, c.c_int, c.c_void_p
+        for name, result, args in (
+            ("XOpenDisplay", pointer, [c.c_char_p]),
+            ("XSetInputFocus", integer, [pointer, unsigned, integer, unsigned]),
+            ("XSync", integer, [pointer, integer]),
+            ("XGetInputFocus", integer, [pointer, c.POINTER(unsigned), c.POINTER(integer)]),
+            ("XQueryKeymap", integer, [pointer, c.c_char_p]),
+        ):
+            fn = getattr(self.api, name)
+            fn.restype, fn.argtypes = result, args
+        self.display = self.api.XOpenDisplay(None)
+        assert self.display
+
+    def focused(self):
+        window, revert = c.c_ulong(), c.c_int()
+        self.api.XGetInputFocus(self.display, c.byref(window), c.byref(revert))
+        return window.value
+
+    def focus(self, window):
+        self.api.XSetInputFocus(self.display, window, 1, 0)
+        self.api.XSync(self.display, 0)
+        assert self.focused() == window
+
+    def keys_down(self):
+        keys = c.create_string_buffer(32)
+        assert self.api.XQueryKeymap(self.display, keys)
+        return [i for i in range(256) if keys.raw[i // 8] & (1 << i % 8)]
+
+
+def fixture(role, state_file):
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("GdkX11", "3.0")
+    from gi.repository import Gdk, GdkX11, GLib, Gtk
+    x = X11()
+    owner = role == "owner"
+    window = Gtk.Window(title="Interrupted input target" if owner else "Interrupted input sink")
+    window.set_default_size(400, 230)
+    window.move(32 if owner else 545, 45)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=12)
+    window.add(box)
+    entries = {}
+    switched = set()
+    current_case = None
+    trigger = state_file.with_suffix(".switch")
+
+    def event(kind, **data):
+        current = json.loads(state_file.read_text())
+        emit(sys.stdout, kind, case=current["case"], role=role, **data)
+        return current
+
+    def keyboard(_widget, ev, tag, phase):
+        current = event("key_" + phase, target=tag, key=Gdk.keyval_name(ev.keyval),
+                        keycode=ev.hardware_keycode, state=int(ev.state), x_time_ms=ev.time)
+        if owner and tag == "Target entry" and phase == "up" and current.get("switch"):
+            if current["case"] not in switched:
+                switched.add(current["case"])
+                if current["switch"] == "sibling":
+                    sibling = entries["Sibling entry"]
+                    sibling.grab_focus()
+                    event("focus_trigger", from_target=tag, to_target="Sibling entry",
+                          sibling_has_focus=sibling.has_focus(), xid=x.focused())
+                else:
+                    x.focus(current["sink_xid"])
+                    event("focus_trigger", from_target=tag, to_target="Sink entry", xid=x.focused())
+        return False
+
+    def focus_event(_widget, _ev, tag, kind):
+        event(kind, target=tag)
+        return False
+
+    for tag in (["Target entry", "Sibling entry"] if owner else ["Sink entry"]):
+        entry = Gtk.Entry()
+        entries[tag] = entry
+        entry.get_accessible().set_name(tag)
+        entry.connect("key-press-event", keyboard, tag, "down")
+        entry.connect("key-release-event", keyboard, tag, "up")
+        entry.connect("changed", lambda widget, name: event("text", target=name, value=widget.get_text()), tag)
+        entry.connect("focus-in-event", focus_event, tag, "focus_in")
+        entry.connect("focus-out-event", focus_event, tag, "focus_out")
+        box.pack_start(entry, False, False, 0)
+    def monitor_case():
+        nonlocal current_case
+        case = json.loads(state_file.read_text())["case"]
+        if case != current_case:
+            current_case = case
+            for entry in entries.values():
+                entry.set_text("")
+            event("reset")
+        if owner and trigger.exists():
+            entries["Sibling entry"].grab_focus()
+            event("focus_trigger", to_target="Sibling entry",
+                  sibling_has_focus=entries["Sibling entry"].has_focus(), xid=x.focused())
+            trigger.unlink()
+        return True
+
+    GLib.timeout_add(3, monitor_case)
+    window.show_all()
+    next(iter(entries.values())).grab_focus()
+    window.get_display().sync()
+    emit(sys.stdout, "ready", role=role, xid=GdkX11.X11Window.get_xid(window.get_window()), pid=os.getpid())
+    Gtk.main()
+
+
+def stop(process):
+    if process.stdin:
+        process.stdin.close()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def until(action, what, seconds=10):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        value = action()
+        if value:
+            return value
+        time.sleep(0.005)
+    raise RuntimeError("timed out waiting for " + what)
+
+
+def read_rows(path):
+    return [json.loads(line) for line in path.read_text().splitlines() if line.endswith("}")]
+
+
+class MCP:
+    def __init__(self, process, log):
+        self.process = process
+        self.log = log
+        self.sequence = 0
+        self.responses = {}
+        threading.Thread(target=self.read, daemon=True).start()
+
+    def read(self):
+        for line in self.process.stdout:
+            row = json.loads(line)
+            self.responses[row["id"]] = row
+
+    def send(self, method, params, notification=False):
+        self.sequence += 1
+        call = dict(jsonrpc="2.0", method=method, params=params)
+        if not notification:
+            call["id"] = self.sequence
+        emit(self.log, "send", rpc=call)
+        self.process.stdin.write(json.dumps(call) + "\n")
+        self.process.stdin.flush()
+        return self.sequence
+
+    def recv(self, sequence):
+        row = until(lambda: self.responses.get(sequence), f"MCP reply {sequence}", 15)
+        emit(self.log, "reply", rpc=row)
+        assert "error" not in row, row
+        result = row["result"]
+        return json.loads(result["content"][0]["text"]) if "content" in result else result
+
+    def tool(self, name, wait=True, **arguments):
+        sequence = self.send("tools/call", dict(name="control_" + name, arguments=arguments))
+        return self.recv(sequence) if wait else sequence
+
+
+def helper_proxy(state_file, helper, args):
+    """Pause the real helper at the first proof request for single-action cases."""
+    case = json.loads(state_file.read_text()).get("case")
+    if case not in {"first_stroke", "chord_refused", "paste_refused"} or "--anchor-token" not in args:
+        os.execv(helper, [helper, *args])
+    with subprocess.Popen([helper, *args], stdout=subprocess.PIPE, text=True) as child:
+        for line in child.stdout:
+            frame = json.loads(line)
+            if frame.get("event") == "validate_segment" and frame["index"] == 0:
+                trigger = state_file.with_suffix(".switch")
+                trigger.touch()
+                until(lambda: not trigger.exists(), "same-window focus switch", seconds=2)
+            print(line, end="", flush=True)
+        return child.wait()
+
+
+def trial(aad, helper, out, baseline):
+    with tempfile.TemporaryDirectory(prefix="aad-element-focus-") as scratch, ExitStack() as stack:
+        root = Path(scratch)
+        for name in ("RUNTIME", "CACHE_HOME", "DATA_HOME", "CONFIG_HOME", "STATE_HOME"):
+            child = root / name.lower()
+            child.mkdir(mode=0o700)
+            os.environ["XDG_RUNTIME_DIR" if name == "RUNTIME" else f"XDG_{name}"] = str(child)
+        os.environ.update(GDK_BACKEND="x11", XDG_SESSION_TYPE="x11", GTK_IM_MODULE="simple")
+        for key in ("AT_SPI_BUS_ADDRESS", "WAYLAND_DISPLAY", "NO_AT_BRIDGE", "GTK_A11Y",
+                    "GTK_MODULES", "QT_IM_MODULE", "XMODIFIERS"):
+            os.environ.pop(key, None)
+        events = {role: out / f"{role}.ndjson" for role in ("owner", "sink")}
+        state_file = root / "case.json"
+        proxy = root / "helper"
+        proxy_args = [sys.executable, str(Path(__file__).resolve()), "helper-proxy",
+                      str(state_file), helper]
+        proxy.write_text(f"#!{sys.executable}\nimport os, sys\n"
+                         f"os.execv({sys.executable!r}, {proxy_args!r} + sys.argv[1:])\n")
+        proxy.chmod(0o700)
+        os.environ["AAD_LINUX_XTEST_HELPER"] = str(proxy)
+        log = stack.enter_context((out / "mcp.ndjson").open("w"))
+        checkpoints = stack.enter_context((out / "checks.ndjson").open("w"))
+        diagnostics = stack.enter_context((out / "diagnostics.log").open("w"))
+
+        def set_case(name, **values):
+            updated = state_file.with_suffix(".tmp")
+            updated.write_text(json.dumps(dict(case=name, **values)))
+            updated.replace(state_file)
+            emit(checkpoints, "case", case=name)
+
+        def rows(role, case):
+            return [r for r in read_rows(events[role]) if r.get("case") == case]
+
+        set_case("startup")
+        fixtures = {}
+        for role, path in events.items():
+            stream = stack.enter_context(path.open("w"))
+            app = subprocess.Popen([sys.executable, __file__, "fixture", role, str(state_file)],
+                                   stdout=stream, stderr=diagnostics)
+            stack.callback(stop, app)
+            fixtures[role] = until(lambda: next((r for r in read_rows(path) if r["kind"] == "ready"), None),
+                                   f"{role} GTK fixture")
+        x = X11()
+        x.focus(fixtures["owner"]["xid"])
+
+        server = subprocess.Popen([aad, "mcp", "--provider", PROVIDER, "--allow-input"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=diagnostics, text=True)
+        stack.callback(stop, server)
+        mcp = MCP(server, log)
+        mcp.recv(mcp.send("initialize", dict(protocolVersion="2025-03-26", capabilities={},
+                                            clientInfo=dict(name="aad-x11-interruption-trial", version="1"))))
+        mcp.send("notifications/initialized", {}, notification=True)
+        mcp.tool("capabilities")
+
+        def find_resource():
+            reply = mcp.tool("targets", provider=PROVIDER)
+            found = [r for r in (reply.get("data") or {}).get("resources", [])
+                     if r["metadata"].get("process_id") == fixtures["owner"]["pid"]]
+            assert len(found) <= 1, found
+            return found[0]["resource_id"] if found else None
+
+        resource = until(find_resource, "owner's AT-SPI resource")
+        emit(checkpoints, "fixture", display=os.environ["DISPLAY"], windows=fixtures, resource=resource)
+
+        def observed_nodes():
+            reply = mcp.tool("observe", resource_id=resource, max_nodes=100, view=dict(mode="nodes"))
+            assert not reply.get("error"), reply
+            return reply["data"]["nodes"]
+
+        def entries():
+            return {node["name"]: node for node in observed_nodes()
+                    if node.get("name") in {"Target entry", "Sibling entry"}}
+
+        def run(case, action, target=None, **switch):
+            x.focus(fixtures["owner"]["xid"])
+            set_case(case, **switch)
+            until(lambda: all(any(r["kind"] == "reset" for r in rows(role, case))
+                              for role in events), f"{case} reset")
+            if target is None:
+                target = entries()["Target entry"]["target"]
+            start = time.monotonic_ns()
+            reply = mcp.tool("act", request_id=case, target=target, action=action)
+            elapsed_ms = (time.monotonic_ns() - start) / 1e6
+            values = {name: node.get("value") for name, node in entries().items()}
+            widgets = rows("owner", case) + rows("sink", case)
+            presses = [row for row in widgets if row["kind"] == "key_down"]
+            span_ms = (presses[-1]["monotonic_ns"] - presses[0]["monotonic_ns"]) / 1e6 if presses else 0
+            held = x.keys_down()
+            emit(checkpoints, "outcome", case=case, response=reply, values=values,
+                 elapsed_ms=elapsed_ms, key_span_ms=span_ms, presses=len(presses), keys_down=held)
+            print(f"{case}: {reply.get('effect')}, {len(presses)} presses, "
+                  f"{elapsed_ms:.1f} ms MCP, {span_ms:.1f} ms between first and last press", flush=True)
+            assert not held, held
+            return reply, values, presses
+
+        def type_text(case, text, mode="unicode", **kwargs):
+            return run(case, dict(type="type_text", text=text, mode=mode), **kwargs)
+
+        def typed(case, text, mode="unicode"):
+            reply, values, presses = type_text(case, text, mode)
+            assert reply.get("effect") == "applied", reply
+            assert values == {"Target entry": text, "Sibling entry": ""}, values
+            assert all(row["target"] == "Target entry" for row in presses), presses
+            if not baseline:
+                progress = reply["data"]["backend_result"]["backend_result"]["input"]["input_progress"]
+                assert progress["delivered"] == progress["total"] == len(text) and progress["released"], progress
+
+        def denied(reply, code, cause, delivered, total, effect):
+            error = reply["error"]
+            assert error["code"] == code and reply["effect"] == effect, reply
+            assert error["details"].get(cause[0]) == cause[1], reply
+            progress = error["details"]["input_progress"]
+            assert (progress["delivered"], progress["total"], progress["released"]) == (delivered, total, True), reply
+
+        old = entries()["Target entry"]["target"]
+        assert old != entries()["Target entry"]["target"]
+        reply, _, presses = type_text("stale", "stale-input", target=old)
+        assert reply["error"]["code"] == "CONTROL.STALE_TARGET" and not presses, reply
+        for mode, text in [("unicode", "abcdefghi"), ("keys", "aBcdEfgHi")]:
+            case = f"sibling_{mode}"
+            reply, values, presses = type_text(case, text, mode, switch="sibling")
+            focus = next(r for r in rows("owner", case) if r["kind"] == "focus_trigger")
+            assert focus["xid"] == fixtures["owner"]["xid"] and focus["sibling_has_focus"], focus
+            if baseline:
+                assert reply["effect"] == "applied" and reply["commit_state"] == "committed", reply
+                assert values == {"Target entry": text[0], "Sibling entry": text[1:]}, values
+            else:
+                denied(reply, "DRIVER.UNKNOWN_EFFECT", ("cause", "focused_element_changed"), 1, 9, "unknown")
+                assert values == {"Target entry": text[0], "Sibling entry": ""}, values
+                assert [(r["target"], r["key"]) for r in presses] == [("Target entry", text[0])], presses
+            typed(f"reobserved_{mode}", text, mode)
+
+        typed("unicode_non_ascii", "a汉éΩ")
+        typed("long_text", ("abcdefghi" * 114)[:1024])
+        if not baseline:
+            reply, values, presses = type_text("cross_process", "klmnopqrs", switch="window",
+                                               sink_xid=fixtures["sink"]["xid"])
+            denied(reply, "DRIVER.UNKNOWN_EFFECT", ("helper_code", "focus_owner_changed"), 1, 9, "unknown")
+            assert values == {"Target entry": "k", "Sibling entry": ""}, values
+            assert [(r["target"], r["key"]) for r in presses] == [("Target entry", "k")], presses
+            typed("cross_process_reobserved", "normal")
+
+            subprocess.run(["xclip", "-selection", "clipboard"], input=b"original clip", check=True)
+            for case, action, total in (
+                ("first_stroke", dict(type="type_text", text="abc"), 3),
+                ("chord_refused", dict(type="key", keys=["ctrl", "a"]), 1),
+                ("paste_refused", dict(type="paste", text="must not be inserted"), 1),
+            ):
+                reply, values, presses = run(case, action)
+                denied(reply, "DRIVER.FOCUS_LOST", ("cause", "focused_element_changed"), 0, total, "not_applied")
+                assert values == {"Target entry": "", "Sibling entry": ""} and not presses, (values, presses)
+            assert subprocess.check_output(["xclip", "-selection", "clipboard", "-o"]) == b"original clip"
+            reply, values, presses = run("paste_reobserved", dict(type="paste", text="粘贴"))
+            assert reply["effect"] == "applied" and values == {"Target entry": "粘贴", "Sibling entry": ""}, reply
+            assert subprocess.check_output(["xclip", "-selection", "clipboard", "-o"]) == b"original clip"
+            reply, _, presses = run("chord_reobserved", dict(type="key", keys=["f2"]))
+            assert reply["effect"] == "applied" and [r["key"] for r in presses] == ["F2"], reply
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else None
+    if mode == "fixture":
+        fixture(sys.argv[2], Path(sys.argv[3]))
+    elif mode == "helper-proxy":
+        sys.exit(helper_proxy(Path(sys.argv[2]), sys.argv[3], sys.argv[4:]))
+    elif mode == "private-session":
+        if (os.environ["DISPLAY"] in {":10", os.environ["AAD_CALLER_DISPLAY"]}
+                or os.environ["DBUS_SESSION_BUS_ADDRESS"] == os.environ["AAD_CALLER_BUS"]
+                or os.environ["XAUTHORITY"] == os.environ["AAD_CALLER_XAUTHORITY"]):
+            raise RuntimeError("the fixture requires a private Xvfb and D-Bus session")
+        trial(sys.argv[2], sys.argv[3], Path(sys.argv[4]), "--baseline" in sys.argv[5:])
+    else:
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("aad", type=Path)
+        parser.add_argument("helper", type=Path)
+        parser.add_argument("output", type=Path)
+        parser.add_argument("--baseline", action="store_true")
+        args = parser.parse_args()
+        args.output.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, AAD_CALLER_DISPLAY=os.environ.get("DISPLAY", ""),
+                   AAD_CALLER_BUS=os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""),
+                   AAD_CALLER_XAUTHORITY=os.environ.get("XAUTHORITY", ""))
+        command = ["xvfb-run", "-a", "--server-args=-screen 0 1024x768x24 -nolisten tcp",
+                   "dbus-run-session", "--", sys.executable, str(Path(__file__).resolve()),
+                   "private-session", str(args.aad.resolve()), str(args.helper.resolve()),
+                   str(args.output.resolve())]
+        if args.baseline:
+            command.append("--baseline")
+        sys.exit(subprocess.call(command, env=env))
