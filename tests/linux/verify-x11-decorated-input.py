@@ -156,11 +156,11 @@ def window_actions(aad):
                 assert len(nodes) == 1, response
                 return nodes[0]
 
-            def act(node, action, xid, binding="geometry"):
+            def act(node, action, xid):
                 response = call("act", target=node["target"], action={"type": action})
                 assert response["effect"] == "applied", response
                 result = response["data"]["backend_result"]["backend_result"]
-                assert result["window"] == int(xid, 16) and result["window_binding"] == binding, result
+                assert result["window"] == int(xid, 16) and result["window_binding"] == "geometry", result
 
             act(observe(PRIMARY), "activate", primary)
             assert primary in xprop("-root", "_NET_ACTIVE_WINDOW")
@@ -197,31 +197,23 @@ def window_actions(aad):
                                        str(time.monotonic_ns() + 3_000_000_000), *options],
                                       capture_output=True, text=True, timeout=5)
 
-            observed = json.loads(helper("window-info", "--geometry-proof", "1").stdout)
-            assert observed["window_binding"] == "single_client_fallback", observed
-            assert not observed["supports"]["close"] and not observed["supports"]["minimize"], observed
-            for name in ("close", "minimize", "maximize"):
-                denied = helper("window-action", "--action", name)
-                assert denied.returncode == 73 and json.loads(denied.stdout)["dispatch_started"] is False, denied
+            def rejected(response):
+                assert response.returncode == 73, response
+                reply = json.loads(response.stdout)
+                assert reply["dispatch_started"] is False, reply
+
+            rejected(helper("window-info"))
+            rejected(helper("window-info", "--geometry-proof", "1"))
             act(observe(SIBLING), "minimize", sibling)
             assert state(sibling) == (True, False)
-            restore = helper("window-action", "--action", "restore", "--window-id", str(int(sibling, 16)),
-                             "--single-client-fallback", "1")
-            reply = json.loads(restore.stdout.splitlines()[-1])
-            assert restore.returncode == 0 and reply["reached"] and reply["window_binding"] == "single_client_fallback", reply
+            active = xprop("-root", "_NET_ACTIVE_WINDOW")
+            for name in ("close", "minimize", "maximize", "restore", "activate"):
+                rejected(helper("window-action", "--action", name))
+                assert state(sibling) == (True, False) and xprop("-root", "_NET_ACTIVE_WINDOW") == active
+            print("PASS single-client mismatched window actions dispatched nothing and left EWMH state unchanged", flush=True)
+            act(observe(SIBLING), "restore", sibling)
             assert state(sibling) == (False, False)
-            act(observe(SIBLING), "minimize", sibling)
-            restore_target = observe(SIBLING)
-            act(restore_target, "restore", sibling,
-                restore_target["provenance"]["window"]["window_binding"])
-            assert state(sibling) == (False, False)
-            act(observe(SIBLING), "minimize", sibling)
-            activate = helper("window-action", "--action", "activate", "--window-id", str(int(sibling, 16)),
-                              "--single-client-fallback", "1")
-            reply = json.loads(activate.stdout.splitlines()[-1])
-            assert activate.returncode == 0 and reply["reached"] and reply["window_binding"] == "single_client_fallback", reply
-            assert state(sibling) == (False, False) and sibling in xprop("-root", "_NET_ACTIVE_WINDOW")
-            print("PASS single-client fallback restore and activate; mismatched close, minimize and maximize rejected", flush=True)
+            print("PASS minimized client with matching geometry restored from a fresh observation", flush=True)
         finally:
             control.terminate()
             gtk.terminate()
@@ -281,6 +273,10 @@ def run(aad):
             window_actions(aad)
         finally:
             wm.terminate()
+            try:
+                wm.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                wm.kill()
 
 
 if __name__ == "__main__":

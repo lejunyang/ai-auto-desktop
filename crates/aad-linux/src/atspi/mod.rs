@@ -94,7 +94,7 @@ pub struct WindowAnchor {
 #[derive(Clone, Debug, PartialEq)]
 pub struct X11WindowBinding {
     client: u32,
-    proof: Option<Value>,
+    proof: Value,
 }
 
 /// Private native path: source, intermediate anchors, then destination. Every
@@ -3878,7 +3878,7 @@ mod tests {
             [1, 2].into_iter().map(|index| {
                 (index, X11WindowBinding {
                     client: index as u32,
-                    proof: Some(json!({"client_bounds": snapshot.nodes[index].bounds.unwrap().to_json()})),
+                            proof: json!({"client_bounds": snapshot.nodes[index].bounds.unwrap().to_json()}),
                 })
             }).collect()
         }

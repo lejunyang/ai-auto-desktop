@@ -225,20 +225,19 @@ std::optional<std::vector<Window>> OwnedWindows(const Ewmh &ewmh, unsigned long 
 struct WindowResolution {
     Window client = None;
     std::optional<WindowGeometryProof> proof;
-    bool fallback = false;
     std::string_view problem = "window_not_found";
 };
 
 WindowResolution ResolveWindow(const Ewmh &ewmh, unsigned long pid, const Geometry &observed,
-                               bool include_frames, bool allow_single = false) {
+                               bool include_frames) {
     const auto owned = OwnedWindows(ewmh, pid);
-    if (!owned || !ValidGeometry(observed)) return {None, {}, false, "window_inventory_unproven"};
+    if (!owned || !ValidGeometry(observed)) return {None, {}, "window_inventory_unproven"};
     WindowResolution match;
     for (Window window : *owned) {
         std::optional<WindowGeometryProof> proof;
         if (include_frames) {
             proof = ReadClientGeometry(ewmh, window, pid, observed);
-            if (!proof) return {None, {}, false, "window_mapping_unproven"};
+            if (!proof) return {None, {}, "window_mapping_unproven"};
             if (GeometryMatches(proof->client_bounds, observed, 2)) {
                 proof->observed_window = window;
             } else {
@@ -249,16 +248,12 @@ WindowResolution ResolveWindow(const Ewmh &ewmh, unsigned long pid, const Geomet
             if (!proof->observed_window) continue;
         } else {
             const auto geometry = RootGeometry(ewmh.display, window);
-            if (!geometry || !ValidGeometry(*geometry)) return {None, {}, false, "window_mapping_unproven"};
+            if (!geometry || !ValidGeometry(*geometry)) return {None, {}, "window_mapping_unproven"};
             if (!GeometryMatches(*geometry, observed, 2)) continue;
         }
-        if (match.client != None) return {None, {}, false, "window_ambiguous"};
+        if (match.client != None) return {None, {}, "window_ambiguous"};
         match.client = window;
         match.proof = std::move(proof);
-    }
-    if (match.client == None && allow_single && owned->size() == 1) {
-        match.client = owned->front();
-        match.fallback = true;
     }
     return match;
 }

@@ -1684,7 +1684,6 @@ struct WindowArgs {
     bool request_proof = false;
     Window expected_window = None;
     std::string proof;
-    bool single_client_fallback = false;
 };
 
 std::optional<WindowArgs> ParseWindowArgs(int argc, char **argv, bool action) {
@@ -1694,7 +1693,6 @@ std::optional<WindowArgs> ParseWindowArgs(int argc, char **argv, bool action) {
         allowed.push_back("action");
         allowed.push_back("window-id");
         allowed.push_back("window-proof");
-        allowed.push_back("single-client-fallback");
     } else {
         allowed.push_back("geometry-proof");
     }
@@ -1734,14 +1732,7 @@ std::optional<WindowArgs> ParseWindowArgs(int argc, char **argv, bool action) {
             if (proof->empty() || proof->size() > kMaxGeometryProofBytes) return std::nullopt;
             parsed.proof = *proof;
         }
-        if (const auto fallback = Pair(*pairs, "single-client-fallback")) {
-            if (*fallback != "1" || (parsed.action != "activate" && parsed.action != "restore")) {
-                return std::nullopt;
-            }
-            parsed.single_client_fallback = true;
-        }
-        if ((parsed.single_client_fallback && !parsed.proof.empty()) ||
-            ((parsed.expected_window != None) != (parsed.single_client_fallback || !parsed.proof.empty()))) {
+        if ((parsed.expected_window != None) != !parsed.proof.empty()) {
             return std::nullopt;
         }
     }
@@ -1786,16 +1777,12 @@ int RunWindow(std::string_view command, int argc, char **argv) {
     }
     const Ewmh ewmh = LoadEwmh(display);
     const auto pid = static_cast<unsigned long>(args->pid);
-    const bool safe_fallback = args->action == "activate" || args->action == "restore";
     const auto resolve = [&] {
         const bool anchored = args->expected_window != None;
-        auto result = ResolveWindow(LoadEwmh(display), pid, args->geometry,
-                                    args->request_proof || anchored,
-                                    !action || (anchored ? args->single_client_fallback : safe_fallback));
+        auto result = ResolveWindow(LoadEwmh(display), pid, args->geometry, args->request_proof || anchored);
         if (anchored && (result.client != args->expected_window ||
-            result.fallback != args->single_client_fallback ||
-            (!result.fallback && (!result.proof || GeometryProofJson(*result.proof) != args->proof)))) {
-            return WindowResolution{None, {}, false, "target_window_changed"};
+            !result.proof || GeometryProofJson(*result.proof) != args->proof)) {
+            return WindowResolution{None, {}, "target_window_changed"};
         }
         return result;
     };
@@ -1806,7 +1793,6 @@ int RunWindow(std::string_view command, int argc, char **argv) {
         return kExitTargetMismatch;
     }
     const WindowState before = ReadWindowState(ewmh, window.client);
-    const auto binding_mode = window.fallback ? "single_client_fallback" : "geometry";
     const bool maximize = Contains(ewmh.supported, ewmh.net_wm_state) &&
                           Contains(ewmh.supported, ewmh.max_vert) &&
                           Contains(ewmh.supported, ewmh.max_horz);
@@ -1814,13 +1800,13 @@ int RunWindow(std::string_view command, int argc, char **argv) {
     const bool close = Contains(ewmh.supported, ewmh.close);
     if (!action) {
         std::cout << "{\"ok\":true,\"window\":" << window.client
-                  << ",\"window_binding\":\"" << binding_mode << "\""
+                  << ",\"window_binding\":\"geometry\""
                   << ",\"ewmh\":" << (ewmh.present ? "true" : "false")
-                  << ",\"supports\":{\"minimize\":" << (ewmh.present && !window.fallback ? "true" : "false")
-                  << ",\"maximize\":" << (maximize && !window.fallback ? "true" : "false")
+                  << ",\"supports\":{\"minimize\":" << (ewmh.present ? "true" : "false")
+                  << ",\"maximize\":" << (maximize ? "true" : "false")
                   << ",\"restore\":" << ((before.minimized ? activate : maximize) ? "true" : "false")
                   << ",\"activate\":" << (activate ? "true" : "false")
-                  << ",\"close\":" << (close && !window.fallback ? "true" : "false") << "}," << StateJson(before)
+                  << ",\"close\":" << (close ? "true" : "false") << "}," << StateJson(before)
                   << WindowTitleJson(display, window.client);
         if (window.proof) std::cout << ",\"geometry_proof\":" << GeometryProofJson(*window.proof);
         std::cout << "}" << std::endl;
@@ -1840,7 +1826,7 @@ int RunWindow(std::string_view command, int argc, char **argv) {
         return kExitUnavailable;
     }
     const auto current = resolve();
-    if (!before.exists || current.client != window.client || current.fallback != window.fallback) {
+    if (!before.exists || current.client != window.client) {
         XCloseDisplay(display);
         EmitError("target_window_changed", "target_preflight", false);
         return kExitTargetMismatch;
@@ -1911,7 +1897,7 @@ int RunWindow(std::string_view command, int argc, char **argv) {
         return kExitUnknownEffect;
     }
     std::cout << "{\"ok\":true,\"dispatch_started\":true,\"events\":1,\"window\":" << target
-              << ",\"window_binding\":\"" << binding_mode << "\""
+              << ",\"window_binding\":\"geometry\""
               << ",\"action\":\"" << name << "\",\"reached\":" << (reached ? "true" : "false")
               << "," << StateJson(after) << "}" << std::endl;
     return 0;

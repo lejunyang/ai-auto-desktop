@@ -135,7 +135,7 @@ frame 必须为端点的真实祖先、与 WM check 窗口属于同一 X 客户�
 | --- | --- | --- |
 | `capture` | 上述 X11 root XGetImage，按 fresh bounds 裁剪 | protected 子树、被别的窗口或子树外可见节点覆盖、非 showing 均拒绝；最小化窗口不可截 |
 | `read_text` | 会话对 capture 的 PNG 运行 `aad-ocr`（Tesseract，`prlimit` 资源限制）；BCP-47 映射为 traineddata（en→eng、zh-Hans→chi_sim 等） | 没有 tesseract 或 prlimit 时 `reads` 不列 `read_text`，调用返回 `DRIVER.OCR_UNAVAILABLE`；缺语言数据时同码并列出 `available_languages` |
-| 窗口动作 | EWMH 窗口管理器按顶层观察中冻结的 client 与外框证明执行最小化、最大化、恢复、激活或关闭，最多 3 秒读回 `WM_STATE`、`_NET_WM_STATE`、`_NET_ACTIVE_WINDOW` 或窗口是否消失 | 恢复和激活在几何失配且完整清单中只有一个同 PID client 时可用，回包标为 `window_binding: "single_client_fallback"`。其他窗口动作需要几何证明。证明失效时拒绝派发，状态没达到时返回 `DRIVER.UNKNOWN_EFFECT` |
+| 窗口动作 | EWMH 窗口管理器按顶层观察中冻结的 client 与外框证明执行最小化、最大化、恢复、激活或关闭，最多 3 秒读回 `WM_STATE`、`_NET_WM_STATE`、`_NET_ACTIVE_WINDOW` 或窗口是否消失 | 最小化窗口在几何仍能唯一对应时可恢复。几何失配时隐藏窗口动作，证明失效时拒绝派发。状态没达到时返回 `DRIVER.UNKNOWN_EFFECT` |
 | `paste` | 聚焦后 helper 先保存 CLIPBOARD 现有全部 target（单项不超过一次请求、合计 ≤32 MiB，否则 `DRIVER.CLIPBOARD_TOO_LARGE` 不粘贴），以真实时间戳占有 CLIPBOARD，只向拥有目标进程焦点窗口的同一 X client（`_NET_WM_PID`，或与该窗口同一 resource-id 基址——Qt/GTK 的取数窗口没有 pid 属性）提供文字，证明焦点后发 Ctrl+V；之后由一个脱离的 restorer 进程持有原内容直到别人占有剪贴板（最长 1 小时） | 目标始终没来取：`DRIVER.PASTE_NOT_CONSUMED`、effect unknown；protected 元素不提供；原先没有 owner 时恢复为无 owner |
 | `clipboard_read` | 读 CLIPBOARD 的 UTF8_STRING（否则 STRING），有界 | 带 `x-kde-passwordManagerHint`（KDE / KeePassXC 的密码标记）时 `DRIVER.CLIPBOARD_PROTECTED`；INCR 大选区 `DRIVER.CLIPBOARD_TOO_LARGE` |
 | `global_key` | XTest 组合键发给当前焦点，不锚定元素 | 拒绝 Ctrl+Alt+Backspace（X zap）、Ctrl+Alt+Delete、Ctrl+Alt+L、Super+L（`DRIVER.KEY_RESERVED`）；结果 `verified: false` |

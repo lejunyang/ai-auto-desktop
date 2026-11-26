@@ -1862,18 +1862,11 @@ impl AtspiBackend for LinuxBackend {
                 )
             })?;
         let mut args = window_args("window-action", process_id, bounds);
-        args.extend(["--window-id".into(), binding.client.to_string()]);
-        if let Some(proof) = &binding.proof {
-            args.extend(["--window-proof".into(), proof.to_string()]);
-        } else if matches!(action, "activate" | "restore") {
-            args.extend(["--single-client-fallback".into(), "1".into()]);
-        } else {
-            return Err(driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                "window action requires matching geometry",
-            ));
-        }
         args.extend([
+            "--window-id".into(),
+            binding.client.to_string(),
+            "--window-proof".into(),
+            binding.input_proof().to_string(),
             "--action".into(),
             if action == "close_window" {
                 "close"
@@ -1895,7 +1888,7 @@ impl AtspiBackend for LinuxBackend {
         let result = parse_input_helper(output, "window_dispatch", 1, process_id)?;
         if result["reached"] != true
             || result["window"] != binding.client
-            || result["window_binding"] != binding.mode()
+            || result["window_binding"] != "geometry"
         {
             return Err(driver_error(
                 "DRIVER.UNKNOWN_EFFECT",
