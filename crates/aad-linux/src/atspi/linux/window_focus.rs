@@ -84,11 +84,17 @@ impl LinuxBackend {
         })?;
         let focus = self.focus(target, Some(window), deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-        // Resolve the native window here. The first handshake proves the
-        // element and can report a focus change before any stroke was sent.
+        // Prove native window focus here. The first handshake rechecks the
+        // element before authorizing any stroke.
         let window_id = self
             .verify_window_with_helper(target, window, process_id, deadline, &support.path)
-            .map_err(after_focus)?;
+            .map_err(|error| {
+                if error.code == "DRIVER.FOCUS_LOST" {
+                    error
+                } else {
+                    after_focus(error)
+                }
+            })?;
         append_window_args(args, window, Some(window_id));
         Ok((support.path, focus))
     }
@@ -298,13 +304,24 @@ impl LinuxBackend {
             XTEST_OUTPUT_LIMIT,
         )?;
         let proof = parse_one_json_object(&output.stdout, "focus info")?;
-        if !output.status.success() || !valid_focus_proof(&proof, process_id) {
+        let Some((id, focused)) =
+            bound_window_focus(&proof, process_id).filter(|_| output.status.success())
+        else {
             return Err(driver_error(
                 "DRIVER.ACTION_UNSUPPORTED",
                 "native input focus is not proven for the observed window",
             ));
+        };
+        if !focused {
+            return Err(driver_error(
+                "DRIVER.FOCUS_LOST",
+                "keyboard focus moved outside the observed X11 window",
+            )
+            .with_detail("helper_code", json!("focus_owner_changed"))
+            .with_detail("proven_window", json!(id))
+            .with_detail("dispatch_started", json!(false)));
         }
-        Ok(proof["window"].as_u64().expect("validated window proof"))
+        Ok(id)
     }
 
     pub(super) fn verify_focused(

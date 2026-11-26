@@ -191,8 +191,13 @@ class MCP:
 
 
 def helper_proxy(state_file, helper, args):
-    """Pause the real helper at the first proof request for single-action cases."""
-    case = json.loads(state_file.read_text()).get("case")
+    """Switch focus at a native preflight or first element proof."""
+    current = json.loads(state_file.read_text())
+    case = current["case"]
+    if case == "first_stroke_cross_window" and args[0] == "focus-info":
+        x = X11()
+        assert x.focused() == current["owner_xid"]
+        x.focus(current["sink_xid"])
     if case not in {"first_stroke", "chord_refused", "paste_refused"} or "--anchor-token" not in args:
         os.execv(helper, [helper, *args])
     with subprocess.Popen([helper, *args], stdout=subprocess.PIPE, text=True) as child:
@@ -206,7 +211,7 @@ def helper_proxy(state_file, helper, args):
         return child.wait()
 
 
-def trial(aad, helper, out, baseline):
+def trial(aad, helper, out, baseline, scenario):
     with tempfile.TemporaryDirectory(prefix="aad-element-focus-") as scratch, ExitStack() as stack:
         root = Path(scratch)
         for name in ("RUNTIME", "CACHE_HOME", "DATA_HOME", "CONFIG_HOME", "STATE_HOME"):
@@ -321,6 +326,22 @@ def trial(aad, helper, out, baseline):
             progress = error["details"]["input_progress"]
             assert (progress["delivered"], progress["total"], progress["released"]) == (delivered, total, True), reply
 
+        def first_stroke_cross_window():
+            reply, values, presses = type_text("first_stroke_cross_window", "abc",
+                                               owner_xid=fixtures["owner"]["xid"],
+                                               sink_xid=fixtures["sink"]["xid"])
+            error = reply["error"]
+            assert reply["effect"] == "not_applied" and error["code"] == "DRIVER.FOCUS_LOST", reply
+            details = error["details"]
+            assert (details["helper_code"], details["dispatch_started"], details["proven_window"]) == (
+                "focus_owner_changed", False, fixtures["owner"]["xid"]), reply
+            assert values == {"Target entry": "", "Sibling entry": ""} and not presses, (values, presses)
+
+        if scenario == "window-preflight":
+            first_stroke_cross_window()
+            typed("window_preflight_reobserved", "abc")
+            return
+
         old = entries()["Target entry"]["target"]
         assert old != entries()["Target entry"]["target"]
         reply, _, presses = type_text("stale", "stale-input", target=old)
@@ -342,6 +363,7 @@ def trial(aad, helper, out, baseline):
         typed("unicode_non_ascii", "a汉éΩ")
         typed("long_text", ("abcdefghi" * 114)[:1024])
         if not baseline:
+            first_stroke_cross_window()
             reply, values, presses = type_text("cross_process", "klmnopqrs", switch="window",
                                                sink_xid=fixtures["sink"]["xid"])
             denied(reply, "DRIVER.UNKNOWN_EFFECT", ("helper_code", "focus_owner_changed"), 1, 9, "unknown")
@@ -377,14 +399,17 @@ if __name__ == "__main__":
                 or os.environ["DBUS_SESSION_BUS_ADDRESS"] == os.environ["AAD_CALLER_BUS"]
                 or os.environ["XAUTHORITY"] == os.environ["AAD_CALLER_XAUTHORITY"]):
             raise RuntimeError("the fixture requires a private Xvfb and D-Bus session")
-        trial(sys.argv[2], sys.argv[3], Path(sys.argv[4]), "--baseline" in sys.argv[5:])
+        trial(sys.argv[2], sys.argv[3], Path(sys.argv[4]), "--baseline" in sys.argv[6:], sys.argv[5])
     else:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("aad", type=Path)
         parser.add_argument("helper", type=Path)
         parser.add_argument("output", type=Path)
         parser.add_argument("--baseline", action="store_true")
+        parser.add_argument("--scenario", choices=["full", "window-preflight"], default="full")
         args = parser.parse_args()
+        if args.baseline and args.scenario != "full":
+            parser.error("--baseline requires the full scenario")
         args.output.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, AAD_CALLER_DISPLAY=os.environ.get("DISPLAY", ""),
                    AAD_CALLER_BUS=os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""),
@@ -392,7 +417,7 @@ if __name__ == "__main__":
         command = ["xvfb-run", "-a", "--server-args=-screen 0 1024x768x24 -nolisten tcp",
                    "dbus-run-session", "--", sys.executable, str(Path(__file__).resolve()),
                    "private-session", str(args.aad.resolve()), str(args.helper.resolve()),
-                   str(args.output.resolve())]
+                   str(args.output.resolve()), args.scenario]
         if args.baseline:
             command.append("--baseline")
         sys.exit(subprocess.call(command, env=env))

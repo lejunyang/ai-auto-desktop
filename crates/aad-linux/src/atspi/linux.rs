@@ -2634,16 +2634,17 @@ fn terminate_with_grace(child: &mut Child, grace: Duration) -> bool {
     false
 }
 
-fn valid_focus_proof(proof: &Map<String, Value>, process_id: u32) -> bool {
-    proof.get("ok") == Some(&Value::Bool(true))
-        && proof.get("focused") == Some(&Value::Bool(true))
-        && proof.get("expected_pid").and_then(Value::as_u64) == Some(u64::from(process_id))
-        && proof.get("window_bound") == Some(&Value::Bool(true))
-        && proof
-            .get("window")
-            .and_then(Value::as_u64)
-            .is_some_and(|id| id > 0 && id <= u64::from(u32::MAX))
-        && !proof.contains_key("dispatch_started")
+fn bound_window_focus(proof: &Map<String, Value>, process_id: u32) -> Option<(u64, bool)> {
+    if proof.get("ok") != Some(&Value::Bool(true))
+        || proof.get("expected_pid").and_then(Value::as_u64) != Some(u64::from(process_id))
+        || proof.get("window_bound") != Some(&Value::Bool(true))
+        || proof.contains_key("dispatch_started")
+    {
+        return None;
+    }
+    let id = proof.get("window")?.as_u64()?;
+    let focused = proof.get("focused")?.as_bool()?;
+    (id > 0 && id <= u64::from(u32::MAX)).then_some((id, focused))
 }
 
 fn parse_input_helper(
@@ -3892,38 +3893,42 @@ mod capture_tests {
         for (proof, expected) in [
             (
                 json!({"ok": true, "focused": true, "expected_pid": 42}),
-                false,
+                None,
             ),
             (
                 json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": true, "window": 123}),
-                true,
+                Some((123, true)),
+            ),
+            (
+                json!({"ok": true, "focused": false, "expected_pid": 42, "window_bound": true, "window": 123}),
+                Some((123, false)),
             ),
             (
                 json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": true, "window": 0}),
-                false,
+                None,
             ),
             (
                 json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": false, "window": 123}),
-                false,
+                None,
             ),
             (
                 json!({"ok": true, "focused": false, "expected_pid": 42}),
-                false,
+                None,
             ),
             (
                 json!({"ok": true, "focused": true, "expected_pid": 43}),
-                false,
+                None,
             ),
             (
                 json!({"ok": false, "focused": true, "expected_pid": 42}),
-                false,
+                None,
             ),
             (
                 json!({"ok": true, "focused": true, "expected_pid": 42, "dispatch_started": false}),
-                false,
+                None,
             ),
         ] {
-            assert_eq!(valid_focus_proof(proof.as_object().unwrap(), 42), expected);
+            assert_eq!(bound_window_focus(proof.as_object().unwrap(), 42), expected);
         }
     }
 
