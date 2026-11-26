@@ -411,10 +411,11 @@ impl Backend for NativeBackend {
             .collect()
     }
     fn supports_cross_resource_drag(&self) -> bool {
-        // Advertising this private operation promises independent snapshot
-        // retention and fresh validation of both native endpoints. Ordinary
-        // single-snapshot `drag` does not make that promise.
         self.offers("drag_between")
+    }
+    fn retains_resource_observations(&self) -> bool {
+        self.supports_cross_resource_drag()
+            || self.provider.manifest().raw["retains_resource_observations"] == true
     }
     fn drag_between(
         &self,

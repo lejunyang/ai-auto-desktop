@@ -1029,6 +1029,10 @@ impl AtspiBackend for LinuxBackend {
             })
     }
 
+    fn retains_resource_observations(&self) -> bool {
+        !crate::wayland_portal::is_wayland_session()
+    }
+
     fn observe_x11_windows(
         &self,
         snapshot: &mut BackendSnapshot,

@@ -192,6 +192,9 @@ pub trait AtspiBackend: Send + Sync {
     fn supports_cross_resource_drag(&self) -> bool {
         false
     }
+    fn retains_resource_observations(&self) -> bool {
+        false
+    }
     fn qt_text_drop(&self, _request: DragBetweenRequest<'_>) -> Result<Value, AutomationError> {
         Err(driver_error(
             "DRIVER.ACTION_UNSUPPORTED",
@@ -619,12 +622,16 @@ pub struct AtspiProvider {
 
 impl AtspiProvider {
     pub fn new(backend: Arc<dyn AtspiBackend>) -> Result<Self, AutomationError> {
-        let retain_resources = backend.supports_cross_resource_drag();
-        let document = if retain_resources {
+        let cross_resource_drag = backend.supports_cross_resource_drag();
+        let retain_resources = cross_resource_drag || backend.retains_resource_observations();
+        let mut document = if cross_resource_drag {
             cross_resource::enabled_manifest()
         } else {
             manifest_document()
         };
+        if retain_resources {
+            document["retains_resource_observations"] = json!(true);
+        }
         Ok(Self {
             backend,
             manifest: manifest::parse(&document).map_err(|reason| {

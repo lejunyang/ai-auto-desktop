@@ -90,11 +90,14 @@ pub trait Backend: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
-    /// Opt in only when native snapshots can remain valid independently for
-    /// multiple resources and `drag_between` revalidates both endpoints. This
-    /// also enables bounded, per-resource observation retention in the session.
+    /// Whether `drag_between` can execute and revalidate both endpoints.
     fn supports_cross_resource_drag(&self) -> bool {
         false
+    }
+    /// Opt in when the provider can keep independent native snapshots for
+    /// multiple resources, even when it cannot dispatch a cross-resource drag.
+    fn retains_resource_observations(&self) -> bool {
+        self.supports_cross_resource_drag()
     }
     /// A single gesture between two observations of this provider. No default
     /// fallback is safe: the usual `act` method only sees the source snapshot.
@@ -1295,11 +1298,11 @@ impl Session {
                 "expires_in_ms": self.lifetime.saturating_sub(self.created.elapsed()).as_millis(),
                 "session_usable": !self.is_closed() && self.created.elapsed() < self.lifetime
                     && self.state.lock().unwrap().requests.len() < self.max_requests,
-                "allow_input": self.policy.allow_input,"allow_secret_input":self.policy.allow_secret_input,"secret_bindings":if self.policy.allow_secret_input { self.policy.secret_bindings.names() } else { Vec::new() },"upload_dirs": self.policy.upload_roots,"save_dirs":self.policy.save_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":if self.backends.values().any(|b| self.allowed_provider(b.name()) && b.supports_cross_resource_drag()) { "provider_declared" } else { "until_next_observation_or_input_attempt" },"observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
+                "allow_input": self.policy.allow_input,"allow_secret_input":self.policy.allow_secret_input,"secret_bindings":if self.policy.allow_secret_input { self.policy.secret_bindings.names() } else { Vec::new() },"upload_dirs": self.policy.upload_roots,"save_dirs":self.policy.save_roots,"cookie_values": self.policy.allow_cookie_values,"observation_retention":if self.backends.values().any(|b| self.allowed_provider(b.name()) && b.retains_resource_observations()) { "provider_declared" } else { "until_next_observation_or_input_attempt" },"observation_ttl_ms":self.observation_ttl.as_millis(),"max_requests":self.max_requests,"input_lease":"exclusive_cooperating_session","input_lease_scope":"os_user","providers": self.backends.values().filter(|b| self.allowed_provider(b.name()))
                     .map(|b| json!({"provider": b.name(), "actions": b.capabilities(), "reads": b.reads(),
                         "cross_resource_drag": b.supports_cross_resource_drag(),
-                        "observation_retention": if b.supports_cross_resource_drag() { "latest_per_resource_until_input_attempt" } else { "until_next_observation_or_input_attempt" },
-                        "max_retained_observations": if b.supports_cross_resource_drag() { MAX_RESOURCE_OBSERVATIONS } else { 1 }
+                        "observation_retention": if b.retains_resource_observations() { "latest_per_resource_until_input_attempt" } else { "until_next_observation_or_input_attempt" },
+                        "max_retained_observations": if b.retains_resource_observations() { MAX_RESOURCE_OBSERVATIONS } else { 1 }
                     })).collect::<Vec<_>>(),
                 "unavailable": self.failures}),
             )),
@@ -1566,7 +1569,7 @@ impl Session {
                 let backend = &self.backends[&observation.provider];
                 let mut drag_destination = None;
                 if let Action::Drag { to, path, .. } = action {
-                    if !backend.supports_cross_resource_drag()
+                    if !backend.retains_resource_observations()
                         && (to.session_id != target.session_id
                             || to.resource_id != target.resource_id
                             || to.observation_id != target.observation_id)
@@ -1608,12 +1611,6 @@ impl Session {
                                 "drag endpoints must be inside their observed scopes",
                             ));
                         }
-                        if !backend.node_capabilities(&destination_node).iter().any(|name| name == "drag") {
-                            return Err(error(
-                                "CONTROL.ACTION_UNSUPPORTED",
-                                "observed destination does not expose drag",
-                            ));
-                        }
                         drag_destination = Some((destination, destination_node));
                     } else if to.observation_id != target.observation_id {
                         return Err(error(
@@ -1639,6 +1636,14 @@ impl Session {
                     }
                 }
                 backend.check_action_support(&observation.raw, action, drag_destination.is_some())?;
+                if let Some((_, destination_node)) = &drag_destination {
+                    if !backend.supports_cross_resource_drag() {
+                        return Err(error("CONTROL.ACTION_UNSUPPORTED", "this provider cannot drag between resources"));
+                    }
+                    if !backend.node_capabilities(destination_node).iter().any(|name| name == "drag") {
+                        return Err(error("CONTROL.ACTION_UNSUPPORTED", "observed destination does not expose drag"));
+                    }
+                }
                 if !backend
                     .capabilities()
                     .iter()
@@ -2080,7 +2085,7 @@ impl Session {
                 Ok((observed.raw, node))
             })
             .transpose()?;
-        let retain_resources = backend.supports_cross_resource_drag();
+        let retain_resources = backend.retains_resource_observations();
         self.state.lock().unwrap().observations.retain(|_, old| {
             old.created.elapsed() < self.observation_ttl
                 && (old.provider != item.resource.provider
