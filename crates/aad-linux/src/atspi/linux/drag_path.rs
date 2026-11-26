@@ -34,6 +34,7 @@ impl LinuxBackend {
         }
         if !modifiers.is_empty() {
             support.require("pointer-modifiers")?;
+            support.require_keyboard_route()?;
         }
         if hold_ms.is_some() {
             support.require("bounded-hold")?;

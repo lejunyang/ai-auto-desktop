@@ -74,12 +74,21 @@ selection 协议访问（见下文）。观察前通过无输入的 `describe` �
 明确发生在派发前的拒绝保留 `not_applied`；首次输入/指针事件后的不确定失败按 `DRIVER.UNKNOWN_EFFECT` 处理；
 成功仍须 fresh snapshot 验证。截图不会自动触发 OCR。
 
-键盘输入额外要求 helper 声明 `window-focus`。后端从同一 fresh snapshot 的结构父链取得顶层
+锚定的键盘输入要求 helper 同时声明 `window-focus` 和 `atomic-key-dispatch`。后端从同一 fresh snapshot 的结构父链取得顶层
 窗口，在派发前复核 AT-SPI bounds，并由 helper 找到同 PID、几何匹配的唯一 X11 client。
 `type_text`、`key_chord`、`paste` 和带修饰键的指针动作向 helper 传入内部窗口绑定；实际焦点
 必须属于该 client 或其子窗口。另一个同 PID 窗口、窗口移动或失焦都不能沿用原证明。
-这项证明不使用“该进程只有一个窗口”的几何降级；持键过程中继续复核并释放自己按下的键。
+这项证明使用精确窗口几何。Unicode 和 keys 模式按字符抓取 X 服务器，在同一段内复核焦点并提交按下和释放。
+组合键及指针修饰键每次按下都在抓取内复核和提交。Ctrl+V 在同一段内提交，剪贴板服务在段外进行。
+持键等待、字符间隔和临时键表恢复都在抓取外。失焦时停在下一次按下前，仍会释放本动作已按下的键。
 旧 helper 不提供相应键盘动作，普通 AT-SPI 语义调用及其已声明的纯指针功能仍可用。
+窗口绑定只确认 X11 client 及其子窗口，同窗控件焦点仍由 toolkit 管理。
+
+XTest 回执的 `input_progress` 包含 `unit`、`delivered`、`total`、`proven_window` 和 `released`。
+单位为字符、物理键、组合键、粘贴快捷键或按钮按下。`delivered` 记录已确认提交的笔数，控件实际内容仍以 fresh snapshot 为准。
+`proven_window` 是派发时已复核的 X11 窗口 ID，无窗口证明时为 `0`。`released` 由 X11 回读，表示本动作按下的键钮已松开。
+部分派发失败仍返回 `effect=unknown`，进度放在错误 `details` 中。进程完成清理并输出进度时，取消和超时回包也携带该记录。
+保密字段的错误只返回脱敏结果。
 
 显式 keys 模式额外要求 `type-text-keys`，只从当前 XKB group 和锁定状态中寻找现有键位与
 Shift 组合，不创建 Unicode 映射、不使用剪贴板、不切换输入法；无法表示的字符在整个字符串
