@@ -870,6 +870,19 @@ and observe the field's current value before continuing with fill or type_text."
             "The deadline elapsed while typing. Check details.input_progress.delivered \
 and observe the field before continuing. On X11, increase timeout_ms up to 30000 or use fill.",
         ),
+        Some("DRIVER.CLIPBOARD_BUSY")
+            if matches!(
+                details["helper_code"].as_str(),
+                Some(
+                    "clipboard_unreadable"
+                        | "clipboard_owner_changed"
+                        | "clipboard_timestamp_unavailable"
+                        | "clipboard_busy"
+                )
+            ) =>
+        {
+            Some("Use fill or type_text to enter the text without replacing the clipboard.")
+        }
         code => code.and_then(hint),
     };
     if let Some(guidance) = guidance {

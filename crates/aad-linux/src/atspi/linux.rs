@@ -2596,13 +2596,7 @@ fn with_helper_receipt(mut error: AutomationError, stdout: &[u8]) -> AutomationE
         if let Some(restored) = frame["restored"].as_str().filter(|state| {
             matches!(
                 *state,
-                "untouched"
-                    | "restored"
-                    | "ownership_changed"
-                    | "cleared"
-                    | "none"
-                    | "lost"
-                    | "unknown"
+                "untouched" | "restored" | "ownership_changed" | "cleared" | "lost" | "unknown"
             )
         }) {
             error = error.with_detail("clipboard_restored", json!(restored));
@@ -2838,9 +2832,21 @@ fn map_helper_code(code: &str) -> Option<AutomationError> {
             "DRIVER.CLIPBOARD_TOO_LARGE",
             "the clipboard holds more than can be kept, so nothing was pasted",
         ),
+        "clipboard_unreadable" => driver_error(
+            "DRIVER.CLIPBOARD_BUSY",
+            "the original clipboard contents could not be saved, so nothing was pasted",
+        ),
+        "clipboard_owner_changed" => driver_error(
+            "DRIVER.CLIPBOARD_BUSY",
+            "clipboard ownership changed before dispatch, so nothing was pasted",
+        ),
+        "clipboard_timestamp_unavailable" => driver_error(
+            "DRIVER.CLIPBOARD_BUSY",
+            "the X server did not provide a clipboard timestamp, so nothing was pasted",
+        ),
         "clipboard_busy" => driver_error(
             "DRIVER.CLIPBOARD_BUSY",
-            "another client kept the clipboard; nothing was pasted",
+            "the clipboard could not be preserved for this paste, so nothing was pasted",
         ),
         "focus_owner_mismatch" | "focus_owner_changed" => driver_error(
             "DRIVER.FOCUS_LOST",
@@ -3821,6 +3827,55 @@ mod capture_tests {
         assert_eq!(error.effect, "not_applied");
         assert_eq!(error.details["helper_code"], "target_point_mismatch");
         assert_eq!(error.details["dispatch_started"], false);
+    }
+
+    #[test]
+    fn paste_refusals_explain_why_the_clipboard_could_not_be_preserved() {
+        for (helper_code, exit, reason) in [
+            (
+                "clipboard_unreadable",
+                69,
+                "original clipboard contents could not be saved",
+            ),
+            ("clipboard_owner_changed", 73, "clipboard ownership changed"),
+            (
+                "clipboard_timestamp_unavailable",
+                69,
+                "X server did not provide a clipboard timestamp",
+            ),
+            ("clipboard_busy", 73, "clipboard could not be preserved"),
+        ] {
+            let stdout = json!({"ok": false, "code": helper_code, "dispatch_started": false,
+                                "restored": "untouched"});
+            let error = parse_input_helper(
+                HelperOutput {
+                    status: ExitStatus::from_raw(exit << 8),
+                    stdout: stdout.to_string().into_bytes(),
+                    stderr: vec![],
+                },
+                "keyboard_dispatch",
+                4,
+                42,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "DRIVER.CLIPBOARD_BUSY");
+            assert_eq!(error.effect, "not_applied");
+            assert_eq!(error.details["helper_code"], helper_code);
+            assert_eq!(error.details["dispatch_started"], false);
+            assert_eq!(error.details["clipboard_restored"], "untouched");
+            assert!(error.message.contains(reason), "{}", error.message);
+            assert!(
+                error.message.contains("nothing was pasted"),
+                "{}",
+                error.message
+            );
+        }
+
+        let obsolete = with_helper_receipt(
+            driver_error("DRIVER.CLIPBOARD_BUSY", "clipboard refused"),
+            br#"{"ok":false,"restored":"none"}"#,
+        );
+        assert!(obsolete.details.get("clipboard_restored").is_none());
     }
 
     #[test]

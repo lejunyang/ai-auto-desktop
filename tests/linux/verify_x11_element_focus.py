@@ -365,24 +365,43 @@ def trial(aad, helper, out, baseline, scenario):
                 "focus_owner_changed", False, fixtures["owner"]["xid"]), reply
             assert values == {"Target entry": "", "Sibling entry": ""} and not presses, (values, presses)
 
+        def copy_original(*options):
+            previous_owner = x.clipboard_owner()
+            subprocess.run(["xclip", "-selection", "clipboard", *options], input=b"original clip", check=True)
+
+            def new_owner():
+                owner = x.clipboard_owner()
+                return owner if owner and owner != previous_owner else None
+
+            # xclip can return after forking but before the child owns CLIPBOARD.
+            return until(new_owner, "xclip to take clipboard ownership")
+
+        def read_clipboard(case, *options):
+            read = subprocess.run(["xclip", "-selection", "clipboard", "-o", *options], capture_output=True)
+            emit(checkpoints, "clipboard_read", case=case, status=read.returncode,
+                 text=read.stdout.decode(), owner=x.clipboard_owner())
+            return read.returncode, read.stdout
+
+        def paste_unreadable():
+            # SAVE_TARGETS is clipboard-manager metadata, so the helper skips it.
+            original_owner = copy_original("-target", "SAVE_TARGETS")
+            assert read_clipboard("paste_unreadable_targets", "-target", "TARGETS") == (
+                0, b"TARGETS\nSAVE_TARGETS\n")
+            reply, values, _ = run("paste_unreadable", dict(type="paste", text="must not be inserted"))
+            assert read_clipboard("paste_unreadable", "-target", "SAVE_TARGETS") == (0, b"original clip")
+            assert x.clipboard_owner() == original_owner
+            assert values == {"Target entry": "", "Sibling entry": ""}, values
+            assert not any(row["kind"] in {"key_down", "key_up"}
+                           for role in events for row in rows(role, "paste_unreadable"))
+            denied(reply, "DRIVER.CLIPBOARD_BUSY", ("helper_code", "clipboard_unreadable"),
+                   0, 1, "not_applied")
+            error = reply["error"]
+            assert error["details"]["clipboard_restored"] == "untouched", reply
+            assert error["details"]["dispatch_started"] is False, reply
+            assert "could not be saved" in error["message"] and "nothing was pasted" in error["message"], reply
+            assert "fill or type_text" in error["hint"], reply
+
         def paste_recovery():
-            def copy_original():
-                previous_owner = x.clipboard_owner()
-                subprocess.run(["xclip", "-selection", "clipboard"], input=b"original clip", check=True)
-
-                def new_owner():
-                    owner = x.clipboard_owner()
-                    return owner if owner != previous_owner else None
-
-                # xclip can return after forking but before the child owns CLIPBOARD.
-                return until(new_owner, "xclip to take clipboard ownership")
-
-            def read_clipboard(case):
-                read = subprocess.run(["xclip", "-selection", "clipboard", "-o"], capture_output=True)
-                emit(checkpoints, "clipboard_read", case=case, status=read.returncode,
-                     text=read.stdout.decode(), owner=x.clipboard_owner())
-                return read.returncode, read.stdout
-
             def cancel_at_confirmation(case, request):
                 until(state_file.with_suffix(f".{case}.owner-reply").exists, "clipboard takeover")
                 mcp.send("notifications/cancelled", {"requestId": request}, notification=True)
@@ -447,6 +466,9 @@ def trial(aad, helper, out, baseline, scenario):
         if scenario == "paste-recovery":
             paste_recovery()
             return
+        if scenario == "paste-unreadable":
+            paste_unreadable()
+            return
 
         old = entries()["Target entry"]["target"]
         assert old != entries()["Target entry"]["target"]
@@ -484,6 +506,7 @@ def trial(aad, helper, out, baseline, scenario):
                 reply, values, presses = run(case, action)
                 denied(reply, "DRIVER.FOCUS_LOST", ("cause", "focused_element_changed"), 0, total, "not_applied")
                 assert values == {"Target entry": "", "Sibling entry": ""} and not presses, (values, presses)
+            paste_unreadable()
             paste_recovery()
             reply, _, presses = run("chord_reobserved", dict(type="key", keys=["f2"]))
             assert reply["effect"] == "applied" and [r["key"] for r in presses] == ["F2"], reply
@@ -507,7 +530,7 @@ if __name__ == "__main__":
         parser.add_argument("helper", type=Path)
         parser.add_argument("output", type=Path)
         parser.add_argument("--baseline", action="store_true")
-        parser.add_argument("--scenario", choices=["full", "window-preflight", "paste-recovery"], default="full")
+        parser.add_argument("--scenario", choices=["full", "window-preflight", "paste-recovery", "paste-unreadable"], default="full")
         args = parser.parse_args()
         if args.baseline and args.scenario != "full":
             parser.error("--baseline requires the full scenario")

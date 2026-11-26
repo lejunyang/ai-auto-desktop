@@ -2729,7 +2729,7 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding,
         return fail("deadline_exceeded", "clipboard_preflight", false, kExitTimeoutBeforeDispatch);
     }
     if (previous_owner != None && saved.empty()) {
-        return fail("clipboard_busy", "clipboard_preflight", false, kExitUnavailable);
+        return fail("clipboard_unreadable", "clipboard_preflight", false, kExitUnavailable);
     }
     const std::vector<Item> offer = {
         {selection.utf8, selection.utf8, 8, text},
@@ -2753,7 +2753,7 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding,
         return fail("focus_owner_mismatch", "target_preflight", false, kExitTargetMismatch);
     }
     if (time == CurrentTime) {
-        return fail("clipboard_busy", "clipboard_preflight", false, kExitUnavailable);
+        return fail("clipboard_timestamp_unavailable", "clipboard_preflight", false, kExitUnavailable);
     }
     if (const auto problem = ValidateKeyboardAnchor(anchor_token, 0, display, *pid,
                                                     pid_atom, binding, *deadline); !problem.empty()) {
@@ -2775,7 +2775,9 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding,
         if (const auto focus = KeyboardFocusProblem(display, *pid, pid_atom, binding, *deadline);
             !focus.empty()) return focus;
         // A copy made during the save or while awaiting ACK belongs to the user.
-        if (XGetSelectionOwner(display, selection.clipboard) != previous_owner) return "clipboard_busy";
+        if (XGetSelectionOwner(display, selection.clipboard) != previous_owner) {
+            return "clipboard_owner_changed";
+        }
         pid_window = FocusedPidWindow(display, *pid, pid_atom);
         if (pid_window == None) return "focus_owner_changed";
         if (const auto keys = VerifyStrokeKeys(display, v, control); !keys.empty()) return keys;
