@@ -8,6 +8,7 @@
 #include <X11/extensions/record.h>
 
 #include <algorithm>
+#include <bitset>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -299,6 +300,47 @@ void MarkDispatchStarted(bool &dispatched) {
     }
 }
 
+struct InputProgress {
+    std::string_view unit;
+    std::size_t total;
+    std::size_t delivered = 0;
+    Window proven_window = None;
+    std::bitset<256> attempted_keys;
+    unsigned attempted_buttons = 0;
+
+    InputProgress(std::string_view unit, std::size_t total) : unit(unit), total(total) {}
+
+    void RecordKey(KeyCode code, const std::optional<WindowBinding> &binding,
+                   KeyCode modifier = 0) {
+        attempted_keys.set(code);
+        if (modifier) attempted_keys.set(modifier);
+        if (binding) proven_window = binding->id;
+    }
+
+    void Emit(Display *display = nullptr) const {
+        bool released = true;
+        if (attempted_keys.any()) {
+            char keys[32]{};
+            released = XQueryKeymap(display, keys) != 0;
+            for (unsigned code = 0; code < attempted_keys.size() && released; ++code) {
+                released = !attempted_keys.test(code) || !KeyIsDown(keys, static_cast<KeyCode>(code));
+            }
+        }
+        if (attempted_buttons != 0) {
+            Window root = None, child = None;
+            int rx = 0, ry = 0, wx = 0, wy = 0;
+            unsigned mask = 0;
+            released = XQueryPointer(display, DefaultRootWindow(display), &root, &child,
+                                     &rx, &ry, &wx, &wy, &mask) &&
+                       (mask & attempted_buttons) == 0 && released;
+        }
+        std::cout << "{\"event\":\"input_progress\",\"unit\":\"" << unit
+                  << "\",\"delivered\":" << delivered << ",\"total\":" << total
+                  << ",\"proven_window\":" << proven_window << ",\"released\":"
+                  << (released ? "true" : "false") << "}" << std::endl;
+    }
+};
+
 bool FocusBelongsToPid(Display *display, unsigned long expected_pid, Atom pid_atom) {
     Window focus = None;
     int revert_to = 0;
@@ -501,10 +543,11 @@ bool PhysicalShift(XkbDescPtr map, KeyCode code) {
 // It never installs Unicode mappings or changes the selected input method.
 int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoints,
                     std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom,
-                    const std::optional<WindowBinding> &binding) {
+                    const std::optional<WindowBinding> &binding, InputProgress &progress) {
     bool dispatched = false;
     unsigned long events = 0;
     auto fail = [&](std::string_view code, int exit_code) {
+        progress.Emit(display);
         XCloseDisplay(display);
         EmitError(code, dispatched ? "keyboard_dispatch" : "text_preflight", dispatched);
         return dispatched ? kExitUnknownEffect : exit_code;
@@ -584,13 +627,18 @@ int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoin
             attempted = true;
             return SubmitKeystroke(display, stroke.code, stroke_shift);
         }, [&] { ReleaseKeystroke(display, stroke.code, stroke_shift); });
-        if (attempted) MarkDispatchStarted(dispatched);
+        if (attempted) {
+            MarkDispatchStarted(dispatched);
+            progress.RecordKey(stroke.code, binding, stroke_shift);
+        }
         if (!problem.empty()) {
             return fail(problem, problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
         }
         events += stroke_shift ? 4 : 2;
+        ++progress.delivered;
         if (index + 1 < plan.size()) usleep(kTextStrokeGapUs);
     }
+    progress.Emit(display);
     XCloseDisplay(display);
     std::cout << "{\"ok\":true,\"dispatch_started\":true,\"mode\":\"keys\",\"events\":"
               << events << ",\"codepoints\":" << codepoints.size() << "}" << std::endl;
@@ -741,8 +789,13 @@ std::string_view ValidatePathSegment(const GestureRequest &request, std::size_t 
 
 int RunGesture(Display *display, std::string_view command, const GestureRequest &request,
                std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom,
-               const std::optional<WindowBinding> &binding = std::nullopt) {
-    InputCancellation cancellation;
+               const std::optional<WindowBinding> &binding, InputProgress &progress) {
+    auto refuse = [&](std::string_view code, std::string_view phase, int exit_code) {
+        progress.Emit(display);
+        XCloseDisplay(display);
+        EmitError(code, phase, false);
+        return exit_code;
+    };
     std::vector<KeyCode> chord;
     std::vector<KeyCode> modifiers;
     std::vector<KeyCode> pressed_modifiers;
@@ -754,9 +807,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         const KeySym symbol = name == "meta" ? XK_Super_L : KeyNamed(name);
         const KeyCode code = symbol == NoSymbol ? 0 : XKeysymToKeycode(display, symbol);
         if (code == 0 || (held_keys[code / 8] & (1 << (code % 8))) != 0) {
-            XCloseDisplay(display);
-            EmitError("modifier_unavailable_or_held", "key_preflight", false);
-            return kExitTargetMismatch;
+            return refuse("modifier_unavailable_or_held", "key_preflight", kExitTargetMismatch);
         }
         modifiers.push_back(code);
     }
@@ -769,14 +820,10 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             const bool last = index + 1 == request.keys.size();
             if (code == 0 || IsModifier(symbol) == last || seen_main ||
                 std::find(chord.begin(), chord.end(), code) != chord.end()) {
-                XCloseDisplay(display);
-                EmitError("unsupported_key", "key_preflight", false);
-                return kExitInvalid;
+                return refuse("unsupported_key", "key_preflight", kExitInvalid);
             }
             if ((held_keys[code / 8] & (1 << (code % 8))) != 0) {
-                XCloseDisplay(display);
-                EmitError("input_already_held", "key_preflight", false);
-                return kExitTargetMismatch;
+                return refuse("input_already_held", "key_preflight", kExitTargetMismatch);
             }
             seen_main = last;
             chord.push_back(code);
@@ -791,9 +838,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             if (!WindowAtPointBelongsToPid(display, point.first, point.second, expected_pid,
                                            pid_atom) || (!request.path.empty() &&
                 !PointMatchesWindow(display, point.first, point.second, expected_pid, pid_atom, binding))) {
-                XCloseDisplay(display);
-                EmitError("target_point_mismatch", "target_preflight", false);
-                return kExitTargetMismatch;
+                return refuse("target_point_mismatch", "target_preflight", kExitTargetMismatch);
             }
         }
     }
@@ -807,9 +852,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                                           [](char keys) { return keys != 0; });
         if (!pointer_known || key_held ||
             (mask & (Button1Mask | Button2Mask | Button3Mask | Button4Mask | Button5Mask)) != 0) {
-            XCloseDisplay(display);
-            EmitError("input_already_held", "input_preflight", false);
-            return kExitTargetMismatch;
+            return refuse("input_already_held", "input_preflight", kExitTargetMismatch);
         }
     }
     bool dispatch_started = false;
@@ -827,6 +870,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             }
         }
         XSync(display, False);
+        progress.Emit(display);
         XCloseDisplay(display);
         EmitError(code, phase, dispatch_started);
         return dispatch_started ? kExitUnknownEffect : pre_dispatch_exit;
@@ -868,6 +912,12 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
     auto submit = [&](bool ok) {
         submitted = ok && submitted;
         ++event_count;
+    };
+    auto press_button = [&] {
+        progress.attempted_buttons |= Button1Mask << (request.button - 1);
+        submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
+        XSync(display, False);
+        if (submitted && !g_x_error) ++progress.delivered;
     };
     // A hold is one bounded transaction. Recheck live ownership while down;
     // cleanup releases only inputs this transaction pressed, even after loss.
@@ -917,6 +967,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         if (attempted) {
             MarkDispatchStarted(dispatch_started);
             pressed.push_back(code);
+            progress.RecordKey(code, binding);
             ++event_count;
         }
         return problem;
@@ -932,6 +983,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         for (const KeyCode code : chord) {
             if (const auto problem = press(code, pressed_chord); !problem.empty()) return press_failed(problem);
         }
+        progress.delivered = 1;
         if (const auto problem = hold(); !problem.empty()) {
             return finish_failure(problem, "input_hold", kExitUnknownEffect);
         }
@@ -952,8 +1004,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                 return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
             }
             button_pressed = true;
-            submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
-            XSync(display, False);
+            press_button();
             if (const auto problem = hold(); !problem.empty()) {
                 return finish_failure(problem, "input_hold", kExitUnknownEffect);
             }
@@ -1008,7 +1059,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                     return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
                 }
                 button_pressed = true;
-                submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
+                press_button();
                 if (const auto problem = hold(); !problem.empty()) {
                     return finish_failure(problem, "input_hold", kExitUnknownEffect);
                 }
@@ -1021,7 +1072,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                 if (DeadlineExpired(deadline_ns)) {
                     return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
                 }
-                submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
+                press_button();
                 submit(XTestFakeButtonEvent(display, request.button, False, 1) != 0);
                 XSync(display, False);
             }
@@ -1041,6 +1092,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
     if (!submitted || g_x_error) {
         return finish_failure("x11_error", "input_dispatch", kExitUnknownEffect);
     }
+    progress.Emit(display);
     XCloseDisplay(display);
     std::cout << "{\"ok\":true,\"dispatch_started\":true,\"events\":" << event_count << "}"
               << std::endl;
@@ -2519,6 +2571,7 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
     }
     const std::optional<std::uint64_t> pid = pid_value;
     const std::optional<std::uint64_t> deadline = deadline_value;
+    InputProgress progress("paste", 1);
     const auto text = ReadStdin(kMaxPasteBytes);
     if (!text.has_value() || text->empty() || !DecodeUtf8(*text).has_value()) {
         EmitError("unsupported_text", "text_preflight", false);
@@ -2530,29 +2583,30 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
         return exit_code;
     }
     int event_base = 0, error_base = 0, major = 0, minor = 0;
+    auto refuse = [&](std::string_view code, std::string_view phase, int exit_code) {
+        progress.Emit(display);
+        XCloseDisplay(display);
+        EmitError(code, phase, false);
+        return exit_code;
+    };
     const Atom pid_atom = XInternAtom(display, "_NET_WM_PID", True);
     if (!XTestQueryExtension(display, &event_base, &error_base, &major, &minor) ||
         pid_atom == None) {
-        XCloseDisplay(display);
-        EmitError("xtest_unavailable", "x11_preflight", false);
-        return kExitUnavailable;
+        return refuse("xtest_unavailable", "x11_preflight", kExitUnavailable);
     }
     const KeyCode control = XKeysymToKeycode(display, XK_Control_L);
     const KeyCode v = XKeysymToKeycode(display, XK_v);
     if (control == 0 || v == 0) {
-        XCloseDisplay(display);
-        EmitError("unsupported_key", "key_preflight", false);
-        return kExitInvalid;
+        return refuse("unsupported_key", "key_preflight", kExitInvalid);
     }
     if (!FocusMatchesWindow(display, static_cast<unsigned long>(*pid), pid_atom, binding)) {
-        XCloseDisplay(display);
-        EmitError("focus_owner_mismatch", "target_preflight", false);
-        return kExitTargetMismatch;
+        return refuse("focus_owner_mismatch", "target_preflight", kExitTargetMismatch);
     }
     const Selection selection = OpenSelection(display);
     auto fail = [&](std::string_view code, std::string_view phase, bool dispatched,
                     int pre_dispatch_exit) {
         XDestroyWindow(display, selection.window);
+        progress.Emit(display);
         XCloseDisplay(display);
         EmitError(code, phase, dispatched);
         return dispatched ? kExitUnknownEffect : pre_dispatch_exit;
@@ -2627,12 +2681,16 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
         attempted = true;
         return SubmitKeystroke(display, v, control);
     }, [&] { ReleaseKeystroke(display, v, control); });
-    if (attempted) MarkDispatchStarted(dispatched);
+    if (attempted) {
+        MarkDispatchStarted(dispatched);
+        progress.RecordKey(v, binding, control);
+    }
     if (!problem.empty()) {
         restore();
         return fail(problem, "keyboard_dispatch", dispatched,
                     problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
     }
+    progress.delivered = 1;
     // Serve the text only to the expected process; wait (bounded) for it.
     bool consumed = false;
     bool lost = false;
@@ -2691,6 +2749,7 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
     }
     const std::string restored = restore();
     XDestroyWindow(display, selection.window);
+    progress.Emit(display);
     XCloseDisplay(display);
     std::cout << "{\"ok\":true,\"dispatch_started\":true,\"events\":4,\"consumed\":"
               << (consumed ? "true" : "false") << ",\"restored\":\"" << restored
@@ -2823,8 +2882,7 @@ int main(int argc, char **argv) {
     if (command == "global-key") {
         return RunGlobalKey(argc, argv);
     }
-    std::optional<InputCancellation> cancellation;
-    if (command == "type-text" || command == "pointer-click") cancellation.emplace();
+    InputCancellation cancellation;
     std::optional<std::uint64_t> expected_pid;
     std::optional<std::uint64_t> deadline_ns;
     std::optional<int> click_x;
@@ -2905,44 +2963,54 @@ int main(int argc, char **argv) {
             return kExitUnsupportedText;
         }
     }
+    std::optional<InputProgress> progress;
+    if (codepoints) {
+        progress.emplace(physical_keys ? "key" : "codepoint", codepoints->size());
+    } else if (command == "key-chord") {
+        progress.emplace("chord", 1);
+    } else if (command == "drag") {
+        progress.emplace("button", 1);
+    } else if (gesture) {
+        const unsigned count = gesture->mode == "click" ? gesture->count :
+                               gesture->mode == "wheel" ? gesture->notches : 0;
+        progress.emplace("button", count);
+    }
+    auto refuse = [&](std::string_view code, std::string_view phase, int exit_code, Display *display = nullptr) {
+        if (progress) progress->Emit();
+        if (display) XCloseDisplay(display);
+        EmitError(code, phase, false);
+        return exit_code;
+    };
     if (DeadlineExpired(deadline_ns.value())) {
-        EmitError("deadline_exceeded", "pre_dispatch", false);
-        return kExitTimeoutBeforeDispatch;
+        return refuse("deadline_exceeded", "pre_dispatch", kExitTimeoutBeforeDispatch);
     }
 
     XSetErrorHandler(HandleXError);
     Display *display = XOpenDisplay(nullptr);
     if (display == nullptr) {
-        EmitError("display_unavailable", "x11_preflight", false);
-        return kExitUnavailable;
+        return refuse("display_unavailable", "x11_preflight", kExitUnavailable);
     }
     int event_base = 0;
     int error_base = 0;
     int major = 0;
     int minor = 0;
     if (!XTestQueryExtension(display, &event_base, &error_base, &major, &minor)) {
-        XCloseDisplay(display);
-        EmitError("xtest_unavailable", "x11_preflight", false);
-        return kExitUnavailable;
+        return refuse("xtest_unavailable", "x11_preflight", kExitUnavailable, display);
     }
     const Atom pid_atom = XInternAtom(display, "_NET_WM_PID", True);
     if (pid_atom == None) {
-        XCloseDisplay(display);
-        EmitError("pid_property_unavailable", "target_preflight", false);
-        return kExitTargetMismatch;
+        return refuse("pid_property_unavailable", "target_preflight", kExitTargetMismatch, display);
     }
     while ((command == "type-text" || command == "key-chord" || (gesture.has_value() && !gesture->modifiers.empty())) &&
            !FocusMatchesWindow(display, expected_pid.value(), pid_atom, binding)) {
         if (DeadlineExpired(deadline_ns.value())) {
-            XCloseDisplay(display);
-            EmitError("focus_owner_mismatch", "target_preflight", false);
-            return kExitTargetMismatch;
+            return refuse("focus_owner_mismatch", "target_preflight", kExitTargetMismatch, display);
         }
         usleep(5000);
     }
     if (gesture.has_value()) {
         return RunGesture(display, command, gesture.value(), expected_pid.value(),
-                          deadline_ns.value(), pid_atom, binding);
+                          deadline_ns.value(), pid_atom, binding, *progress);
     }
     if (command == "pointer-click") {
         if (!click_x.has_value() || !click_y.has_value() ||
@@ -2995,7 +3063,7 @@ int main(int argc, char **argv) {
 
     if (physical_keys) {
         return RunPhysicalText(display, codepoints.value(), expected_pid.value(),
-                               deadline_ns.value(), pid_atom, binding);
+                               deadline_ns.value(), pid_atom, binding, *progress);
     }
 
     int minimum = 0;
@@ -3009,9 +3077,7 @@ int main(int argc, char **argv) {
         if (mapping != nullptr) {
             XFree(mapping);
         }
-        XCloseDisplay(display);
-        EmitError("keyboard_map_unavailable", "text_preflight", false);
-        return kExitUnavailable;
+        return refuse("keyboard_map_unavailable", "text_preflight", kExitUnavailable, display);
     }
     const auto spares =
         FindUnusedKeycodes(display, minimum, maximum, symbols_per_code, mapping);
@@ -3019,9 +3085,7 @@ int main(int argc, char **argv) {
                                    symbols_per_code, mapping, spares);
     if (!plan.has_value()) {
         XFree(mapping);
-        XCloseDisplay(display);
-        EmitError("unsupported_keyboard_mapping", "text_preflight", false);
-        return kExitUnsupportedText;
+        return refuse("unsupported_keyboard_mapping", "text_preflight", kExitUnsupportedText, display);
     }
     const KeyCode shift = XKeysymToKeycode(display, XK_Shift_L);
     bool requires_shift = false;
@@ -3030,9 +3094,7 @@ int main(int argc, char **argv) {
     }
     if (requires_shift && shift == 0) {
         XFree(mapping);
-        XCloseDisplay(display);
-        EmitError("shift_unavailable", "text_preflight", false);
-        return kExitUnsupportedText;
+        return refuse("shift_unavailable", "text_preflight", kExitUnsupportedText, display);
     }
 
     std::vector<std::vector<KeySym>> original_mappings;
@@ -3063,6 +3125,7 @@ int main(int argc, char **argv) {
                               int pre_dispatch_exit) {
         restore_mapping();
         XSync(display, False);
+        progress->Emit(display);
         XCloseDisplay(display);
         EmitError(code, phase, dispatch_started);
         return dispatch_started ? kExitUnknownEffect : pre_dispatch_exit;
@@ -3105,18 +3168,23 @@ int main(int argc, char **argv) {
             attempted = true;
             return SubmitKeystroke(display, stroke.keycode, stroke_shift);
         }, [&] { ReleaseKeystroke(display, stroke.keycode, stroke_shift); });
-        if (attempted) MarkDispatchStarted(dispatch_started);
+        if (attempted) {
+            MarkDispatchStarted(dispatch_started);
+            progress->RecordKey(stroke.keycode, binding, stroke_shift);
+        }
         if (!problem.empty()) {
             return finish_failure(problem, "keyboard_dispatch",
                                   problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
         }
         event_count += stroke_shift ? 4 : 2;
+        ++progress->delivered;
         // Let the target process the completed stroke between server grabs.
         if (index + 1 < plan->strokes.size()) usleep(kTextStrokeGapUs);
     }
     restore_mapping();
     XSync(display, False);
     const bool final_error = g_x_error;
+    progress->Emit(display);
     XCloseDisplay(display);
     if (final_error) {
         EmitError("x11_error", "post_dispatch", dispatch_started);

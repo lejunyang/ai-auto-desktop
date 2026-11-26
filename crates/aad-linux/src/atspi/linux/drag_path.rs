@@ -351,14 +351,15 @@ pub(super) fn run(
             let clean = terminate_with_grace(&mut child, Duration::from_millis(500));
             let _ = drain(&mut stdout, &mut output);
             let dispatched = helper_dispatched(&output);
-            Err(error
+            let error = error
                 .with_effect(if dispatched || !clean {
                     "unknown"
                 } else {
                     "not_applied"
                 })
                 .with_detail("dispatch_started", json!(dispatched))
-                .with_detail("helper_exited_before_kill", json!(clean)))
+                .with_detail("helper_exited_before_kill", json!(clean));
+            Err(with_helper_progress(error, &output))
         }
     }
 }

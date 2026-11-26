@@ -1873,13 +1873,17 @@ impl AtspiBackend for LinuxBackend {
         )?;
         let input = parse_input_helper(output, "keyboard_dispatch", 4, process_id)?;
         if input["consumed"] != true {
-            return Err(driver_error(
+            let mut error = driver_error(
                 "DRIVER.PASTE_NOT_CONSUMED",
                 "paste text was not served to the target; inspect paste diagnostics",
             )
             .with_effect("unknown")
             .with_detail("clipboard_restored", input["restored"].clone())
-            .with_detail("paste_diagnostics", input["paste_diagnostics"].clone()));
+            .with_detail("paste_diagnostics", input["paste_diagnostics"].clone());
+            if let Some(progress) = input.get("input_progress") {
+                error = error.with_detail("input_progress", progress.clone());
+            }
+            return Err(error);
         }
         Ok(
             json!({"native_interface": "Component.grab_focus -> X11 CLIPBOARD + XTEST Ctrl+V", "focus": focus, "input": input, "synthetic_input": true, "clipboard_restored": input["restored"]}),
@@ -2463,7 +2467,7 @@ fn run_helper_cancellable(
                 }
             }
             let dispatched = stdout_result.as_deref().is_some_and(helper_dispatched);
-            return Err(token
+            let error = token
                 .check()
                 .unwrap_err()
                 .with_effect(if dispatched || !clean_exit {
@@ -2472,7 +2476,11 @@ fn run_helper_cancellable(
                     "not_applied"
                 })
                 .with_detail("dispatch_started", json!(dispatched))
-                .with_detail("helper_exited_before_kill", json!(clean_exit)));
+                .with_detail("helper_exited_before_kill", json!(clean_exit));
+            return Err(with_helper_progress(
+                error,
+                stdout_result.as_deref().unwrap_or_default(),
+            ));
         }
         if status.is_some() && stdout_result.is_some() && stderr_result.is_some() {
             break;
@@ -2487,9 +2495,13 @@ fn run_helper_cancellable(
                 }
             }
             let dispatched = stdout_result.as_deref().is_some_and(helper_dispatched);
-            return Err(super::timeout_error(dispatched || !clean_exit)
+            let error = super::timeout_error(dispatched || !clean_exit)
                 .with_detail("dispatch_started", json!(dispatched))
-                .with_detail("helper_exited_before_kill", json!(clean_exit)));
+                .with_detail("helper_exited_before_kill", json!(clean_exit));
+            return Err(with_helper_progress(
+                error,
+                stdout_result.as_deref().unwrap_or_default(),
+            ));
         }
         if let (Some(input), Some(stdin)) = (input, child.stdin.as_mut()) {
             // A helper may stop consuming stdin. Never block cancellation or
@@ -2517,17 +2529,19 @@ fn run_helper_cancellable(
                         }
                     }
                     let dispatched = stdout_result.as_deref().is_some_and(helper_dispatched);
-                    return Err(driver_error(
-                        "DRIVER.ACTION_FAILED",
-                        "helper input could not be written",
-                    )
-                    .with_effect(if dispatched || !clean_exit {
-                        "unknown"
-                    } else {
-                        "not_applied"
-                    })
-                    .with_detail("dispatch_started", json!(dispatched))
-                    .with_detail("helper_exited_before_kill", json!(clean_exit)));
+                    let error =
+                        driver_error("DRIVER.ACTION_FAILED", "helper input could not be written")
+                            .with_effect(if dispatched || !clean_exit {
+                                "unknown"
+                            } else {
+                                "not_applied"
+                            })
+                            .with_detail("dispatch_started", json!(dispatched))
+                            .with_detail("helper_exited_before_kill", json!(clean_exit));
+                    return Err(with_helper_progress(
+                        error,
+                        stdout_result.as_deref().unwrap_or_default(),
+                    ));
                 }
             }
         }
@@ -2546,6 +2560,33 @@ fn helper_dispatched(bytes: &[u8]) -> bool {
         .split(|byte| *byte == b'\n')
         .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
         .any(|value| value["event"] == "dispatch_started" || value["dispatch_started"] == true)
+}
+
+fn helper_progress(bytes: &[u8]) -> Option<Value> {
+    let progress = bytes
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .find(|value| value["event"] == "input_progress")?;
+    let unit = progress["unit"].as_str()?;
+    let delivered = progress["delivered"].as_u64()?;
+    let total = progress["total"].as_u64()?;
+    let proven_window = progress["proven_window"].as_u64()?;
+    let released = progress["released"].as_bool()?;
+    if !matches!(unit, "codepoint" | "key" | "chord" | "paste" | "button")
+        || delivered > total
+        || proven_window > u64::from(u32::MAX)
+    {
+        return None;
+    }
+    Some(json!({"unit": unit, "delivered": delivered, "total": total,
+                "proven_window": proven_window, "released": released}))
+}
+
+fn with_helper_progress(error: AutomationError, stdout: &[u8]) -> AutomationError {
+    match helper_progress(stdout) {
+        Some(progress) => error.with_detail("input_progress", progress),
+        None => error,
+    }
 }
 
 fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
@@ -2624,8 +2665,11 @@ fn parse_input_helper(
     }
     if output.status.success() {
         let result = result.ok_or_else(|| {
-            driver_error("DRIVER.UNKNOWN_EFFECT", "helper success result is missing")
-                .with_effect("unknown")
+            with_helper_progress(
+                driver_error("DRIVER.UNKNOWN_EFFECT", "helper success result is missing")
+                    .with_effect("unknown"),
+                &output.stdout,
+            )
         })?;
         if !dispatched
             || result.get("ok") != Some(&Value::Bool(true))
@@ -2634,13 +2678,19 @@ fn parse_input_helper(
                 .and_then(Value::as_u64)
                 .is_none_or(|events| events < minimum_events)
         {
-            return Err(driver_error(
-                "DRIVER.UNKNOWN_EFFECT",
-                "helper did not prove successful input dispatch",
-            )
-            .with_effect("unknown"));
+            return Err(with_helper_progress(
+                driver_error(
+                    "DRIVER.UNKNOWN_EFFECT",
+                    "helper did not prove successful input dispatch",
+                )
+                .with_effect("unknown"),
+                &output.stdout,
+            ));
         }
         let mut answer = json!({"native_interface": "XTEST", "synthetic_input": true, "submitted": true, "events": result["events"], "codepoints": result.get("codepoints").cloned().unwrap_or(Value::Null), "expected_process_id": process_id});
+        if let Some(progress) = helper_progress(&output.stdout) {
+            answer["input_progress"] = progress;
+        }
         // Window and paste commands report what they observed afterwards.
         for key in [
             "consumed",
@@ -2688,21 +2738,27 @@ fn parse_input_helper(
     let helper_code = helper_error_code(&output.stdout);
     if !dispatched {
         if let Some(mapped) = helper_code.as_deref().and_then(map_helper_code) {
-            return Err(mapped
-                .with_detail("helper_code", json!(helper_code))
-                .with_detail("helper_exit_code", json!(code))
-                .with_detail("dispatch_started", json!(false)));
+            return Err(with_helper_progress(
+                mapped
+                    .with_detail("helper_code", json!(helper_code))
+                    .with_detail("helper_exit_code", json!(code))
+                    .with_detail("dispatch_started", json!(false)),
+                &output.stdout,
+            ));
         }
     }
     if dispatched || code == Some(70) {
-        return Err(driver_error(
-            "DRIVER.UNKNOWN_EFFECT",
-            "XTest helper failed after dispatch",
-        )
-        .with_effect("unknown")
-        .with_detail("phase", json!(phase))
-        .with_detail("helper_code", json!(helper_code))
-        .with_detail("dispatch_started", json!(dispatched)));
+        return Err(with_helper_progress(
+            driver_error(
+                "DRIVER.UNKNOWN_EFFECT",
+                "XTest helper failed after dispatch",
+            )
+            .with_effect("unknown")
+            .with_detail("phase", json!(phase))
+            .with_detail("helper_code", json!(helper_code))
+            .with_detail("dispatch_started", json!(dispatched)),
+            &output.stdout,
+        ));
     }
     let (error_code, message, retryable) = match code {
         Some(69) => ("DRIVER.UNAVAILABLE", "X11/XTest is unavailable", false),
@@ -2722,11 +2778,14 @@ fn parse_input_helper(
             false,
         ),
     };
-    Err(driver_error(error_code, message)
-        .with_retryable(retryable)
-        .with_detail("helper_exit_code", json!(code))
-        .with_detail("helper_code", json!(helper_code))
-        .with_detail("dispatch_started", json!(false)))
+    Err(with_helper_progress(
+        driver_error(error_code, message)
+            .with_retryable(retryable)
+            .with_detail("helper_exit_code", json!(code))
+            .with_detail("helper_code", json!(helper_code))
+            .with_detail("dispatch_started", json!(false)),
+        &output.stdout,
+    ))
 }
 
 /// The `code` of the helper's failure record, if it printed one.
@@ -2787,12 +2846,17 @@ fn after_focus(error: AutomationError) -> AutomationError {
     } else if error.code == "DRIVER.UNKNOWN_EFFECT" {
         error
     } else {
-        driver_error(
+        let progress = error.details.get("input_progress").cloned();
+        let mut result = driver_error(
             "DRIVER.UNKNOWN_EFFECT",
             "target focus changed before synthetic input completed",
         )
         .with_effect("unknown")
-        .with_cause(error)
+        .with_cause(error);
+        if let Some(progress) = progress {
+            result = result.with_detail("input_progress", progress);
+        }
+        result
     }
 }
 
@@ -3496,7 +3560,8 @@ mod capture_tests {
             &helper,
             concat!(
                 "#!/bin/sh\n",
-                "trap 'touch cleaned; exit 0' TERM\n",
+                "cleanup() { touch cleaned; printf '%s\\n' '{\"event\":\"input_progress\",\"unit\":\"chord\",\"delivered\":1,\"total\":1,\"proven_window\":42,\"released\":true}'; exit 0; }\n",
+                "trap cleanup TERM\n",
                 "printf '%s\\n' '{\"event\":\"dispatch_started\"}'\n",
                 "touch ready\n",
                 "while :; do sleep 0.01; done\n",
@@ -3530,7 +3595,26 @@ mod capture_tests {
         assert_eq!(error.effect, "unknown");
         assert_eq!(error.details["dispatch_started"], true);
         assert_eq!(error.details["helper_exited_before_kill"], true);
+        assert_eq!(error.details["input_progress"]["delivered"], 1);
+        assert_eq!(error.details["input_progress"]["released"], true);
         assert!(dir.join("cleaned").exists());
+        let timeout = run_helper_cancellable(
+            &helper,
+            &[],
+            None,
+            Instant::now() + Duration::from_secs(1),
+            4096,
+            4096,
+            None,
+        )
+        .err()
+        .expect("helper must observe the deadline");
+        assert_eq!(timeout.code, "DRIVER.TIMEOUT");
+        assert_eq!(timeout.effect, "unknown");
+        assert_eq!(
+            timeout.details["input_progress"],
+            error.details["input_progress"]
+        );
         std::fs::remove_file(dir.join("ready")).unwrap();
         let error = run_helper_cancellable(
             &helper,
@@ -3677,6 +3761,52 @@ mod capture_tests {
         assert_eq!(error.effect, "not_applied");
         assert_eq!(error.details["helper_code"], "target_point_mismatch");
         assert_eq!(error.details["dispatch_started"], false);
+    }
+
+    #[test]
+    fn helper_progress_preserves_partial_effect_and_excludes_payloads() {
+        let success = parse_input_helper(HelperOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: br#"{"event":"input_progress","unit":"codepoint","delivered":2,"total":2,"proven_window":42,"released":true,"text":"private"}
+{"ok":true,"dispatch_started":true,"events":4}"#.to_vec(),
+            stderr: vec![],
+        }, "keyboard_dispatch", 2, 42).unwrap();
+        assert_eq!(
+            success["input_progress"],
+            json!({"unit":"codepoint", "delivered":2,
+            "total":2, "proven_window":42, "released":true})
+        );
+
+        for (dispatched, exit, code, effect, delivered) in [
+            (false, 73, "DRIVER.FOCUS_LOST", "not_applied", 0),
+            (true, 70, "DRIVER.UNKNOWN_EFFECT", "unknown", 1),
+        ] {
+            let stdout = format!(
+                "{}\n{}\n",
+                json!({"event":"input_progress", "unit":"codepoint", "delivered":delivered,
+                    "total":2, "proven_window":42, "released":true}),
+                json!({"ok":false, "code":"focus_owner_changed", "dispatch_started":dispatched}),
+            );
+            let error = parse_input_helper(
+                HelperOutput {
+                    status: ExitStatus::from_raw(exit << 8),
+                    stdout: stdout.into_bytes(),
+                    stderr: vec![],
+                },
+                "keyboard_dispatch",
+                2,
+                42,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error.effect, effect);
+            assert_eq!(error.details["input_progress"]["delivered"], delivered);
+            let redacted = super::super::redact_secret_error(error);
+            assert_eq!(
+                redacted.details,
+                Map::from_iter([("redacted".into(), json!(true))])
+            );
+        }
     }
 
     #[test]
