@@ -2580,6 +2580,10 @@ fn helper_progress(bytes: &[u8]) -> Option<Value> {
         .split(|byte| *byte == b'\n')
         .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
         .find(|value| value["event"] == "input_progress")?;
+    parse_helper_progress(&progress)
+}
+
+fn parse_helper_progress(progress: &Value) -> Option<Value> {
     let unit = progress["unit"].as_str()?;
     let delivered = progress["delivered"].as_u64()?;
     let total = progress["total"].as_u64()?;

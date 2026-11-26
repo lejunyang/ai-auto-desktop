@@ -251,20 +251,32 @@ pub(super) fn run(
     let mut next = 0usize;
     let mut worker: Option<mpsc::Receiver<Result<(), AutomationError>>> = None;
     let mut ready = false;
+    let mut saw_progress = false;
+    let mut saw_result = false;
     let result = (|| loop {
         if let Some(token) = token {
             token.check()?;
         }
         remaining(deadline, false)?;
+        // Poll before draining so the last bytes after exit go through the
+        // same frame checks as bytes read while the helper is running.
+        let status = child
+            .try_wait()
+            .map_err(|_| protocol("drag helper state unavailable"))?;
         drain(&mut stdout, &mut output)?;
         drain(&mut stderr, &mut diagnostics)?;
+        let mut validation_requested = false;
         while let Some(end) = output[cursor..].iter().position(|b| *b == b'\n') {
             let end = cursor + end;
             let value: Value = serde_json::from_slice(&output[cursor..end])
                 .map_err(|_| protocol("malformed drag helper frame"))?;
             cursor = end + 1;
+            if saw_result || (saw_progress && value.get("event").is_some()) {
+                return Err(protocol("unexpected frame after drag helper completion"));
+            }
             if value["event"] == "validate_segment" {
-                if worker.is_some()
+                if validation_requested
+                    || worker.is_some()
                     || ready
                     || next > point_count
                     || value["token"] != nonce
@@ -272,25 +284,47 @@ pub(super) fn run(
                 {
                     return Err(protocol("unexpected drag validation sequence"));
                 }
-                let (tx, rx) = mpsc::sync_channel(1);
-                let validate = validate.clone();
-                let permit = permit.clone();
-                let index = next;
-                std::thread::Builder::new()
-                    .name("aad-drag-validation".into())
-                    .spawn(move || {
-                        let _permit = permit;
-                        let _ = tx.send(validate(index));
-                    })
-                    .map_err(|_| protocol("drag validation worker could not be started"))?;
-                worker = Some(rx);
+                validation_requested = true;
             } else if value["event"] == "dispatch_started" {
                 if next == 0 {
                     return Err(protocol("drag helper dispatched before validation"));
                 }
-            } else if !value["ok"].is_boolean() {
+            } else if value["event"] == "input_progress" {
+                if value.get("ok").is_some() || parse_helper_progress(&value).is_none() {
+                    return Err(protocol("invalid drag helper input progress"));
+                }
+                saw_progress = true;
+            } else if value.get("event").is_none() && value["ok"].is_boolean() {
+                saw_result = true;
+            } else {
                 return Err(protocol("unknown drag helper frame"));
             }
+        }
+        if let Some(status) = status {
+            if cursor != output.len() {
+                return Err(protocol("incomplete drag helper frame"));
+            }
+            if status.success() && next != point_count + 1 {
+                return Err(protocol("drag helper skipped validation"));
+            }
+            return Ok(status);
+        }
+        if saw_progress || saw_result {
+            worker = None;
+            ready = false;
+        } else if validation_requested {
+            let (tx, rx) = mpsc::sync_channel(1);
+            let validate = validate.clone();
+            let permit = permit.clone();
+            let index = next;
+            std::thread::Builder::new()
+                .name("aad-drag-validation".into())
+                .spawn(move || {
+                    let _permit = permit;
+                    let _ = tx.send(validate(index));
+                })
+                .map_err(|_| protocol("drag validation worker could not be started"))?;
+            worker = Some(rx);
         }
         if let Some(receiver) = &worker {
             match receiver.try_recv() {
@@ -329,17 +363,6 @@ pub(super) fn run(
                 _ => return Err(protocol("drag validation ACK could not be written")),
             }
         }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|_| protocol("drag helper state unavailable"))?
-        {
-            drain(&mut stdout, &mut output)?;
-            drain(&mut stderr, &mut diagnostics)?;
-            if status.success() && next != point_count + 1 {
-                return Err(protocol("drag helper skipped validation"));
-            }
-            return Ok(status);
-        }
         std::thread::sleep(Duration::from_millis(5));
     })();
     match result {
@@ -370,6 +393,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    const PROGRESS: &str = r#"{"event":"input_progress","unit":"button","delivered":1,"total":1,"proven_window":42,"released":true}"#;
 
     struct Script(PathBuf);
     impl Script {
@@ -396,6 +420,8 @@ for index in 0 1 2 3; do
     [ "$line" = "ack {NONCE} $index" ] || exit 2
     if [ "$index" = 0 ]; then printf '{{"event":"dispatch_started"}}\n'; fi
 done
+printf '%s\n' '{PROGRESS}'
+sleep 0.2
 printf '{{"ok":true,"dispatch_started":true,"events":5}}\n'
 "#
         ))
@@ -421,7 +447,9 @@ printf '{{"ok":true,"dispatch_started":true,"events":5}}\n'
             }),
         )
         .unwrap();
-        assert!(result.status.success());
+        let input = parse_input_helper(result, "drag_path", 5, 123).unwrap();
+        assert_eq!(input["input_progress"]["released"], true);
+        assert_eq!(input["input_progress"]["delivered"], 1);
         assert_eq!(*visited.lock().unwrap(), vec![0, 1, 2, 3]);
         assert!(!busy.load(Ordering::SeqCst));
         for event in [
@@ -443,6 +471,45 @@ printf '{{"ok":true,"dispatch_started":true,"events":5}}\n'
             .unwrap();
             assert_eq!(error.effect, "not_applied");
             assert_eq!(error.code, "DRIVER.ACTION_FAILED");
+        }
+    }
+
+    #[test]
+    fn terminal_progress_preserves_helper_failure_and_rejects_invalid_frames() {
+        let initial_progress = PROGRESS.replace("\"delivered\":1", "\"delivered\":0");
+        for (progress, trailing, expected) in [
+            (initial_progress.clone(), "", "DRIVER.FOCUS_LOST"),
+            (
+                PROGRESS.replace("\"total\":1", "\"total\":0"),
+                "",
+                "DRIVER.ACTION_FAILED",
+            ),
+            (
+                initial_progress,
+                "printf '%s\\n' '{\"event\":\"dispatch_started\"}'",
+                "DRIVER.ACTION_FAILED",
+            ),
+        ] {
+            let script = Script::new(&format!(
+                "printf '%s\\n' '{progress}' '{{\"ok\":false,\"code\":\"focus_owner_changed\",\"dispatch_started\":false}}'\n{trailing}\nexit 73"
+            ));
+            let error = run(
+                &script.0,
+                &[],
+                NONCE,
+                3,
+                Instant::now() + Duration::from_secs(2),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(|_| panic!("terminal frames must not request validation")),
+            )
+            .and_then(|output| parse_input_helper(output, "drag_path", 5, 123))
+            .unwrap_err();
+            assert_eq!(error.code, expected);
+            if expected == "DRIVER.FOCUS_LOST" {
+                assert_eq!(error.details["input_progress"]["released"], true);
+                assert_eq!(error.effect, "not_applied");
+            }
         }
     }
 
