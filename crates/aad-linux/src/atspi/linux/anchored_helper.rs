@@ -27,7 +27,6 @@ pub(super) struct Request<'a> {
     pub payload: Option<&'a [u8]>,
     pub handshakes: usize,
     pub poll: Duration,
-    pub cleanup_grace: Duration,
     pub deadline: Instant,
     pub token: Option<&'a CancellationToken>,
     pub validation: Validation<'a>,
@@ -82,7 +81,6 @@ pub(super) fn run_drag(
         payload: None,
         handshakes: point_count + 1,
         poll: Duration::from_millis(5),
-        cleanup_grace: Duration::from_millis(500),
         deadline,
         token,
         validation: Validation::Worker { busy, validate },
@@ -154,7 +152,6 @@ pub(super) fn run(request: Request<'_>) -> Result<HelperOutput, AutomationError>
         payload,
         handshakes,
         poll,
-        cleanup_grace,
         deadline,
         token,
         validation,
@@ -328,7 +325,7 @@ pub(super) fn run(request: Request<'_>) -> Result<HelperOutput, AutomationError>
                     std::thread::sleep(poll);
                 }
             }
-            let clean = terminate_with_grace(&mut child, cleanup_grace);
+            let clean = terminate_with_grace(&mut child, Duration::from_millis(500));
             let _ = drain(&mut stdout, &mut frames);
             // Include evidence written during cleanup, even if a malformed
             // frame caused the protocol loop to stop.
@@ -343,7 +340,7 @@ pub(super) fn run(request: Request<'_>) -> Result<HelperOutput, AutomationError>
             } else {
                 error
             };
-            Err(with_helper_receipt(
+            Err(with_helper_progress(
                 error
                     .with_effect(if dispatched || !clean {
                         "unknown"
@@ -463,7 +460,6 @@ printf '{{"ok":true,"dispatch_started":true,"events":5}}\n'
             payload: Some(b"hi\nab"),
             handshakes: 1024,
             poll: Duration::from_millis(1),
-            cleanup_grace: Duration::from_millis(500),
             deadline: Instant::now() + Duration::from_secs(10),
             token: None,
             validation: Validation::Inline(&|_| Ok(())),

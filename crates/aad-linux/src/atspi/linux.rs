@@ -2479,7 +2479,7 @@ fn run_helper_cancellable(
                 })
                 .with_detail("dispatch_started", json!(dispatched))
                 .with_detail("helper_exited_before_kill", json!(clean_exit));
-            return Err(with_helper_receipt(
+            return Err(with_helper_progress(
                 error,
                 stdout_result.as_deref().unwrap_or_default(),
             ));
@@ -2500,7 +2500,7 @@ fn run_helper_cancellable(
             let error = super::timeout_error(dispatched || !clean_exit)
                 .with_detail("dispatch_started", json!(dispatched))
                 .with_detail("helper_exited_before_kill", json!(clean_exit));
-            return Err(with_helper_receipt(
+            return Err(with_helper_progress(
                 error,
                 stdout_result.as_deref().unwrap_or_default(),
             ));
@@ -2540,7 +2540,7 @@ fn run_helper_cancellable(
                             })
                             .with_detail("dispatch_started", json!(dispatched))
                             .with_detail("helper_exited_before_kill", json!(clean_exit));
-                    return Err(with_helper_receipt(
+                    return Err(with_helper_progress(
                         error,
                         stdout_result.as_deref().unwrap_or_default(),
                     ));
@@ -2584,31 +2584,11 @@ fn helper_progress(bytes: &[u8]) -> Option<Value> {
                 "proven_window": proven_window, "released": released}))
 }
 
-fn with_helper_receipt(mut error: AutomationError, stdout: &[u8]) -> AutomationError {
-    if let Some(progress) = helper_progress(stdout) {
-        error = error.with_detail("input_progress", progress);
+fn with_helper_progress(error: AutomationError, stdout: &[u8]) -> AutomationError {
+    match helper_progress(stdout) {
+        Some(progress) => error.with_detail("input_progress", progress),
+        None => error,
     }
-    for frame in stdout
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
-        .filter(|value| value["ok"].is_boolean())
-    {
-        if let Some(restored) = frame["restored"].as_str().filter(|state| {
-            matches!(
-                *state,
-                "untouched"
-                    | "restored"
-                    | "ownership_changed"
-                    | "cleared"
-                    | "none"
-                    | "lost"
-                    | "unknown"
-            )
-        }) {
-            error = error.with_detail("clipboard_restored", json!(restored));
-        }
-    }
-    error
 }
 
 fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
@@ -2628,7 +2608,8 @@ fn terminate(child: &mut Child) {
 }
 
 fn terminate_with_grace(child: &mut Child, grace: Duration) -> bool {
-    // Never signal a helper's process group after the helper has exited.
+    // A completed paste can leave its clipboard restorer in the process group.
+    // Never signal that group after its helper has already exited.
     if child.try_wait().ok().flatten().is_some() {
         return true;
     }
@@ -2687,7 +2668,7 @@ fn parse_input_helper(
     }
     if output.status.success() {
         let result = result.ok_or_else(|| {
-            with_helper_receipt(
+            with_helper_progress(
                 driver_error("DRIVER.UNKNOWN_EFFECT", "helper success result is missing")
                     .with_effect("unknown"),
                 &output.stdout,
@@ -2700,7 +2681,7 @@ fn parse_input_helper(
                 .and_then(Value::as_u64)
                 .is_none_or(|events| events < minimum_events)
         {
-            return Err(with_helper_receipt(
+            return Err(with_helper_progress(
                 driver_error(
                     "DRIVER.UNKNOWN_EFFECT",
                     "helper did not prove successful input dispatch",
@@ -2760,7 +2741,7 @@ fn parse_input_helper(
     let helper_code = helper_error_code(&output.stdout);
     if !dispatched {
         if let Some(mapped) = helper_code.as_deref().and_then(map_helper_code) {
-            return Err(with_helper_receipt(
+            return Err(with_helper_progress(
                 mapped
                     .with_detail("helper_code", json!(helper_code))
                     .with_detail("helper_exit_code", json!(code))
@@ -2770,7 +2751,7 @@ fn parse_input_helper(
         }
     }
     if dispatched || code == Some(70) {
-        return Err(with_helper_receipt(
+        return Err(with_helper_progress(
             driver_error(
                 "DRIVER.UNKNOWN_EFFECT",
                 "XTest helper failed after dispatch",
@@ -2800,7 +2781,7 @@ fn parse_input_helper(
             false,
         ),
     };
-    Err(with_helper_receipt(
+    Err(with_helper_progress(
         driver_error(error_code, message)
             .with_retryable(retryable)
             .with_detail("helper_exit_code", json!(code))

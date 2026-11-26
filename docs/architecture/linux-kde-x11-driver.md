@@ -157,17 +157,16 @@ frame 必须为端点的真实祖先、与 WM check 窗口属于同一 X 客户�
 | `capture` | 上述 X11 root XGetImage，按 fresh bounds 裁剪 | protected 子树、被别的窗口或子树外可见节点覆盖、非 showing 均拒绝；最小化窗口不可截 |
 | `read_text` | 会话对 capture 的 PNG 运行 `aad-ocr`（Tesseract，`prlimit` 资源限制）；BCP-47 映射为 traineddata（en→eng、zh-Hans→chi_sim 等） | 没有 tesseract 或 prlimit 时 `reads` 不列 `read_text`，调用返回 `DRIVER.OCR_UNAVAILABLE`；缺语言数据时同码并列出 `available_languages` |
 | 窗口动作 | 顶层窗口节点（应用节点的直接子节点：Qt 主窗口是 frame，裸 QWidget 窗口是 filler）。helper 找到该进程 `_NET_WM_PID` 且根坐标几何等于该节点 bounds 的唯一 client 窗口，向窗口管理器发 `WM_CHANGE_STATE`（XIconifyWindow）、`_NET_WM_STATE` 最大化/还原、`_NET_ACTIVE_WINDOW`、`_NET_CLOSE_WINDOW`，再（最多 3 秒）读回 `_NET_WM_STATE` / `WM_STATE` / `_NET_ACTIVE_WINDOW` / 窗口是否消失 | 只在有 EWMH 窗口管理器（`_NET_SUPPORTING_WM_CHECK`）时按当前状态提供；状态没达到返回 `DRIVER.UNKNOWN_EFFECT`；找不到唯一窗口 `DRIVER.STALE_SNAPSHOT` |
-| `paste` | helper 先只读保存 CLIPBOARD 的现有格式（单项不超过一次请求、合计 ≤32 MiB）。控件焦点证明通过后，在同一次 X server grab 内复核窗口焦点和原 owner、用服务器时间戳接管 CLIPBOARD 并派发 Ctrl+V。只向目标焦点窗口所属的 X client 提供文字（核对 `_NET_WM_PID` 或 X resource-id 基址）。 | 内容超限报 `DRIVER.CLIPBOARD_TOO_LARGE`。目标未取数报 `DRIVER.PASTE_NOT_CONSUMED`，effect 为 unknown。protected 元素不提供该动作。 |
+| `paste` | 聚焦后 helper 先保存 CLIPBOARD 现有全部 target（单项不超过一次请求、合计 ≤32 MiB，否则 `DRIVER.CLIPBOARD_TOO_LARGE` 不粘贴），以真实时间戳占有 CLIPBOARD，只向拥有目标进程焦点窗口的同一 X client（`_NET_WM_PID`，或与该窗口同一 resource-id 基址——Qt/GTK 的取数窗口没有 pid 属性）提供文字，通过窗口和控件焦点证明后发 Ctrl+V；之后由一个脱离的 restorer 进程持有原内容直到别人占有剪贴板（最长 1 小时） | 目标始终没来取：`DRIVER.PASTE_NOT_CONSUMED`、effect unknown；protected 元素不提供；原先没有 owner 时恢复为无 owner |
 | `clipboard_read` | 读 CLIPBOARD 的 UTF8_STRING（否则 STRING），有界 | 带 `x-kde-passwordManagerHint`（KDE / KeePassXC 的密码标记）时 `DRIVER.CLIPBOARD_PROTECTED`；INCR 大选区 `DRIVER.CLIPBOARD_TOO_LARGE` |
 | `global_key` | XTest 组合键发给当前焦点，不锚定元素 | 拒绝 Ctrl+Alt+Backspace（X zap）、Ctrl+Alt+Delete、Ctrl+Alt+L、Super+L（`DRIVER.KEY_RESERVED`）；结果 `verified: false` |
 | `launch` | 会话直接以 argv 启动白名单程序（`setsid`，不经 shell），按 AT-SPI 应用的 PID（或 `/proc/<pid>/exe` 的文件名）等待其出现 | shell、`xdg-open`、`gio` 等即使在白名单里也拒绝；不可执行文件拒绝 |
 
+restorer 恢复的是内容的拷贝：原 owner 的延迟格式此时已被取成数据，这会被剪贴板管理器视为一次新的变更。
 首次文字取数成功后，helper 继续响应同一已验证目标 client 的格式和元数据请求，直到
 250 ms 请求静默或总交付窗口达到 2 秒；每批最多处理 32 个事件，使焦点、取消和截止时间
-检查持续执行。首次派发前拒绝时，原剪贴板保持原 owner。接管后的恢复进程有独立的
-会话和 2 秒交接期限，成功后持有原内容的副本，直到另一客户端复制或满 1 小时。恢复时
-再次确认临时 offer 仍为 owner，保留用户后续的复制。原先无 owner 时释放临时 offer 即可。
-回包的 `clipboard_restored` 说明交接结果，取消或派发后失败时可从 `error.details` 取得该结果。
+检查持续执行。这是有界协议策略，不保证任意延迟客户端都能完成取数。若期间出现新的
+CLIPBOARD owner，保留其后续复制，不用旧内容覆盖；正常恢复和取消恢复仍须独立回读验证。
 
 构建 helper：
 
