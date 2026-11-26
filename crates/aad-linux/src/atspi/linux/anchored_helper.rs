@@ -312,12 +312,34 @@ pub(super) fn run(request: Request<'_>) -> Result<HelperOutput, AutomationError>
             stderr: diagnostics,
         }),
         Err(error) => {
+            let refused = matches!(
+                error.code.as_str(),
+                "DRIVER.FOCUS_LOST" | "DRIVER.STALE_SNAPSHOT"
+            ) && matches!(validation, Validation::Inline(_));
+            if refused {
+                // Let the helper observe EOF and report its native window
+                // check and cleanup before falling back to cancellation.
+                child.stdin.take();
+                let until = Instant::now() + Duration::from_millis(20);
+                while Instant::now() < until && child.try_wait().ok().flatten().is_none() {
+                    std::thread::sleep(poll);
+                }
+            }
             let clean = terminate_with_grace(&mut child, Duration::from_millis(500));
             let _ = drain(&mut stdout, &mut frames);
             // Include evidence written during cleanup, even if a malformed
             // frame caused the protocol loop to stop.
             output.extend_from_slice(&frames);
             let dispatched = helper_dispatched(&output);
+            let error = if matches!(validation, Validation::Inline(_)) {
+                if let Some(code) = helper_error_code(&output) {
+                    error.with_detail("helper_code", json!(code))
+                } else {
+                    error
+                }
+            } else {
+                error
+            };
             Err(with_helper_progress(
                 error
                     .with_effect(if dispatched || !clean {

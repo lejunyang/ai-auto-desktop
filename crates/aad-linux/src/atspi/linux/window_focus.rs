@@ -18,7 +18,140 @@ pub(super) fn append_window_args(args: &mut Vec<String>, window: &WindowAnchor, 
     }
 }
 
+pub(super) struct AnchoredKeyboard<'a> {
+    pub path: &'a Path,
+    pub args: Vec<String>,
+    pub payload: Option<&'a [u8]>,
+    pub strokes: usize,
+    pub target: &'a NativeRef,
+    pub process_id: u32,
+    pub deadline: Instant,
+    pub phase: &'a str,
+    pub minimum_events: u64,
+}
+
+const ANCHOR_POLL: Duration = Duration::from_millis(1);
+
+fn focus_ready(states: atspi::StateSet) -> bool {
+    [State::Focused, State::Enabled, State::Sensitive]
+        .into_iter()
+        .all(|state| states.contains(state))
+}
+
+fn keyboard_anchor_error(mut error: AutomationError) -> AutomationError {
+    if error.code == "DRIVER.FOCUS_LOST" {
+        if error.details.get("helper_code").and_then(Value::as_str) == Some("focus_owner_changed") {
+            error.message = "keyboard focus moved outside the observed X11 window".into();
+            error.details.remove("cause");
+        }
+        if error.effect == "unknown" {
+            error.code = "DRIVER.UNKNOWN_EFFECT".into();
+        }
+    }
+    if error.effect == "unknown" {
+        error.retryable = false;
+    }
+    error
+}
+
 impl LinuxBackend {
+    pub(super) fn run_anchored_keyboard(
+        &self,
+        request: AnchoredKeyboard<'_>,
+    ) -> Result<Value, AutomationError> {
+        let AnchoredKeyboard {
+            path,
+            mut args,
+            payload,
+            strokes,
+            target,
+            process_id,
+            deadline,
+            phase,
+            minimum_events,
+        } = request;
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        args.extend(["--anchor-token".into(), nonce.clone()]);
+        let validate = |_| self.verify_keyboard_anchor(target, process_id, deadline);
+        let output = anchored_helper::run(anchored_helper::Request {
+            path,
+            args: &args,
+            nonce: &nonce,
+            payload,
+            handshakes: strokes,
+            poll: ANCHOR_POLL,
+            deadline,
+            token: self.cancellation.as_ref(),
+            validation: anchored_helper::Validation::Inline(&validate),
+        })
+        .map_err(keyboard_anchor_error)?;
+        if !output.status.success()
+            && helper_error_code(&output.stdout).as_deref() == Some("deadline_exceeded")
+        {
+            return Err(with_helper_progress(
+                super::super::timeout_error(helper_dispatched(&output.stdout)),
+                &output.stdout,
+            ));
+        }
+        parse_input_helper(output, phase, minimum_events, process_id)
+    }
+
+    async fn input_states(&self, target: &NativeRef) -> Result<atspi::StateSet, AutomationError> {
+        self.accessible_async(target)
+            .await?
+            .get_state()
+            .await
+            .map_err(|error| native_failure("Accessible.GetState", target, error))
+    }
+
+    fn verify_keyboard_anchor(
+        &self,
+        target: &NativeRef,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<(), AutomationError> {
+        let proof = async {
+            if self.process_id_async(&target.bus_name).await != Some(process_id) {
+                return Err(super::super::stale(
+                    "observed accessibility process changed",
+                ));
+            }
+            // GetState is a method call on the observed bus and object path.
+            // There is no properties cache or tree capture in this proof.
+            let states = self.input_states(target).await.map_err(|_| {
+                super::super::stale("observed accessibility element could not be rechecked")
+            })?;
+            if states.contains(State::Defunct) {
+                return Err(super::super::stale(
+                    "observed accessibility element was removed",
+                ));
+            }
+            if !focus_ready(states) {
+                return Err(driver_error(
+                    "DRIVER.FOCUS_LOST",
+                    "the observed control lost keyboard focus",
+                )
+                .with_detail("cause", json!("focused_element_changed")));
+            }
+            Ok(())
+        };
+        // The bus connection's method timeout may be longer than the time
+        // left for this request. Keep both deadline and cancellation bounded.
+        let interrupted = async {
+            loop {
+                self.check_cancelled(false)?;
+                let left = remaining(deadline, false)?;
+                let delay = if self.cancellation.is_some() {
+                    left.min(ANCHOR_POLL)
+                } else {
+                    left
+                };
+                async_io::Timer::after(delay).await;
+            }
+        };
+        zbus::block_on(futures_lite::future::race(proof, interrupted))
+    }
+
     // Observation-time visibility recovery has no normalized Record yet.
     // This path requires a real same-application native Parent chain.
     fn native_window(
@@ -152,16 +285,8 @@ impl LinuxBackend {
     ) -> Result<u64, AutomationError> {
         let focused = || -> Result<bool, AutomationError> {
             remaining(deadline, false)?;
-            let states = zbus::block_on(self.accessible(target)?.get_state())
-                .map_err(|error| native_failure("Accessible.GetState", target, error))?;
-            Ok([
-                State::Focused,
-                State::Focusable,
-                State::Enabled,
-                State::Sensitive,
-            ]
-            .into_iter()
-            .all(|state| states.contains(state)))
+            let states = zbus::block_on(self.input_states(target))?;
+            Ok(focus_ready(states) && states.contains(State::Focusable))
         };
         if !focused()? {
             return Err(driver_error(

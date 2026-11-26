@@ -117,7 +117,7 @@ fn action_schema() -> Value {
             "secret_ref": {"type":"string", "minLength":1, "maxLength":64, "pattern":"^[A-Za-z][A-Za-z0-9_-]*$", "description":"An exact binding name listed by control_capabilities; never a secret value or an environment-variable expression."}
         }), &["secret_ref"]),
         variant("type_text", "Type text as keystrokes after focusing the element. Use \
-    only when fill is unsupported, since keystrokes go wherever focus lands.", json!({
+    fill for direct text replacement. For long text on X11, increase timeout_ms up to 30000 if needed.", json!({
             "text": {"type": "string", "maxLength": 1024},
             "mode": {
                 "enum": ["unicode", "keys"],
@@ -779,9 +779,9 @@ paste plain text (or used the shortcut for something else). Observe to see what 
 then use fill or type_text. The clipboard was put back."
         }
         "DRIVER.FOCUS_LOST" => {
-            "The element's window could not be brought to the keyboard, so no key was sent \
-(it would have gone to another application). Use activate on the window's node, observe \
-again and retry, or prefer fill, which needs no focus."
+            "The observed element lost keyboard focus, possibly to another control in the same \
+window. Observe the field again before retrying, or use fill. When present, \
+details.input_progress.delivered gives the number of strokes sent."
         }
         "DRIVER.ACTIVATION_REFUSED" => {
             "Windows' foreground lock kept this window from coming forward. Actions that do \
@@ -859,9 +859,21 @@ files; check the name, or ask the person where the file is."
 
 pub fn payload(response: Response) -> Value {
     let mut value = serde_json::to_value(response).unwrap();
-    let code = value["error"]["code"].as_str().map(str::to_string);
-    if let Some(hint) = code.as_deref().and_then(hint) {
-        value["error"]["hint"] = json!(hint);
+    let error = &value["error"];
+    let details = &error["details"];
+    let guidance = match error["code"].as_str() {
+        Some("DRIVER.UNKNOWN_EFFECT") if details["cause"] == "focused_element_changed" => Some(
+            "Keyboard focus moved to another control. Check details.input_progress.delivered \
+and observe the field's current value before continuing with fill or type_text.",
+        ),
+        Some("DRIVER.TIMEOUT") if details["input_progress"]["unit"] == "codepoint" => Some(
+            "The deadline elapsed while typing. Check details.input_progress.delivered \
+and observe the field before continuing. On X11, increase timeout_ms up to 30000 or use fill.",
+        ),
+        code => code.and_then(hint),
+    };
+    if let Some(guidance) = guidance {
+        value["error"]["hint"] = json!(guidance);
     }
     value
 }

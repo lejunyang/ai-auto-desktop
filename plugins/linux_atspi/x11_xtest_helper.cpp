@@ -539,11 +539,59 @@ bool PhysicalShift(XkbDescPtr map, KeyCode code) {
            map->map->modmap[code] == ShiftMask;
 }
 
+// Private, single-request protocol. AX work happens in Rust; this process
+// continues checking cancellation/ownership while the read-only worker waits.
+std::string_view ValidateSegment(std::string_view token, std::size_t index,
+                                    std::uint64_t deadline_ns,
+                                    const std::function<std::string_view()> &verify, int poll_ms, bool recheck_on_eof = false) {
+    std::cout << "{\"event\":\"validate_segment\",\"token\":\"" << token
+              << "\",\"index\":" << index << "}" << std::endl;
+    std::string frame;
+    const std::string expected = "ack " + std::string(token) + " " + std::to_string(index) + "\n";
+    for (;;) {
+        if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
+        if (const auto problem = verify(); !problem.empty()) return problem;
+        pollfd input{STDIN_FILENO, POLLIN, 0};
+        const int ready = poll(&input, 1, poll_ms);
+        if (ready < 0) { if (errno == EINTR) continue; return "path_ack_failed"; }
+        if (ready == 0) continue;
+        if ((input.revents & (POLLERR | POLLNVAL)) != 0) return "path_ack_failed";
+        char byte = 0;
+        const auto count = read(STDIN_FILENO, &byte, 1);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (count != 1) {
+            if (recheck_on_eof) {
+                if (const auto problem = verify(); !problem.empty()) return problem;
+            }
+            return "path_ack_eof";
+        }
+        frame.push_back(byte);
+        if (frame.size() > 96) return "path_ack_invalid";
+        if (byte == '\n') {
+            if (frame != expected) return "path_ack_invalid";
+            if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
+            return verify();
+        }
+    }
+}
+
+// Run before grabbing the server, with no injected keys held.
+std::string_view ValidateKeyboardAnchor(std::string_view token, std::size_t index,
+                                       Display *display, unsigned long pid, Atom pid_atom,
+                                       const std::optional<WindowBinding> &binding,
+                                       std::uint64_t deadline_ns) {
+    if (token.empty()) return {};
+    const auto verify = [&] { return KeyboardFocusProblem(display, pid, pid_atom, binding, deadline_ns); };
+    if (const auto problem = verify(); !problem.empty()) return problem;
+    return ValidateSegment(token, index, deadline_ns, verify, 1, true);
+}
+
 // Explicit physical typing lets the target's existing IME compose keystrokes.
 // It never installs Unicode mappings or changes the selected input method.
 int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoints,
                     std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom,
-                    const std::optional<WindowBinding> &binding, InputProgress &progress) {
+                    const std::optional<WindowBinding> &binding, InputProgress &progress,
+                    std::string_view anchor_token) {
     bool dispatched = false;
     unsigned long events = 0;
     auto fail = [&](std::string_view code, int exit_code) {
@@ -620,6 +668,10 @@ int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoin
         return DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "";
     };
     for (std::size_t index = 0; index < plan.size(); ++index) {
+        if (const auto problem = ValidateKeyboardAnchor(anchor_token, index, display, expected_pid,
+                                                        pid_atom, binding, deadline_ns); !problem.empty()) {
+            return fail(problem, problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
+        }
         const auto &stroke = plan[index];
         const KeyCode stroke_shift = stroke.shift ? shift : 0;
         bool attempted = false;
@@ -756,37 +808,6 @@ void SleepUntilOrDeadline(unsigned milliseconds, std::uint64_t deadline_ns) {
     }
 }
 
-// Private, single-request protocol. AX work happens in Rust; this process
-// continues checking cancellation/ownership while the read-only worker waits.
-std::string_view ValidatePathSegment(const GestureRequest &request, std::size_t index,
-                                    std::uint64_t deadline_ns,
-                                    const std::function<std::string_view()> &verify) {
-    std::cout << "{\"event\":\"validate_segment\",\"token\":\"" << request.path_token
-              << "\",\"index\":" << index << "}" << std::endl;
-    std::string frame;
-    const std::string expected = "ack " + request.path_token + " " + std::to_string(index) + "\n";
-    for (;;) {
-        if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
-        if (const auto problem = verify(); !problem.empty()) return problem;
-        pollfd input{STDIN_FILENO, POLLIN, 0};
-        const int ready = poll(&input, 1, 5);
-        if (ready < 0) { if (errno == EINTR) continue; return "path_ack_failed"; }
-        if (ready == 0) continue;
-        if ((input.revents & (POLLERR | POLLNVAL)) != 0) return "path_ack_failed";
-        char byte = 0;
-        const auto count = read(STDIN_FILENO, &byte, 1);
-        if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-        if (count != 1) return "path_ack_eof";
-        frame.push_back(byte);
-        if (frame.size() > 96) return "path_ack_invalid";
-        if (byte == '\n') {
-            if (frame != expected) return "path_ack_invalid";
-            if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
-            return verify();
-        }
-    }
-}
-
 int RunGesture(Display *display, std::string_view command, const GestureRequest &request,
                std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom,
                const std::optional<WindowBinding> &binding, InputProgress &progress) {
@@ -902,7 +923,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         return {};
     };
     if (!request.path.empty()) {
-        if (const auto problem = ValidatePathSegment(request, 0, deadline_ns, path_problem); !problem.empty()) {
+        if (const auto problem = ValidateSegment(request.path_token, 0, deadline_ns, path_problem, 5); !problem.empty()) {
             return finish_failure(problem, "path_preflight", kExitTargetMismatch);
         }
     }
@@ -1012,7 +1033,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                 auto route = request.path;
                 route.emplace_back(request.to_x, request.to_y);
                 for (std::size_t index = 0; index < route.size(); ++index) {
-                    if (const auto problem = ValidatePathSegment(request, index + 1, deadline_ns, path_problem); !problem.empty()) {
+                    if (const auto problem = ValidateSegment(request.path_token, index + 1, deadline_ns, path_problem, 5); !problem.empty()) {
                         return finish_failure(problem, "path_validation", kExitUnknownEffect);
                     }
                     const auto next = route[index];
@@ -1026,7 +1047,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                     if (!submitted || g_x_error) return finish_failure("x11_error", "path_dispatch", kExitUnknownEffect);
                     SleepUntilOrDeadline(15, deadline_ns);
                 }
-                if (const auto problem = ValidatePathSegment(request, route.size() + 1, deadline_ns, path_problem); !problem.empty()) {
+                if (const auto problem = ValidateSegment(request.path_token, route.size() + 1, deadline_ns, path_problem, 5); !problem.empty()) {
                     return finish_failure(problem, "path_release", kExitUnknownEffect);
                 }
             } else {
@@ -1450,6 +1471,40 @@ std::optional<std::string> ReadStdin(std::size_t limit) {
     return input;
 }
 
+// The same pipe carries subsequent ACKs. Read exactly the payload bytes
+// without a buffered stream that could consume the next frame.
+std::string_view ReadTextFrame(std::size_t limit, std::uint64_t deadline, std::string *text) {
+    auto read_bytes = [&](char *out, std::size_t length) -> std::string_view {
+        while (length != 0) {
+            if (DeadlineExpired(deadline)) return "deadline_exceeded";
+            pollfd input{STDIN_FILENO, POLLIN, 0};
+            const int ready = poll(&input, 1, 5);
+            if (ready == 0 || (ready < 0 && errno == EINTR)) continue;
+            if (ready < 0) return "unsupported_text";
+            const auto count = read(STDIN_FILENO, out, length);
+            if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+            if (count <= 0) return "unsupported_text";
+            out += count;
+            length -= static_cast<std::size_t>(count);
+        }
+        return {};
+    };
+    std::string header;
+    char byte = 0;
+    while (byte != '\n') {
+        if (const auto problem = read_bytes(&byte, 1); !problem.empty()) return problem;
+        if (byte == '\n') break;
+        if (header.size() == 25) return "input_too_large";
+        header.push_back(byte);
+    }
+    if (header.compare(0, 5, "text ") != 0) return "unsupported_text";
+    const auto size = ParseUnsigned(std::string_view(header).substr(5));
+    if (!size || *size == 0) return "unsupported_text";
+    if (*size > limit) return "input_too_large";
+    text->resize(static_cast<std::size_t>(*size));
+    return read_bytes(text->data(), text->size());
+}
+
 std::vector<Atom> AtomList(Display *display, Window window, Atom property) {
     std::vector<Atom> result;
     Atom actual_type = None;
@@ -1745,14 +1800,24 @@ bool PointMatchesWindow(Display *display, int x, int y, unsigned long pid, Atom 
     return false;
 }
 
-// Strip internal window binding options before the legacy command parsers.
+// Strip internal input anchors before the legacy command parsers.
 // All four bounds are required together; actual dispatch additionally needs id.
-bool ExtractWindowBinding(int *argc, char ***argv, std::vector<char *> *filtered,
-                          std::optional<WindowBinding> *binding) {
+bool ExtractInputAnchors(int *argc, char ***argv, std::vector<char *> *filtered,
+                          std::optional<WindowBinding> *binding, std::string_view *anchor_token) {
     filtered->assign(*argv, *argv + std::min(*argc, 2));
     WindowBinding parsed; unsigned seen = 0;
     for (int i = 2; i < *argc; ++i) {
         const std::string_view option((*argv)[i]);
+        if (option == "--anchor-token") {
+            if (!anchor_token->empty() || ++i >= *argc) return false;
+            *anchor_token = (*argv)[i];
+            if (anchor_token->size() != 32 ||
+                !std::all_of(anchor_token->begin(), anchor_token->end(),
+                             [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })) {
+                return false;
+            }
+            continue;
+        }
         unsigned bit = 0; int *destination = nullptr;
         if (option == "--window-x") { bit = 1; destination = &parsed.bounds.x; }
         if (option == "--window-y") { bit = 2; destination = &parsed.bounds.y; }
@@ -2848,13 +2913,15 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
         // This protocol handshake does not open a display or touch input state.
-        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys","anchored-drag-between"]})"
+        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys","anchored-drag-between","anchored-type-text"]})"
                   << std::endl;
         return 0;
     }
     std::optional<WindowBinding> binding;
     std::vector<char *> filtered;
-    if (!ExtractWindowBinding(&argc, &argv, &filtered, &binding) ||
+    std::string_view anchor_token;
+    if (!ExtractInputAnchors(&argc, &argv, &filtered, &binding, &anchor_token) ||
+        (!anchor_token.empty() && (command != "type-text" || !binding)) ||
         (binding.has_value() && command != "focus-info" && binding->id == None)) {
         EmitError("invalid_window_binding", "arguments", false);
         return kExitInvalid;
@@ -2944,18 +3011,17 @@ int main(int argc, char **argv) {
     std::optional<std::vector<std::uint32_t>> codepoints;
     if (command == "type-text") {
         std::string input;
-        input.reserve(kMaxInputBytes);
-        char buffer[1024];
-        while (std::cin.good()) {
-            std::cin.read(buffer, sizeof(buffer));
-            const std::streamsize count = std::cin.gcount();
-            if (count > 0) {
-                input.append(buffer, static_cast<std::size_t>(count));
-                if (input.size() > kMaxInputBytes) {
-                    EmitError("input_too_large", "text_preflight", false);
-                    return kExitInvalid;
-                }
+        if (anchor_token.empty()) {
+            auto legacy = ReadStdin(kMaxInputBytes);
+            if (!legacy) {
+                EmitError("input_too_large", "text_preflight", false);
+                return kExitInvalid;
             }
+            input = std::move(*legacy);
+        } else if (const auto problem = ReadTextFrame(kMaxInputBytes, *deadline_ns, &input);
+                   !problem.empty()) {
+            EmitError(problem, "text_preflight", false);
+            return problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitUnsupportedText;
         }
         codepoints = DecodeUtf8(input);
         if (!codepoints.has_value() || codepoints->empty()) {
@@ -2965,7 +3031,7 @@ int main(int argc, char **argv) {
     }
     std::optional<InputProgress> progress;
     if (codepoints) {
-        progress.emplace(physical_keys ? "key" : "codepoint", codepoints->size());
+        progress.emplace(physical_keys && anchor_token.empty() ? "key" : "codepoint", codepoints->size());
     } else if (command == "key-chord") {
         progress.emplace("chord", 1);
     } else if (command == "drag") {
@@ -3003,7 +3069,7 @@ int main(int argc, char **argv) {
     }
     while ((command == "type-text" || command == "key-chord" || (gesture.has_value() && !gesture->modifiers.empty())) &&
            !FocusMatchesWindow(display, expected_pid.value(), pid_atom, binding)) {
-        if (DeadlineExpired(deadline_ns.value())) {
+        if (!anchor_token.empty() || DeadlineExpired(deadline_ns.value())) {
             return refuse("focus_owner_mismatch", "target_preflight", kExitTargetMismatch, display);
         }
         usleep(5000);
@@ -3063,7 +3129,7 @@ int main(int argc, char **argv) {
 
     if (physical_keys) {
         return RunPhysicalText(display, codepoints.value(), expected_pid.value(),
-                               deadline_ns.value(), pid_atom, binding, *progress);
+                               deadline_ns.value(), pid_atom, binding, *progress, anchor_token);
     }
 
     int minimum = 0;
@@ -3154,6 +3220,11 @@ int main(int argc, char **argv) {
     }
 
     for (std::size_t index = 0; index < plan->strokes.size(); ++index) {
+        if (const auto problem = ValidateKeyboardAnchor(anchor_token, index, display, *expected_pid,
+                                                        pid_atom, binding, *deadline_ns); !problem.empty()) {
+            return finish_failure(problem, "keyboard_dispatch",
+                                  problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
+        }
         const auto &stroke = plan->strokes[index];
         const KeyCode stroke_shift = stroke.shift ? shift : 0;
         bool attempted = false;

@@ -34,13 +34,14 @@ mod table;
 mod wayland_input;
 use focus_discovery::FocusDiscovery;
 mod window_focus;
-use window_focus::append_window_args;
+use window_focus::{append_window_args, AnchoredKeyboard};
 
 const REGISTRY_NAME: &str = "org.a11y.atspi.Registry";
 const REGISTRY_PATH: &str = "/org/a11y/atspi/accessible/root";
 const DBUS_NAME: &str = "org.freedesktop.DBus";
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
+const ANCHORED_KEYBOARD: &str = "anchored-type-text";
 const XTEST_OUTPUT_LIMIT: usize = 64 * 1024;
 const CAPTURE_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 const CAPTURE_METADATA_LIMIT: usize = 64 * 1024;
@@ -263,11 +264,10 @@ impl LinuxBackend {
                 "input requires an observed top-level window",
             )
         })?;
-        self.input_helper("window-focus", deadline)?;
         let focus = self.focus(target, Some(window), deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
         let window_id = self
-            .verify_focused(target, Some(window), process_id, deadline)
+            .verify_focused_with_helper(target, Some(window), process_id, deadline, &path)
             .map_err(after_focus)?;
         // Unicode insertion cannot silently become IME composition. Explicit
         // keys mode intentionally participates in the current input method.
@@ -286,18 +286,17 @@ impl LinuxBackend {
             args.extend(["--mode".into(), "keys".into()]);
         }
         append_window_args(&mut args, window, Some(window_id));
-        let output = self
-            .run_helper(
-                &path,
-                &args,
-                Some(text.as_bytes()),
-                deadline,
-                XTEST_OUTPUT_LIMIT,
-                XTEST_OUTPUT_LIMIT,
-            )
-            .map_err(after_focus)?;
-        let input =
-            parse_input_helper(output, "keyboard_dispatch", 2, process_id).map_err(after_focus)?;
+        let input = self.run_anchored_keyboard(AnchoredKeyboard {
+            path: &path,
+            args,
+            payload: Some(text.as_bytes()),
+            strokes: text.chars().count(),
+            target,
+            process_id,
+            deadline,
+            phase: "keyboard_dispatch",
+            minimum_events: 2,
+        })?;
         Ok(
             json!({"native_interface": "Component.grab_focus -> XTEST", "focus": focus,
             "input": input, "synthetic_input": true, "mode": if keys { "keys" } else { "unicode" }}),
@@ -315,16 +314,22 @@ impl LinuxBackend {
         &'a self,
         target: &'a NativeRef,
     ) -> Result<AccessibleProxy<'a>, AutomationError> {
+        zbus::block_on(self.accessible_async(target))
+    }
+
+    async fn accessible_async<'a>(
+        &'a self,
+        target: &'a NativeRef,
+    ) -> Result<AccessibleProxy<'a>, AutomationError> {
         let builder = AccessibleProxy::builder(self.connection.inner())
             .destination(target.bus_name.as_str())
             .and_then(|builder| builder.path(target.object_path.as_str()))
             .map_err(|error| native_failure("Accessible proxy", target, error))?;
-        zbus::block_on(
-            builder
-                .cache_properties(zbus::proxy::CacheProperties::No)
-                .build(),
-        )
-        .map_err(|error| native_failure("Accessible proxy", target, error))
+        builder
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .map_err(|error| native_failure("Accessible proxy", target, error))
     }
 
     fn children(
@@ -356,9 +361,21 @@ impl LinuxBackend {
     }
 
     fn process_id(&self, bus_name: &str) -> Option<u32> {
-        Proxy::new(&self.connection, DBUS_NAME, DBUS_PATH, DBUS_INTERFACE)
-            .and_then(|proxy| proxy.call::<_, _, u32>("GetConnectionUnixProcessID", &(bus_name,)))
-            .ok()
+        zbus::block_on(self.process_id_async(bus_name))
+    }
+
+    async fn process_id_async(&self, bus_name: &str) -> Option<u32> {
+        zbus::Proxy::new(
+            self.connection.inner(),
+            DBUS_NAME,
+            DBUS_PATH,
+            DBUS_INTERFACE,
+        )
+        .await
+        .ok()?
+        .call("GetConnectionUnixProcessID", &(bus_name,))
+        .await
+        .ok()
     }
 
     fn application_info(
@@ -630,11 +647,20 @@ impl LinuxBackend {
 
     fn input_helper(&self, feature: &str, deadline: Instant) -> Result<PathBuf, AutomationError> {
         let support = self.probe_input(deadline)?;
-        support.require(feature)?;
+        if matches!(feature, "type-text" | "type-text-keys") {
+            support.require_anchored_keyboard(feature)?;
+        } else {
+            support.require(feature)?;
+        }
         if self.cancellation.is_some()
             && matches!(
                 feature,
-                "type-text" | "paste" | "pointer-click" | "window-action" | "global-key"
+                "type-text"
+                    | "type-text-keys"
+                    | "paste"
+                    | "pointer-click"
+                    | "window-action"
+                    | "global-key"
             )
         {
             support.require("cooperative-cancel")?;
@@ -829,7 +855,13 @@ impl LinuxBackend {
         {
             for (action, feature) in [("type_text", "type-text"), ("paste", "paste")] {
                 if input.is_some_and(|support| {
-                    support.has(feature) && support.has("focus-info") && support.has("window-focus")
+                    if feature == "type-text" {
+                        support.has_anchored_keyboard(feature)
+                    } else {
+                        support.has(feature)
+                            && support.has("focus-info")
+                            && support.has("window-focus")
+                    }
                 }) {
                     actions.push(action.into());
                 }
@@ -1083,8 +1115,11 @@ impl AtspiBackend for LinuxBackend {
             _ => return Ok(()),
         };
         let support = self.probe_input(deadline)?;
+        if action == "type_text" {
+            return support.require_anchored_keyboard(feature);
+        }
         support.require(feature)?;
-        if matches!(action, "type_text" | "key_chord" | "paste") {
+        if matches!(action, "key_chord" | "paste") {
             support.require("focus-info")?;
             support.require("window-focus")?;
         }
@@ -2213,6 +2248,19 @@ struct InputSupport {
 impl InputSupport {
     fn has(&self, feature: &str) -> bool {
         self.features.contains(feature)
+    }
+
+    fn has_anchored_keyboard(&self, feature: &str) -> bool {
+        [feature, ANCHORED_KEYBOARD, "focus-info", "window-focus"]
+            .into_iter()
+            .all(|feature| self.has(feature))
+    }
+
+    fn require_anchored_keyboard(&self, feature: &str) -> Result<(), AutomationError> {
+        for feature in [feature, ANCHORED_KEYBOARD, "focus-info", "window-focus"] {
+            self.require(feature)?;
+        }
+        Ok(())
     }
 
     fn require(&self, feature: &str) -> Result<(), AutomationError> {
@@ -3504,6 +3552,23 @@ mod capture_tests {
             assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
             assert_eq!(error.effect, "not_applied");
             assert_eq!(error.details["dispatch_started"], false);
+        }
+    }
+
+    #[test]
+    fn legacy_x11_helper_does_not_offer_anchored_keyboard() {
+        let support = InputSupport {
+            path: PathBuf::new(),
+            features: ["type-text", "type-text-keys", "focus-info", "window-focus"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        };
+        for feature in ["type-text", "type-text-keys"] {
+            assert!(!support.has_anchored_keyboard(feature));
+            let error = support.require_anchored_keyboard(feature).unwrap_err();
+            assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+            assert_eq!(error.details["required_feature"], ANCHORED_KEYBOARD);
         }
     }
 

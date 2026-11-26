@@ -241,14 +241,14 @@ int RunDragBetween(int argc, char **argv) {
     if (!unheld()) return fail("input_already_held","input_preflight");
     if (const auto problem=CrossRouteProof(display,source.x,source.y,destination.x,destination.y,
         source,destination,wm,type_atom,desktop_atom,decorations,*deadline);!problem.empty()) return fail(problem,"route_preflight");
-    if (const auto problem=ValidatePathSegment(request,0,*deadline,verify);!problem.empty()) return fail(problem,"path_validation");
+    if (const auto problem=ValidateSegment(request.path_token,0,*deadline,verify,5);!problem.empty()) return fail(problem,"path_validation");
     if (!unheld()) return fail("input_already_held","input_preflight");
     if (const auto problem=verify();!problem.empty()) return fail(problem,"target_preflight");
     std::cout << "{\"event\":\"dispatch_started\"}" << std::endl; dispatched=true;
     auto send=[&](bool ok) { ++event_count; XSync(display,False); return ok&&!g_x_error; };
     g_x_error=false;
     if (!send(XTestFakeMotionEvent(display,-1,source.x,source.y,1)!=0)) return fail("x11_error","source_dispatch");
-    if (const auto problem=ValidatePathSegment(request,1,*deadline,verify);!problem.empty()) return fail(problem,"hover_validation");
+    if (const auto problem=ValidateSegment(request.path_token,1,*deadline,verify,5);!problem.empty()) return fail(problem,"hover_validation");
     if (!unheld()) return fail("input_already_held","modifier_preflight");
     for(const auto code:modifier_codes) {
         bool attempted = false;
@@ -264,7 +264,7 @@ int RunDragBetween(int argc, char **argv) {
         if (!problem.empty()) return fail(problem, "modifier_dispatch");
         ++event_count;
     }
-    if (const auto problem=ValidatePathSegment(request,2,*deadline,verify);!problem.empty()) return fail(problem,"modifier_validation");
+    if (const auto problem=ValidateSegment(request.path_token,2,*deadline,verify,5);!problem.empty()) return fail(problem,"modifier_validation");
     if (!unheld(true)) return fail("input_already_held","button_preflight");
     if (const auto problem=verify();!problem.empty()) return fail(problem,"source_dispatch");
     g_x_error=false;
@@ -276,7 +276,7 @@ int RunDragBetween(int argc, char **argv) {
         usleep(5000);
     }
     for(unsigned segment=1;segment<=kCrossDragSegments;++segment) {
-        if(const auto problem=ValidatePathSegment(request,segment+2,*deadline,verify);!problem.empty()) return fail(problem,"path_validation");
+        if(const auto problem=ValidateSegment(request.path_token,segment+2,*deadline,verify,5);!problem.empty()) return fail(problem,"path_validation");
         const int x=source.x+static_cast<int>((static_cast<long long>(destination.x)-source.x)*segment/kCrossDragSegments);
         const int y=source.y+static_cast<int>((static_cast<long long>(destination.y)-source.y)*segment/kCrossDragSegments);
         if(const auto problem=CrossRouteProof(display,current_x,current_y,x,y,source,destination,wm,type_atom,desktop_atom,decorations,*deadline);!problem.empty()) return fail(problem,"route_validation");
@@ -285,7 +285,7 @@ int RunDragBetween(int argc, char **argv) {
         if (!send(XTestFakeMotionEvent(display,-1,x,y,1)!=0)) return fail("x11_error","pointer_dispatch");
         current_x=x;current_y=y;usleep(15000);
     }
-    if(const auto problem=ValidatePathSegment(request,kCrossDragSegments+3,*deadline,verify);!problem.empty()) return fail(problem,"release_validation");
+    if(const auto problem=ValidateSegment(request.path_token,kCrossDragSegments+3,*deadline,verify,5);!problem.empty()) return fail(problem,"release_validation");
     if(const auto problem=verify();!problem.empty()) return fail(problem,"release_validation");
     g_x_error=false;
     if(!send(XTestFakeButtonEvent(display,*button,False,1)!=0)) return fail("x11_error","release_dispatch");
