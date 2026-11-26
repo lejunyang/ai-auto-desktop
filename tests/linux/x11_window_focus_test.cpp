@@ -39,7 +39,7 @@ int main() {
         };
         struct Result { int code; std::string output; unsigned presses = 0; unsigned releases = 0; };
         auto invoke = [&](std::vector<std::string> args, bool geometry_only = false,
-                          std::function<void(const XEvent &)> on_event = {}) {
+                          std::function<void(const XEvent &)> on_event = {}, std::string_view text = "a") {
             XSync(display, False);
             while (XPending(display)) { XEvent event{}; XNextEvent(display, &event); }
             const auto deadline = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() + 500000000LL;
@@ -56,7 +56,7 @@ int main() {
                 _exit(aad_xtest_helper_main(static_cast<int>(raw.size()), raw.data()));
             }
             close(output[1]); close(input[0]);
-            RequireWindow(write(input[1], "a", 1) == 1, "stdin write failed"); close(input[1]);
+            RequireWindow(write(input[1], text.data(), text.size()) == static_cast<ssize_t>(text.size()), "stdin write failed"); close(input[1]);
             Result result{}; int status = 0;
             const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
             auto drain = [&] {
@@ -125,6 +125,37 @@ int main() {
         RequireWindow(proof.code == 0 && proof.output.find("\"focused\":true") != std::string::npos, "exact-window proof failed");
         const auto success = invoke({"key-chord", "--keys", "f2"});
         RequireWindow(success.code == 0 && success.presses == 1 && success.releases == 1 && released(), "bound key did not reach target child");
+        auto keyboard_map = [&] {
+            int first = 0, last = 0, width = 0;
+            XDisplayKeycodes(display, &first, &last);
+            KeySym *symbols = XGetKeyboardMapping(display, static_cast<KeyCode>(first), last - first + 1, &width);
+            RequireWindow(symbols != nullptr, "keyboard map unavailable");
+            std::vector<KeySym> result(symbols, symbols + (last - first + 1) * width);
+            XFree(symbols);
+            return result;
+        };
+        const auto before = keyboard_map();
+        unsigned wrong_window = 0;
+        bool switched = false;
+        const auto interrupted = invoke({"type-text"}, false, [&](const XEvent &event) {
+            if (event.type == KeyPress && event.xkey.window == sibling) ++wrong_window;
+            if (event.type == KeyRelease && event.xkey.window == child && !switched) {
+                switched = true;
+                XSetInputFocus(display, sibling, RevertToParent, CurrentTime);
+                XSync(display, False);
+            }
+        }, "a汉Bcd");
+        RequireWindow(switched && interrupted.code == kExitUnknownEffect && wrong_window == 0 &&
+                      interrupted.output.find("focus_owner_changed") != std::string::npos,
+                      "Unicode typing reached the other window after focus changed");
+        char keys[32]{};
+        XQueryKeymap(display, keys);
+        RequireWindow(std::none_of(std::begin(keys), std::end(keys), [](char byte) { return byte != 0; }) &&
+                      before == keyboard_map(), "interrupted typing left keys held or a changed map");
+        XSetInputFocus(display, child, RevertToParent, CurrentTime); XSync(display, False);
+        const auto recovered = invoke({"type-text"}, false, {}, "B汉");
+        RequireWindow(recovered.code == 0 && recovered.presses == 3 && recovered.releases == 3 &&
+                      before == keyboard_map(), "Unicode typing did not recover after refocus");
         bool changed = false;
         const auto changed_focus = invoke({"key-chord", "--keys", "ctrl,f2", "--hold-ms", "200"}, false, [&](const XEvent &event) {
             if (event.type == KeyPress && event.xkey.keycode == f2 && !changed) {
