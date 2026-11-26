@@ -353,6 +353,45 @@ impl Backend for NativeBackend {
             .map(|name| name.to_string())
             .collect()
     }
+    fn check_action_support(
+        &self,
+        snapshot: &Value,
+        action: &Action,
+        cross_resource: bool,
+    ) -> Result<()> {
+        let helper = &snapshot["metadata"]["input_helper"];
+        if !matches!(self.flavor, Flavor::Linux) || helper["ready"] != true {
+            return Ok(());
+        }
+        let requires_geometry = match action {
+            Action::TypeText { .. }
+            | Action::Key { .. }
+            | Action::Paste { .. }
+            | Action::Activate {}
+            | Action::Minimize {}
+            | Action::Maximize {}
+            | Action::Restore {}
+            | Action::CloseWindow {} => true,
+            Action::Click { modifiers, .. } => !modifiers.is_empty(),
+            Action::Drag {
+                path, modifiers, ..
+            } => cross_resource || !path.is_empty() || !modifiers.is_empty(),
+            _ => false,
+        };
+        if requires_geometry
+            && !helper["features"].as_array().is_some_and(|features| {
+                features
+                    .iter()
+                    .any(|feature| feature == "window-geometry-proof-v1")
+            })
+        {
+            return Err(error(
+                "DRIVER.HELPER_INCOMPATIBLE",
+                "Linux XTest helper is missing window-geometry-proof-v1",
+            ));
+        }
+        Ok(())
+    }
     fn lease_key(&self, _snapshot: &Value) -> Option<String> {
         Some("desktop-input".into())
     }

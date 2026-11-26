@@ -80,6 +80,16 @@ pub trait Backend: Send + Sync {
         ))
     }
     fn capabilities(&self) -> Vec<String>;
+    /// Report an explicit action's backend prerequisite before the generic
+    /// capability check. Discovery can omit an unavailable action.
+    fn check_action_support(
+        &self,
+        _snapshot: &Value,
+        _action: &Action,
+        _cross_resource: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
     /// Opt in only when native snapshots can remain valid independently for
     /// multiple resources and `drag_between` revalidates both endpoints. This
     /// also enables bounded, per-resource observation retention in the session.
@@ -1553,6 +1563,11 @@ impl Session {
                     None
                 };
                 let backend = &self.backends[&observation.provider];
+                backend.check_action_support(
+                    &observation.raw,
+                    action,
+                    matches!(action, Action::Drag { to, .. } if to.resource_id != target.resource_id),
+                )?;
                 let mut drag_destination = None;
                 if let Action::Drag { to, path, .. } = action {
                     if !backend.supports_cross_resource_drag()

@@ -17,6 +17,7 @@ use std::{
 struct Tree {
     distinct: bool,
     after_first: Option<usize>,
+    legacy_x11_helper: bool,
     captures: AtomicUsize,
 }
 impl Tree {
@@ -32,7 +33,14 @@ impl AtspiBackend for Tree {
         "fixture"
     }
     fn session_info(&self) -> Map<String, Value> {
-        Map::new()
+        if self.legacy_x11_helper {
+            Map::from_iter([(
+                "input_helper".into(),
+                json!({"ready":true,"protocol":1,"features":["type-text","window-focus"]}),
+            )])
+        } else {
+            Map::new()
+        }
     }
     fn list_applications(&self, _: Instant) -> Result<Vec<Map<String, Value>>> {
         Ok(vec![Self::app()])
@@ -199,4 +207,52 @@ fn session_wait_reobserves_native_ambiguity_until_unique_or_absent() {
         assert!(result.error.is_none(), "{result:?}");
         assert!(tree.captures.load(Ordering::SeqCst) >= 2);
     }
+}
+
+#[test]
+fn explicit_x11_actions_report_missing_geometry_feature_before_capability_rejection() {
+    let tree = Arc::new(Tree {
+        legacy_x11_helper: true,
+        ..Default::default()
+    });
+    let provider = Arc::new(AtspiProvider::new(tree.clone()).unwrap());
+    let session = Session::new(
+        vec![Arc::new(NativeBackend::new(provider, Flavor::Linux))],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    );
+    let call = |operation| session.execute(&Request::new(Some(session.id().into()), operation));
+    let targets = call(Operation::Targets { provider: None }).data.unwrap();
+    let observed = call(Operation::Observe {
+        resource_id: targets["resources"][0]["resource_id"]
+            .as_str()
+            .unwrap()
+            .into(),
+        max_nodes: 10,
+        view: Default::default(),
+    })
+    .data
+    .unwrap();
+    let node = &observed["nodes"][0];
+    assert!(!node["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|name| name == "type_text"));
+    for (action, code) in [
+        (
+            json!({"type":"type_text","text":"seed"}),
+            "DRIVER.HELPER_INCOMPATIBLE",
+        ),
+        (json!({"type":"close_window"}), "DRIVER.HELPER_INCOMPATIBLE"),
+        (json!({"type":"click"}), "CONTROL.ACTION_UNSUPPORTED"),
+    ] {
+        let op =
+            serde_json::from_value(json!({"method":"act","target":node["target"],"action":action}))
+                .unwrap();
+        assert_eq!(call(op).error.unwrap()["code"], code);
+    }
+    assert_eq!(tree.captures.load(Ordering::SeqCst), 1);
 }
