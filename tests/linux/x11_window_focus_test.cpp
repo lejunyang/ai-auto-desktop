@@ -135,6 +135,27 @@ int main() {
             return result;
         };
         const auto before = keyboard_map();
+        const std::string nonce = "0123456789abcdef0123456789abcdef";
+        const std::string ack = "ack " + nonce + " 0\n";
+        for (bool physical : {false, true}) {
+            std::vector<std::string> args{"type-text", "--anchor-token", nonce};
+            if (physical) args.insert(args.end(), {"--mode", "keys"});
+            const std::string framed = physical ? "text 2\naB" : "text 4\na汉";
+            const auto no_proof = invoke(args, false, {}, framed);
+            RequireWindow(no_proof.code == kExitTargetMismatch && no_proof.presses == 0 &&
+                          no_proof.releases == 0 && before == keyboard_map(),
+                          "typing dispatched before the first ACK");
+            const auto one_proof = invoke(args, false, {}, framed + ack);
+            RequireWindow(one_proof.code == kExitUnknownEffect &&
+                          one_proof.presses == 1 && one_proof.releases == 1 &&
+                          one_proof.output.find("\"index\":1") != std::string::npos &&
+                          one_proof.output.find("\"delivered\":1,\"total\":2") != std::string::npos &&
+                          one_proof.output.find("\"released\":true") != std::string::npos &&
+                          before == keyboard_map(), "typing sent a stroke without its own ACK");
+            const auto truncated = invoke(args, false, {}, "text 4\na");
+            RequireWindow(truncated.code == kExitUnsupportedText && truncated.presses == 0 &&
+                          truncated.releases == 0, "truncated text frame reached dispatch");
+        }
         unsigned wrong_window = 0;
         bool switched = false;
         const auto interrupted = invoke({"type-text"}, false, [&](const XEvent &event) {
@@ -178,7 +199,7 @@ int main() {
         const auto moved_proof = invoke({"focus-info"}, true);
         RequireWindow(moved_proof.code == 0 && moved_proof.output.find("\"focused\":false") != std::string::npos, "single-window geometry mismatch accepted");
         XCloseDisplay(display);
-        std::cout << "PASS: strict window binding, queued focus switch, failed burst cleanup, and hold cleanup\n";
+        std::cout << "PASS: strict window binding, queued focus switch, failed burst cleanup, text ACK and mapping cleanup, and hold cleanup\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "FAIL: " << error.what() << '\n'; return 1;
