@@ -283,7 +283,18 @@ fn assert_x11_helper_rejection(incompatible_handshake: bool) {
             "DRIVER.HELPER_INCOMPATIBLE",
         ),
         (json!({"type":"close_window"}), "DRIVER.HELPER_INCOMPATIBLE"),
-        (json!({"type":"click"}), "CONTROL.ACTION_UNSUPPORTED"),
+        (
+            json!({"type":"click"}),
+            if incompatible_handshake {
+                "DRIVER.HELPER_INCOMPATIBLE"
+            } else {
+                "CONTROL.ACTION_UNSUPPORTED"
+            },
+        ),
+        (
+            json!({"type":"fill","value":"seed"}),
+            "CONTROL.ACTION_UNSUPPORTED",
+        ),
     ] {
         let op =
             serde_json::from_value(json!({"method":"act","target":node["target"],"action":action}))

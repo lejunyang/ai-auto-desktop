@@ -378,10 +378,18 @@ impl Backend for NativeBackend {
             } => cross_resource || !path.is_empty() || !modifiers.is_empty(),
             _ => false,
         };
-        if !requires_geometry {
-            return Ok(());
-        }
-        if helper["ready"] == false && helper["code"] == "DRIVER.HELPER_INCOMPATIBLE" {
+        let uses_x11_helper = requires_geometry
+            || matches!(
+                action,
+                Action::Click { .. }
+                    | Action::Drag { .. }
+                    | Action::Scroll { .. }
+                    | Action::Hover { .. }
+            );
+        if uses_x11_helper
+            && helper["ready"] == false
+            && helper["code"] == "DRIVER.HELPER_INCOMPATIBLE"
+        {
             return Err(error(
                 "DRIVER.HELPER_INCOMPATIBLE",
                 helper["message"]
@@ -389,7 +397,8 @@ impl Backend for NativeBackend {
                     .unwrap_or("Linux XTest helper handshake is incompatible"),
             ));
         }
-        if helper["ready"] == true
+        if requires_geometry
+            && helper["ready"] == true
             && !helper["features"].as_array().is_some_and(|features| {
                 features
                     .iter()
