@@ -153,6 +153,8 @@ impl AtspiProvider {
         let bounds = parse_bounds(node.get("bounds"))?;
         let window = input_window(&fresh, &id)
             .ok_or_else(|| stale("drag endpoint has no observed window"))?;
+        let (original_id, _, _) = Self::revalidate_target(args, original, original, deadline)?;
+        revalidate_x11_window(original, &original_id, &fresh, &id)?;
         let point = point_in(bounds, fraction)?;
         let visibility = self.path_occlusion_record(&fresh, &id, deadline)?;
         let (visible, visible_id) = visibility
@@ -278,8 +280,7 @@ impl AtspiProvider {
             for (original, args, fraction, native, window, bounds, point, process) in &baselines {
                 let current = validator.prepare_endpoint(original, args, *fraction, deadline)?;
                 if current.native != *native
-                    || current.window.native != window.native
-                    || current.window.bounds != window.bounds
+                    || current.window != *window
                     || current.bounds != *bounds
                     || current.point != *point
                     || current.process_id != *process

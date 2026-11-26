@@ -39,12 +39,15 @@ int main() {
         };
         struct Result { int code; std::string output; unsigned presses = 0; unsigned releases = 0; };
         auto invoke = [&](std::vector<std::string> args, bool geometry_only = false,
-                          std::function<void(const XEvent &)> on_event = {}) {
+                          std::function<void(const XEvent &)> on_event = {},
+                          Geometry observed = {20, 20, 200, 200}) {
             XSync(display, False);
             while (XPending(display)) { XEvent event{}; XNextEvent(display, &event); }
             const auto deadline = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() + 500000000LL;
             args.insert(args.begin(), "helper");
-            args.insert(args.end(), {"--expected-pid", std::to_string(pid), "--deadline-monotonic-ns", std::to_string(deadline), "--window-x", "20", "--window-y", "20", "--window-width", "200", "--window-height", "200"});
+            args.insert(args.end(), {"--expected-pid", std::to_string(pid), "--deadline-monotonic-ns", std::to_string(deadline),
+                "--window-x", std::to_string(observed.x), "--window-y", std::to_string(observed.y),
+                "--window-width", std::to_string(observed.width), "--window-height", std::to_string(observed.height)});
             if (!geometry_only) args.insert(args.end(), {"--window-id", std::to_string(target)});
             int output[2], input[2];
             RequireWindow(pipe(output) == 0 && pipe(input) == 0, "pipe failed");
@@ -153,11 +156,35 @@ int main() {
         RequireWindow(helper_proof.code == 0 && helper_proof.output.find("\"focused\":true") != std::string::npos &&
                       helper_proof.output.find("\"geometry_proof\":") != std::string::npos,
                       "helper did not emit focus and geometry proof");
+        const std::string wire_proof = GeometryProofJson(*decorated);
+        auto decorated_key = [&](const std::string &proof) {
+            return invoke({"key-chord", "--keys", "f2", "--window-proof", proof}, false, {}, outer);
+        };
+        const auto decorated_result = decorated_key(wire_proof);
+        RequireWindow(decorated_result.code == 0 && decorated_result.presses == 1 &&
+                      decorated_result.releases == 1, "frozen decoration did not allow bound input");
+        auto denied = [&](const Result &result, const char *message) {
+            RequireWindow(result.code == kExitTargetMismatch && result.presses == 0 &&
+                          result.releases == 0 && released(), message);
+        };
+        denied(invoke({"key-chord", "--keys", "f2"}, false, {}, outer),
+               "legacy input accepted decorated observation");
+        denied(decorated_key("{\"version\":2}"), "unknown or incomplete proof allowed input");
+        const WindowBinding decorated_binding{target, outer, false, wire_proof};
+        RequireWindow(!PointMatchesWindow(display, 18, 12, pid, pid_atom, decorated_binding) &&
+                       PointMatchesWindow(display, 50, 50, pid, pid_atom, decorated_binding),
+                       "proof treated WM titlebar as a client hit");
+        XMoveWindow(wm, frame, outer.x + 1, outer.y);
+        XSync(wm, False);
+        denied(decorated_key(wire_proof), "initial lookup tolerance allowed frozen frame movement");
+        XMoveWindow(wm, frame, outer.x, outer.y);
+        XSync(wm, False);
         XDeleteProperty(display, target, frame_extents);
         XSync(display, False);
         const auto absent = geometry_proof(outer);
         RequireWindow(absent && !absent->extents && GeometryProofJson(*absent) != GeometryProofJson(*decorated),
                       "verified frame without extents property failed or lost change evidence");
+        denied(decorated_key(wire_proof), "extents property removal allowed frozen input");
         property(display, target, frame_extents, XA_CARDINAL, extents, 3);
         XSync(display, False);
         RequireWindow(!geometry_proof(outer), "partial extents accepted");
@@ -172,6 +199,12 @@ int main() {
         property(display, root, client_list, XA_WINDOW, ambiguous, 2);
         XSync(display, False);
         RequireWindow(!geometry_proof(outer), "client and frame candidate union was ambiguous");
+        denied(decorated_key(wire_proof), "new ambiguous window allowed frozen input");
+        XMoveWindow(display, sibling, 350, 20);
+        XSetInputFocus(display, sibling, RevertToParent, CurrentTime);
+        XSync(display, False);
+        denied(decorated_key(wire_proof), "same-PID sibling accepted decorated proof");
+        XSetInputFocus(display, child, RevertToParent, CurrentTime);
         std::vector<Window> excessive(4097, target);
         property(display, root, client_list, XA_WINDOW, excessive.data(), static_cast<int>(excessive.size()));
         XSync(display, False);
@@ -180,6 +213,16 @@ int main() {
         XSync(display, False);
         RequireWindow(!geometry_proof(outer), "missing EWMH client list accepted");
         property(display, root, client_list, XA_WINDOW, &target, 1);
+        const Window replacement = XCreateSimpleWindow(wm, root, outer.x, outer.y, outer.width, outer.height, 0, 0, 0);
+        XMapWindow(wm, replacement);
+        XSync(wm, False);
+        XReparentWindow(display, target, replacement, 5, 10);
+        XMapWindow(display, target);
+        XSetInputFocus(display, child, RevertToParent, CurrentTime);
+        XSync(display, False);
+        const auto replaced = geometry_proof(outer);
+        RequireWindow(replaced && replaced->observed_window == replacement, "replacement frame fixture is invalid");
+        denied(decorated_key(wire_proof), "equal-sized WM frame replacement accepted old proof");
         const Window fake = XCreateSimpleWindow(display, root, outer.x, outer.y, outer.width, outer.height, 0, 0, 0);
         XMapWindow(display, fake);
         XReparentWindow(display, target, fake, 5, 10);

@@ -82,10 +82,19 @@ pub struct NativeRef {
 
 /// A top-level window from the same freshly captured tree as an input target.
 /// This is an internal anchor, never a caller-provided coordinate or window id.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WindowAnchor {
     pub native: NativeRef,
     pub bounds: Bounds,
+    x11: Option<X11WindowBinding>,
+}
+
+/// Private platform state returned by the Linux backend for this observation.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct X11WindowBinding {
+    client: u32,
+    proof: Value,
 }
 
 /// Private native path: source, intermediate anchors, then destination. Every
@@ -160,6 +169,14 @@ impl Bounds {
 }
 
 pub trait AtspiBackend: Send + Sync {
+    #[doc(hidden)]
+    fn observe_x11_windows(
+        &self,
+        _snapshot: &mut BackendSnapshot,
+        _deadline: Instant,
+    ) -> BTreeMap<usize, X11WindowBinding> {
+        BTreeMap::new()
+    }
     fn read_table(
         &self,
         _target: &NativeRef,
@@ -571,6 +588,7 @@ struct Scope {
 struct Record {
     public: Value,
     handles: BTreeMap<String, NativeRef>,
+    x11_windows: BTreeMap<String, X11WindowBinding>,
     fingerprints: BTreeMap<String, String>,
     members: BTreeSet<String>,
     application_selector: Map<String, Value>,
@@ -752,7 +770,7 @@ impl AtspiProvider {
                     200000,
                     "max_characters",
                 )? as usize;
-                let (_, _, node, native) = self.fresh_target(args, deadline, false)?;
+                let (_, _, node, native) = self.fresh_target(args, deadline, false, false)?;
                 if node["states"]["protected"] != false
                     || node["provenance"]["scope_context"] == true
                 {
@@ -966,7 +984,7 @@ impl AtspiProvider {
         scope: Option<Scope>,
         deadline: Instant,
     ) -> Result<Record, AutomationError> {
-        let raw = match scope.as_ref() {
+        let mut raw = match scope.as_ref() {
             Some(scope) => {
                 self.backend
                     .capture_scope(selector, &scope.root, max_depth, max_nodes, deadline)?
@@ -981,6 +999,7 @@ impl AtspiProvider {
                 "backend exceeded the requested node limit",
             ));
         }
+        let mut observed_windows = self.backend.observe_x11_windows(&mut raw, deadline);
         let mut state = self
             .state
             .lock()
@@ -990,6 +1009,7 @@ impl AtspiProvider {
         let snapshot_id = format!("{}:{revision}", self.generation);
         let mut nodes = Vec::with_capacity(raw.nodes.len());
         let mut handles = BTreeMap::new();
+        let mut x11_windows = BTreeMap::new();
         let mut fingerprints = BTreeMap::new();
         let mut members = BTreeSet::new();
         let mut structural_members = BTreeSet::new();
@@ -1009,6 +1029,9 @@ impl AtspiProvider {
                 })
                 .transpose()?;
             let node_id = format!("n{index}");
+            if let Some(binding) = observed_windows.remove(&index) {
+                x11_windows.insert(node_id.clone(), binding);
+            }
             let in_scope = scope.as_ref().is_none_or(|scope| item.native == scope.root)
                 || parent_id
                     .as_ref()
@@ -1120,6 +1143,7 @@ impl AtspiProvider {
         let record = Record {
             public,
             handles,
+            x11_windows,
             fingerprints,
             members,
             application_selector: selector.clone(),
@@ -1271,11 +1295,12 @@ impl AtspiProvider {
         args: &Map<String, Value>,
         deadline: Instant,
         pin_invoke_name: bool,
+        pin_x11_window: bool,
     ) -> Result<(Record, String, Value, NativeRef), AutomationError> {
         let record = self.observed_record(args)?;
         // Reject invalid observed references before asking the backend for a
         // fresh tree. Both checks use the same identity/fingerprint rules.
-        let (_, observed, _) = Self::revalidate_target(args, &record, &record, deadline)?;
+        let (observed_id, observed, _) = Self::revalidate_target(args, &record, &record, deadline)?;
         let fresh = self.capture_scoped(
             &record.application_selector,
             record.max_depth,
@@ -1285,6 +1310,9 @@ impl AtspiProvider {
         )?;
         let (fresh_id, resolved, native) =
             Self::revalidate_target(args, &record, &fresh, deadline)?;
+        if pin_x11_window {
+            revalidate_x11_window(&record, &observed_id, &fresh, &fresh_id)?;
+        }
         // On a Chromium checkbox the default action can reverse while the
         // object, role and locator all remain identical.
         if pin_invoke_name {
@@ -1310,7 +1338,7 @@ impl AtspiProvider {
         let observed = self.observed_record(args)?;
         let (_, observed_node, _) = Self::revalidate_target(args, &observed, &observed, deadline)?;
         check_secret_target(&observed_node)?;
-        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline, false)?;
+        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline, false, false)?;
         check_secret_target(&node)?;
         remaining(deadline, false)?;
         let result = self.backend.secret_input(&native, text, deadline);
@@ -1413,8 +1441,11 @@ impl AtspiProvider {
         } else {
             None
         };
+        let pin_x11_window = matches!(action, "type_text" | "key_chord" | "paste")
+            || !modifiers.is_empty()
+            || !path.is_empty();
         let (fresh, fresh_id, node, native) =
-            self.fresh_target(args, deadline, action == "invoke")?;
+            self.fresh_target(args, deadline, action == "invoke", pin_x11_window)?;
         let available = node["actions"].as_array().expect("normalized action array");
         if !available.iter().any(|value| value == action) {
             self.backend.check_action_support(action, deadline)?;
@@ -1581,9 +1612,7 @@ impl AtspiProvider {
                     return Err(stale("drag surface geometry or input state changed"));
                 }
                 let current_window = input_window(&now, &id);
-                if expected_window.as_ref().map(|w| (&w.native, w.bounds))
-                    != current_window.as_ref().map(|w| (&w.native, w.bounds))
-                {
+                if expected_window != current_window {
                     return Err(stale("drag window identity or geometry changed"));
                 }
                 let checked = if index == 0 {
@@ -1915,7 +1944,7 @@ impl AtspiProvider {
         args: &Map<String, Value>,
         deadline: Instant,
     ) -> Result<(Vec<u8>, Map<String, Value>), AutomationError> {
-        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline, false)?;
+        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline, false, false)?;
         let expanded = self.private_window_record(&fresh, &fresh_id, "capture", deadline)?;
         let (visibility, visibility_id) = expanded
             .as_ref()
@@ -2848,10 +2877,24 @@ fn input_window(record: &Record, node_id: &str) -> Option<WindowAnchor> {
             return Some(WindowAnchor {
                 native: record.handles.get(&id)?.clone(),
                 bounds,
+                x11: record.x11_windows.get(&id).cloned(),
             });
         }
     }
     None
+}
+
+fn revalidate_x11_window(
+    observed: &Record,
+    observed_id: &str,
+    fresh: &Record,
+    fresh_id: &str,
+) -> Result<(), AutomationError> {
+    let binding = |record, id| input_window(record, id).filter(|window| window.x11.is_some());
+    if binding(observed, observed_id) != binding(fresh, fresh_id) {
+        return Err(stale("observed X11 window geometry or identity changed"));
+    }
+    Ok(())
 }
 
 fn descendants(record: &Record, node_id: &str) -> BTreeSet<String> {

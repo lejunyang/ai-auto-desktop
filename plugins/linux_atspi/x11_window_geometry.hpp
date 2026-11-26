@@ -266,3 +266,12 @@ std::string GeometryProofJson(const WindowGeometryProof &proof) {
     }
     return json + "}";
 }
+
+std::optional<WindowGeometryProof> RecheckGeometryProof(const Ewmh &ewmh, unsigned long pid,
+                                                        const WindowBinding &binding) {
+    auto proof = FindGeometryProof(ewmh, pid, binding.bounds);
+    if (!proof || proof->client != binding.id || GeometryProofJson(*proof) != binding.proof) {
+        return std::nullopt;
+    }
+    return proof;
+}

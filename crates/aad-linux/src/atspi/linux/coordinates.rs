@@ -120,27 +120,10 @@ impl LinuxBackend {
                 })?
                 .to_string(),
         };
-        let children = self.child_references(&app, deadline)?;
-        let count = zbus::block_on(self.accessible(&app)?.child_count())
-            .map_err(|e| native_failure("coordinate window count", &app, e))?;
-        if usize::try_from(count).ok() != Some(children.returned_count)
-            || children.items.len() > 128
-        {
-            return Err(driver_error(
-                "DRIVER.COORDINATE_UNPROVEN",
-                "complete direct-window inventory unavailable",
-            ));
-        }
         let mut result = Vec::new();
-        for native in children.items {
+        for native in self.direct_windows(&app, deadline)? {
             self.check_cancelled(false)?;
             remaining(deadline, false)?;
-            if native.bus_name != app.bus_name {
-                return Err(driver_error(
-                    "DRIVER.COORDINATE_UNPROVEN",
-                    "application window belongs to another bus",
-                ));
-            }
             let name = zbus::block_on(self.accessible(&native)?.name())
                 .map_err(|e| native_failure("coordinate window name", &native, e))?;
             let (x, y, width, height) = zbus::block_on(

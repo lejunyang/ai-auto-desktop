@@ -1,6 +1,6 @@
 use super::{
     driver_error, remaining, AtspiBackend, AutomationError, BackendNode, BackendSnapshot, Bounds,
-    Gesture, Map, NativeRef, Value, WindowAnchor, MAX_FIELD_CHARS, MAX_NODES,
+    Gesture, Map, NativeRef, Value, WindowAnchor, X11WindowBinding, MAX_FIELD_CHARS, MAX_NODES,
 };
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::action::ActionProxy;
@@ -33,7 +33,7 @@ mod table;
 mod wayland_input;
 use focus_discovery::FocusDiscovery;
 mod window_focus;
-use window_focus::append_window_args;
+use window_focus::{append_window_args, GEOMETRY_FEATURE};
 
 const REGISTRY_NAME: &str = "org.a11y.atspi.Registry";
 const REGISTRY_PATH: &str = "/org/a11y/atspi/accessible/root";
@@ -263,10 +263,11 @@ impl LinuxBackend {
             )
         })?;
         self.input_helper("window-focus", deadline)?;
+        self.input_helper(GEOMETRY_FEATURE, deadline)?;
+        let binding = window.input_binding()?;
         let focus = self.focus(target, Some(window), deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-        let window_id = self
-            .verify_focused(target, Some(window), process_id, deadline)
+        self.verify_focused(target, Some(window), process_id, deadline)
             .map_err(after_focus)?;
         // Unicode insertion cannot silently become IME composition. Explicit
         // keys mode intentionally participates in the current input method.
@@ -284,7 +285,7 @@ impl LinuxBackend {
         if keys {
             args.extend(["--mode".into(), "keys".into()]);
         }
-        append_window_args(&mut args, window, Some(window_id));
+        append_window_args(&mut args, window, Some(binding));
         let output = self
             .run_helper(
                 &path,
@@ -352,6 +353,30 @@ impl LinuxBackend {
         Ok(ChildReferences::new(
             children.into_iter().map(Self::native).collect(),
         ))
+    }
+
+    fn direct_windows(
+        &self,
+        app: &NativeRef,
+        deadline: Instant,
+    ) -> Result<Vec<NativeRef>, AutomationError> {
+        let children = self.child_references(app, deadline)?;
+        let count = zbus::block_on(self.accessible(app)?.child_count())
+            .map_err(|e| native_failure("application window count", app, e))?;
+        let mut paths = BTreeSet::new();
+        if usize::try_from(count).ok() != Some(children.returned_count)
+            || children.items.len() > 128
+            || children
+                .items
+                .iter()
+                .any(|child| child.bus_name != app.bus_name || !paths.insert(&child.object_path))
+        {
+            return Err(driver_error(
+                "DRIVER.COORDINATE_UNPROVEN",
+                "complete direct-window inventory unavailable",
+            ));
+        }
+        Ok(children.items)
     }
 
     fn process_id(&self, bus_name: &str) -> Option<u32> {
@@ -507,35 +532,33 @@ impl LinuxBackend {
         if args.iter().any(|arg| arg == "--hold-ms") {
             support.require("bounded-hold")?;
         }
-        if args.first().is_some_and(|command| command == "key-chord")
-            || args.iter().any(|arg| arg == "--modifiers")
-        {
-            support.require("focus-info")?;
-            support.require("window-focus")?;
-        }
-        let path = support.path;
-        let focus = if args.first().is_some_and(|command| command == "key-chord") {
-            let proof = self.focus(target, window, deadline)?;
-            std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-            self.verify_focused(target, window, process_id, deadline)
-                .map_err(after_focus)?;
-            Some(proof)
-        } else {
-            None
-        };
-        if args.first().is_some_and(|command| command == "key-chord")
-            || args.iter().any(|arg| arg == "--modifiers")
-        {
+        let keyboard = args.first().is_some_and(|command| command == "key-chord");
+        let bound = if keyboard || args.iter().any(|arg| arg == "--modifiers") {
+            for feature in ["focus-info", "window-focus", GEOMETRY_FEATURE] {
+                support.require(feature)?;
+            }
             let window = window.ok_or_else(|| {
                 driver_error(
                     "DRIVER.ACTION_UNSUPPORTED",
                     "input requires an observed top-level window",
                 )
             })?;
-            // Feature checked before any focus request or keyboard dispatch.
-            let window_id =
-                self.verify_window_with_helper(target, window, process_id, deadline, &path)?;
-            append_window_args(&mut args, window, Some(window_id));
+            Some((window, window.input_binding()?))
+        } else {
+            None
+        };
+        let path = support.path;
+        let mut focus = None;
+        if let Some((window, binding)) = bound {
+            if keyboard {
+                focus = Some(self.focus(target, Some(window), deadline)?);
+                std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+                self.verify_focused_with_helper(target, Some(window), process_id, deadline, &path)
+                    .map_err(after_focus)?;
+            } else {
+                self.verify_window_with_helper(target, window, process_id, deadline, &path, true)?;
+            }
+            append_window_args(&mut args, window, Some(binding));
         }
         let input_error = |error| {
             if focus.is_some() {
@@ -790,9 +813,11 @@ impl LinuxBackend {
         // Qt Quick can report hidden states for its actual focused text input.
         // Recover only keyboard actions, with independent live focus ownership;
         // input paths repeat the focus check after GrabFocus before dispatch.
-        let visibility_recovery = input
-            .is_some_and(|support| support.has("focus-info") && support.has("window-focus"))
-            && !fully_interactive
+        let visibility_recovery = input.is_some_and(|support| {
+            support.has("focus-info")
+                && support.has("window-focus")
+                && support.has(GEOMETRY_FEATURE)
+        }) && !fully_interactive
             && toolkit == Some("Qt")
             && states.is_some_and(|states| {
                 [
@@ -828,7 +853,10 @@ impl LinuxBackend {
         {
             for (action, feature) in [("type_text", "type-text"), ("paste", "paste")] {
                 if input.is_some_and(|support| {
-                    support.has(feature) && support.has("focus-info") && support.has("window-focus")
+                    support.has(feature)
+                        && support.has("focus-info")
+                        && support.has("window-focus")
+                        && support.has(GEOMETRY_FEATURE)
                 }) {
                     actions.push(action.into());
                 }
@@ -857,6 +885,7 @@ impl LinuxBackend {
                     support.has("key-chord")
                         && support.has("focus-info")
                         && support.has("window-focus")
+                        && support.has(GEOMETRY_FEATURE)
                 })
             {
                 actions.push("key_chord".into());
@@ -995,9 +1024,18 @@ impl AtspiBackend for LinuxBackend {
     }
     fn supports_cross_resource_drag(&self) -> bool {
         self.probe_input(Instant::now() + Duration::from_secs(1))
-            .is_ok_and(|support| support.require("anchored-drag-between").is_ok())
+            .is_ok_and(|support| {
+                support.has("anchored-drag-between") && support.has(GEOMETRY_FEATURE)
+            })
     }
 
+    fn observe_x11_windows(
+        &self,
+        snapshot: &mut BackendSnapshot,
+        deadline: Instant,
+    ) -> BTreeMap<usize, X11WindowBinding> {
+        self.capture_x11_window_bindings(snapshot, deadline)
+    }
     fn drag_between(
         &self,
         request: super::DragBetweenRequest<'_>,
@@ -1086,6 +1124,7 @@ impl AtspiBackend for LinuxBackend {
         if matches!(action, "type_text" | "key_chord" | "paste") {
             support.require("focus-info")?;
             support.require("window-focus")?;
+            support.require(GEOMETRY_FEATURE)?;
         }
         Ok(())
     }
@@ -1850,10 +1889,11 @@ impl AtspiBackend for LinuxBackend {
             )
         })?;
         self.input_helper("window-focus", deadline)?;
+        self.input_helper(GEOMETRY_FEATURE, deadline)?;
+        let binding = window.input_binding()?;
         let focus = self.focus(target, Some(window), deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-        let window_id = self
-            .verify_focused(target, Some(window), process_id, deadline)
+        self.verify_focused(target, Some(window), process_id, deadline)
             .map_err(after_focus)?;
         let mut args = vec![
             "paste".to_string(),
@@ -1862,7 +1902,7 @@ impl AtspiBackend for LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        append_window_args(&mut args, window, Some(window_id));
+        append_window_args(&mut args, window, Some(binding));
         let output = self.run_helper(
             &path,
             &args,

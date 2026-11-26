@@ -224,6 +224,7 @@ struct WindowBinding {
     Window id = None;
     Geometry bounds;
     bool request_proof = false;
+    std::string proof{};
 };
 bool FocusMatchesWindow(Display *, unsigned long, Atom, const std::optional<WindowBinding> &);
 bool PointMatchesWindow(Display *, int, int, unsigned long, Atom, const std::optional<WindowBinding> &);
@@ -1544,24 +1545,29 @@ std::optional<Window> FindClientWindow(const Ewmh &ewmh, unsigned long pid, cons
     return std::nullopt;
 }
 
-// Keyboard ownership requires the precise observed client window and live
-// geometry. A child focus window is allowed; a same-process sibling is not.
-bool FocusMatchesWindow(Display *display, unsigned long pid, Atom pid_atom,
-                        const std::optional<WindowBinding> &binding) {
-    if (!FocusBelongsToPid(display, pid, pid_atom)) return false;
-    if (!binding.has_value()) return true; // legacy helper protocol only
-    if (binding->id == None || OwnPid(display, binding->id, pid_atom) != pid) return false;
-    const auto bounds = RootGeometry(display, binding->id);
+bool BoundClientViewable(Display *display, unsigned long pid, Atom pid_atom, Window id) {
     XWindowAttributes attributes{};
-    if (!bounds.has_value() || !XGetWindowAttributes(display, binding->id, &attributes) ||
-        attributes.map_state != IsViewable ||
-        std::abs(static_cast<long long>(bounds->x) - binding->bounds.x) > 2 ||
-        std::abs(static_cast<long long>(bounds->y) - binding->bounds.y) > 2 ||
-        bounds->width != binding->bounds.width || bounds->height != binding->bounds.height) return false;
+    return ValidXid(id) && OwnPid(display, id, pid_atom) == pid &&
+        XGetWindowAttributes(display, id, &attributes) && !g_x_error &&
+        attributes.map_state == IsViewable && !attributes.override_redirect &&
+        attributes.c_class == InputOutput;
+}
+
+bool WindowBindingMatches(Display *display, unsigned long pid, Atom pid_atom,
+                          const WindowBinding &binding, int legacy_tolerance) {
+    if (!BoundClientViewable(display, pid, pid_atom, binding.id)) return false;
+    if (!binding.proof.empty()) return RecheckGeometryProof(LoadEwmh(display), pid, binding).has_value();
+    const auto bounds = RootGeometry(display, binding.id);
+    return bounds && GeometryMatches(*bounds, binding.bounds, legacy_tolerance);
+}
+
+bool FocusInClient(Display *display, Window client) {
     Window current = None; int revert = 0;
+    g_x_error = false;
     XGetInputFocus(display, &current, &revert); XSync(display, False);
+    if (g_x_error) return false;
     for (int depth = 0; depth < 64 && current != None && current != PointerRoot; ++depth) {
-        if (current == binding->id) return true;
+        if (current == client) return true;
         Window root = None, parent = None, *children = nullptr; unsigned count = 0;
         g_x_error = false;
         const Status found = XQueryTree(display, current, &root, &parent, &children, &count);
@@ -1573,14 +1579,15 @@ bool FocusMatchesWindow(Display *display, unsigned long pid, Atom pid_atom,
     return false;
 }
 
-bool PointMatchesWindow(Display *display, int x, int y, unsigned long pid, Atom pid_atom,
+// Keyboard focus must be in the observed client, including its children.
+bool FocusMatchesWindow(Display *display, unsigned long pid, Atom pid_atom,
                         const std::optional<WindowBinding> &binding) {
-    if (!binding.has_value() || binding->id == None || OwnPid(display, binding->id, pid_atom) != pid) return false;
-    const auto bounds = RootGeometry(display, binding->id);
-    XWindowAttributes attributes{};
-    if (!bounds.has_value() || !XGetWindowAttributes(display, binding->id, &attributes) ||
-        attributes.map_state != IsViewable || bounds->x != binding->bounds.x || bounds->y != binding->bounds.y ||
-        bounds->width != binding->bounds.width || bounds->height != binding->bounds.height) return false;
+    return FocusBelongsToPid(display, pid, pid_atom) &&
+        (!binding || (WindowBindingMatches(display, pid, pid_atom, *binding, 2) &&
+                      FocusInClient(display, binding->id)));
+}
+
+bool PointInClient(Display *display, int x, int y, Window client) {
     Window current = DefaultRootWindow(display);
     for (int depth = 0; depth < 64; ++depth) {
         Window child = None; int local_x = 0, local_y = 0;
@@ -1588,10 +1595,16 @@ bool PointMatchesWindow(Display *display, int x, int y, unsigned long pid, Atom 
         const bool ok = XTranslateCoordinates(display, DefaultRootWindow(display), current, x, y, &local_x, &local_y, &child) != 0;
         XSync(display, False);
         if (!ok || g_x_error || child == None) return false;
-        if (child == binding->id) return true;
+        if (child == client) return true;
         current = child;
     }
     return false;
+}
+
+bool PointMatchesWindow(Display *display, int x, int y, unsigned long pid, Atom pid_atom,
+                        const std::optional<WindowBinding> &binding) {
+    return binding && WindowBindingMatches(display, pid, pid_atom, *binding, 0) &&
+        PointInClient(display, x, y, binding->id);
 }
 
 // Strip internal window binding options before the legacy command parsers.
@@ -1609,6 +1622,7 @@ bool ExtractWindowBinding(int *argc, char ***argv, std::vector<char *> *filtered
         if (option == "--window-height") { bit = 8; destination = &parsed.bounds.height; }
         if (option == "--window-id") bit = 16;
         if (option == "--geometry-proof") bit = 32;
+        if (option == "--window-proof") bit = 64;
         if (bit == 0) { filtered->push_back((*argv)[i]); continue; }
         if ((seen & bit) != 0 || ++i >= *argc) return false;
         seen |= bit;
@@ -1618,13 +1632,18 @@ bool ExtractWindowBinding(int *argc, char ***argv, std::vector<char *> *filtered
             const auto id = ParseUnsigned((*argv)[i]);
             if (!id.has_value() || *id == 0 || *id > 0xffffffffUL) return false;
             parsed.id = static_cast<Window>(*id);
-        } else {
+        } else if (bit == 32) {
             if (std::string_view((*argv)[i]) != "1") return false;
             parsed.request_proof = true;
+        } else {
+            const std::string_view proof((*argv)[i]);
+            if (proof.empty() || proof.size() > kMaxGeometryProofBytes) return false;
+            parsed.proof = proof;
         }
     }
     if (seen) {
-        if ((seen & 15) != 15 || parsed.bounds.width <= 0 || parsed.bounds.height <= 0) return false;
+        if ((seen & 15) != 15 || !ValidGeometry(parsed.bounds) ||
+            ((seen & 64) && ((seen & 16) == 0 || (seen & 32)))) return false;
         *binding = parsed;
     }
     *argc = static_cast<int>(filtered->size());
@@ -2038,7 +2057,15 @@ int RunFocusInfo(int argc, char **argv, std::optional<WindowBinding> binding) {
     std::optional<WindowGeometryProof> proof;
     if (binding.has_value()) {
         const auto ewmh = LoadEwmh(display);
-        if (binding->request_proof) {
+        if (!binding->proof.empty()) {
+            proof = RecheckGeometryProof(ewmh, static_cast<unsigned long>(pid), *binding);
+            if (!proof) {
+                binding->id = None;
+            } else {
+                binding->bounds = proof->client_bounds;
+                binding->proof.clear();
+            }
+        } else if (binding->request_proof) {
             proof = FindGeometryProof(ewmh, static_cast<unsigned long>(pid), binding->bounds);
             binding->id = proof ? proof->client : None;
             if (proof) binding->bounds = proof->client_bounds;

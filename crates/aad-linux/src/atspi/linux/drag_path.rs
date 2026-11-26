@@ -39,6 +39,7 @@ impl LinuxBackend {
             "anchored-drag-path",
             "cooperative-cancel",
             "window-focus",
+            GEOMETRY_FEATURE,
         ] {
             support.require(feature)?;
         }
@@ -54,49 +55,14 @@ impl LinuxBackend {
                 "drag path requires an observed top-level window",
             )
         })?;
-        if window.native.bus_name != target.bus_name
-            || self.process_id(&target.bus_name) != Some(process_id)
-        {
-            return Err(driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                "drag window process is not proven",
-            ));
-        }
-        // Resolve the exact observed window without activating it or requiring
-        // keyboard focus for an unmodified pointer gesture.
-        let mut lookup = vec![
-            "focus-info".into(),
-            "--expected-pid".into(),
-            process_id.to_string(),
-            "--deadline-monotonic-ns".into(),
-            monotonic_deadline_ns(deadline)?.to_string(),
-        ];
-        append_window_args(&mut lookup, window, None);
-        let proof = self.run_helper(
-            &support.path,
-            &lookup,
-            None,
+        let binding = self.verify_window_with_helper(
+            target,
+            window,
+            process_id,
             deadline,
-            XTEST_OUTPUT_LIMIT,
-            XTEST_OUTPUT_LIMIT,
+            &support.path,
+            !modifiers.is_empty(),
         )?;
-        let proof_value = parse_one_json_object(&proof.stdout, "drag window")?;
-        let window_id = proof_value
-            .get("window")
-            .and_then(Value::as_u64)
-            .filter(|id| *id > 0 && *id <= u32::MAX as u64);
-        if !proof.status.success()
-            || proof_value.get("ok") != Some(&json!(true))
-            || proof_value.get("window_bound") != Some(&json!(true))
-            || proof_value.get("expected_pid") != Some(&json!(process_id))
-            || window_id.is_none()
-            || (!modifiers.is_empty() && proof_value.get("focused") != Some(&json!(true)))
-        {
-            return Err(driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                "drag window identity or modifier focus is not proven",
-            ));
-        }
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let last = points[points.len() - 1];
         let path = points[1..points.len() - 1]
@@ -125,7 +91,7 @@ impl LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        append_window_args(&mut args, window, window_id);
+        append_window_args(&mut args, window, Some(binding));
         if !modifiers.is_empty() {
             args.extend(["--modifiers".into(), modifiers.join(",")]);
         }
