@@ -29,6 +29,8 @@ class X11:
             ("XSync", integer, [pointer, integer]),
             ("XGetInputFocus", integer, [pointer, c.POINTER(unsigned), c.POINTER(integer)]),
             ("XQueryKeymap", integer, [pointer, c.c_char_p]),
+            ("XInternAtom", unsigned, [pointer, c.c_char_p, integer]),
+            ("XGetSelectionOwner", unsigned, [pointer, unsigned]),
         ):
             fn = getattr(self.api, name)
             fn.restype, fn.argtypes = result, args
@@ -49,6 +51,10 @@ class X11:
         keys = c.create_string_buffer(32)
         assert self.api.XQueryKeymap(self.display, keys)
         return [i for i in range(256) if keys.raw[i // 8] & (1 << i % 8)]
+
+    def clipboard_owner(self):
+        atom = self.api.XInternAtom(self.display, b"CLIPBOARD", 0)
+        return self.api.XGetSelectionOwner(self.display, atom)
 
 
 def fixture(role, state_file):
@@ -198,12 +204,26 @@ def helper_proxy(state_file, helper, args):
         x = X11()
         assert x.focused() == current["owner_xid"]
         x.focus(current["sink_xid"])
+    if case in {"paste_refused", "paste_timed_out", "paste_owner_timeout", "paste_owner_cancel"} and args[0] == "paste":
+        deadline = args[args.index("--deadline-monotonic-ns") + 1]
+        os.environ.update(
+            LD_PRELOAD=str(state_file.with_name("paste-restore-delay.so")),
+            AAD_TEST_RESTORE_STARTED=str(state_file.with_suffix(f".{case}.restore")),
+        )
+        if case == "paste_timed_out":
+            os.environ["AAD_TEST_RESTORE_AFTER_NS"] = deadline
+        if case in {"paste_owner_timeout", "paste_owner_cancel"}:
+            os.environ["AAD_TEST_OWNER_REPLY"] = str(state_file.with_suffix(f".{case}.owner-reply"))
+        if case == "paste_owner_timeout":
+            os.environ["AAD_TEST_OWNER_REPLY_AFTER_NS"] = deadline
     if case not in {"first_stroke", "chord_refused", "paste_refused"} or "--anchor-token" not in args:
         os.execv(helper, [helper, *args])
     with subprocess.Popen([helper, *args], stdout=subprocess.PIPE, text=True) as child:
         for line in child.stdout:
             frame = json.loads(line)
             if frame.get("event") == "validate_segment" and frame["index"] == 0:
+                if case == "paste_refused":
+                    state_file.with_suffix(".clipboard-owner").write_text(str(X11().clipboard_owner()))
                 trigger = state_file.with_suffix(".switch")
                 trigger.touch()
                 until(lambda: not trigger.exists(), "same-window focus switch", seconds=2)
@@ -224,6 +244,10 @@ def trial(aad, helper, out, baseline, scenario):
             os.environ.pop(key, None)
         events = {role: out / f"{role}.ndjson" for role in ("owner", "sink")}
         state_file = root / "case.json"
+        if not baseline:
+            subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC",
+                            str(Path(__file__).with_name("x11_paste_restore_delay.c")),
+                            "-ldl", "-o", str(root / "paste-restore-delay.so")], check=True)
         proxy = root / "helper"
         proxy_args = [sys.executable, str(Path(__file__).resolve()), "helper-proxy",
                       str(state_file), helper]
@@ -285,7 +309,7 @@ def trial(aad, helper, out, baseline, scenario):
             return {node["name"]: node for node in observed_nodes()
                     if node.get("name") in {"Target entry", "Sibling entry"}}
 
-        def run(case, action, target=None, **switch):
+        def run(case, action, target=None, timeout_ms=10000, before_reply=None, **switch):
             x.focus(fixtures["owner"]["xid"])
             set_case(case, **switch)
             until(lambda: all(any(r["kind"] == "reset" for r in rows(role, case))
@@ -293,7 +317,11 @@ def trial(aad, helper, out, baseline, scenario):
             if target is None:
                 target = entries()["Target entry"]["target"]
             start = time.monotonic_ns()
-            reply = mcp.tool("act", request_id=case, target=target, action=action)
+            pending = mcp.tool("act", wait=False, request_id=case, target=target,
+                               action=action, timeout_ms=timeout_ms)
+            if before_reply is not None:
+                before_reply(case, pending)
+            reply = mcp.recv(pending)
             elapsed_ms = (time.monotonic_ns() - start) / 1e6
             values = {name: node.get("value") for name, node in entries().items()}
             widgets = rows("owner", case) + rows("sink", case)
@@ -337,9 +365,81 @@ def trial(aad, helper, out, baseline, scenario):
                 "focus_owner_changed", False, fixtures["owner"]["xid"]), reply
             assert values == {"Target entry": "", "Sibling entry": ""} and not presses, (values, presses)
 
+        def paste_recovery():
+            def copy_original():
+                subprocess.run(["xclip", "-selection", "clipboard"], input=b"original clip", check=True)
+
+            def read_clipboard(case):
+                read = subprocess.run(["xclip", "-selection", "clipboard", "-o"], capture_output=True)
+                emit(checkpoints, "clipboard_read", case=case, status=read.returncode,
+                     text=read.stdout.decode(), owner=x.clipboard_owner())
+                return read.returncode, read.stdout
+
+            def cancel_at_confirmation(case, request):
+                until(state_file.with_suffix(f".{case}.owner-reply").exists, "clipboard takeover")
+                mcp.send("notifications/cancelled", {"requestId": request}, notification=True)
+
+            def interrupt_ownership(case, timeout_ms, before_reply=None):
+                copy_original()
+                reply, values, _ = run(case, dict(type="paste", text="must not be inserted"),
+                                       timeout_ms=timeout_ms, before_reply=before_reply)
+                clipboard = read_clipboard(case)
+                held_confirmation = state_file.with_suffix(f".{case}.owner-reply").exists()
+                restorer_started = state_file.with_suffix(f".{case}.restore").exists()
+                emit(checkpoints, "clipboard_confirm", case=case, held_confirmation=held_confirmation,
+                     restorer_started=restorer_started)
+                keys = [row for role in events for row in rows(role, case)
+                        if row["kind"] in {"key_down", "key_up"}]
+                return reply, values, keys, clipboard, held_confirmation, restorer_started
+
+            empty = {"Target entry": "", "Sibling entry": ""}
+            original = (0, b"original clip")
+
+            copy_original()
+            original_owner = x.clipboard_owner()
+            assert original_owner
+            refused, refused_values, presses = run("paste_refused", dict(type="paste", text="must not be inserted"))
+            refused_clipboard = read_clipboard("paste_refused")
+            owner_at_proof = int(state_file.with_suffix(".clipboard-owner").read_text())
+            emit(checkpoints, "clipboard_at_proof", case="paste_refused", original_owner=original_owner,
+                 owner_at_proof=owner_at_proof,
+                 restorer_started=state_file.with_suffix(".paste_refused.restore").exists())
+            assert refused_values == empty and not presses, (refused_values, presses)
+
+            copy_original()
+            delayed, values, presses = run("paste_timed_out", dict(type="paste", text="粘贴"), timeout_ms=1200)
+            delayed_clipboard = read_clipboard("paste_timed_out")
+            delayed_restorer = state_file.with_suffix(".paste_timed_out.restore").exists()
+            timed_out_at_owner = interrupt_ownership("paste_owner_timeout", 1200)
+            cancelled_at_owner = interrupt_ownership("paste_owner_cancel", 10000, cancel_at_confirmation)
+
+            assert delayed_restorer, delayed
+            assert values == {"Target entry": "粘贴", "Sibling entry": ""} and presses, (values, presses)
+            assert owner_at_proof == original_owner and refused_clipboard == original, refused
+            assert not state_file.with_suffix(".paste_refused.restore").exists(), refused
+            denied(refused, "DRIVER.FOCUS_LOST", ("cause", "focused_element_changed"), 0, 1, "not_applied")
+            assert refused["error"]["details"]["clipboard_restored"] == "untouched", refused
+            assert delayed_clipboard == original, delayed
+            denied(delayed, "DRIVER.TIMEOUT", ("clipboard_restored", "restored"), 1, 1, "unknown")
+
+            for result, code in ((timed_out_at_owner, "DRIVER.TIMEOUT"),
+                                 (cancelled_at_owner, "DRIVER.CANCELLED")):
+                reply, values, keys, clipboard, held_confirmation, restorer_started = result
+                assert held_confirmation and restorer_started, result
+                assert values == empty and not keys and clipboard == original, result
+                denied(reply, code, ("clipboard_restored", "restored"), 0, 1, "not_applied")
+                assert reply["error"]["details"]["dispatch_started"] is False, reply
+
+            reply, values, presses = run("paste_reobserved", dict(type="paste", text="粘贴"))
+            assert reply["effect"] == "applied" and values == {"Target entry": "粘贴", "Sibling entry": ""}, reply
+            assert read_clipboard("paste_reobserved") == original
+
         if scenario == "window-preflight":
             first_stroke_cross_window()
             typed("window_preflight_reobserved", "abc")
+            return
+        if scenario == "paste-recovery":
+            paste_recovery()
             return
 
         old = entries()["Target entry"]["target"]
@@ -371,19 +471,14 @@ def trial(aad, helper, out, baseline, scenario):
             assert [(r["target"], r["key"]) for r in presses] == [("Target entry", "k")], presses
             typed("cross_process_reobserved", "normal")
 
-            subprocess.run(["xclip", "-selection", "clipboard"], input=b"original clip", check=True)
             for case, action, total in (
                 ("first_stroke", dict(type="type_text", text="abc"), 3),
                 ("chord_refused", dict(type="key", keys=["ctrl", "a"]), 1),
-                ("paste_refused", dict(type="paste", text="must not be inserted"), 1),
             ):
                 reply, values, presses = run(case, action)
                 denied(reply, "DRIVER.FOCUS_LOST", ("cause", "focused_element_changed"), 0, total, "not_applied")
                 assert values == {"Target entry": "", "Sibling entry": ""} and not presses, (values, presses)
-            assert subprocess.check_output(["xclip", "-selection", "clipboard", "-o"]) == b"original clip"
-            reply, values, presses = run("paste_reobserved", dict(type="paste", text="粘贴"))
-            assert reply["effect"] == "applied" and values == {"Target entry": "粘贴", "Sibling entry": ""}, reply
-            assert subprocess.check_output(["xclip", "-selection", "clipboard", "-o"]) == b"original clip"
+            paste_recovery()
             reply, _, presses = run("chord_reobserved", dict(type="key", keys=["f2"]))
             assert reply["effect"] == "applied" and [r["key"] for r in presses] == ["F2"], reply
 
@@ -406,7 +501,7 @@ if __name__ == "__main__":
         parser.add_argument("helper", type=Path)
         parser.add_argument("output", type=Path)
         parser.add_argument("--baseline", action="store_true")
-        parser.add_argument("--scenario", choices=["full", "window-preflight"], default="full")
+        parser.add_argument("--scenario", choices=["full", "window-preflight", "paste-recovery"], default="full")
         args = parser.parse_args()
         if args.baseline and args.scenario != "full":
             parser.error("--baseline requires the full scenario")
