@@ -18,6 +18,7 @@ struct Tree {
     distinct: bool,
     after_first: Option<usize>,
     legacy_x11_helper: bool,
+    context_sibling: bool,
     captures: AtomicUsize,
 }
 impl Tree {
@@ -79,10 +80,11 @@ impl AtspiBackend for Tree {
                     states: Default::default(),
                     bounds: None,
                     actions: vec![],
-                    provenance: json!({"bus_name":":1.42","object_path":path})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
+                    provenance: json!({"bus_name":":1.42","object_path":path,
+                        "focus_context": self.context_sibling && i == 1})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
                 }
             })
             .collect();
@@ -212,7 +214,9 @@ fn session_wait_reobserves_native_ambiguity_until_unique_or_absent() {
 #[test]
 fn explicit_x11_actions_report_missing_geometry_feature_before_capability_rejection() {
     let tree = Arc::new(Tree {
+        distinct: true,
         legacy_x11_helper: true,
+        context_sibling: true,
         ..Default::default()
     });
     let provider = Arc::new(AtspiProvider::new(tree.clone()).unwrap());
@@ -253,6 +257,21 @@ fn explicit_x11_actions_report_missing_geometry_feature_before_capability_reject
             serde_json::from_value(json!({"method":"act","target":node["target"],"action":action}))
                 .unwrap();
         assert_eq!(call(op).error.unwrap()["code"], code);
+    }
+    let context = &observed["nodes"][1];
+    assert_eq!(context["provenance"]["scope_context"], true);
+    for (target, action) in [
+        (&context["target"], json!({"type":"close_window"})),
+        (
+            &node["target"],
+            json!({"type":"drag","to":context["target"],"modifiers":["shift"]}),
+        ),
+    ] {
+        let op = serde_json::from_value(json!({"method":"act","target":target,"action":action}))
+            .unwrap();
+        let response = call(op);
+        assert_eq!(response.effect, "not_applied");
+        assert_eq!(response.error.unwrap()["code"], "CONTROL.STALE_TARGET");
     }
     assert_eq!(tree.captures.load(Ordering::SeqCst), 1);
 }

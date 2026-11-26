@@ -1504,7 +1504,8 @@ impl Session {
                         .unwrap()
                         .iter()
                         .find(|n| n["node_id"] == id)
-                        .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed"))
+                        .filter(|n| n["provenance"]["scope_context"] != true)
+                        .ok_or_else(|| error("CONTROL.STALE_TARGET", "node was not observed inside the action scope"))
                 };
                 let mut node = observed(&target.node_id)?;
                 let mut folder_node;
@@ -1563,11 +1564,6 @@ impl Session {
                     None
                 };
                 let backend = &self.backends[&observation.provider];
-                backend.check_action_support(
-                    &observation.raw,
-                    action,
-                    matches!(action, Action::Drag { to, .. } if to.resource_id != target.resource_id),
-                )?;
                 let mut drag_destination = None;
                 if let Action::Drag { to, path, .. } = action {
                     if !backend.supports_cross_resource_drag()
@@ -1606,9 +1602,7 @@ impl Session {
                                 "truncated destination observation cannot authorize input",
                             ));
                         }
-                        if node["provenance"]["scope_context"] == true
-                            || destination_node["provenance"]["scope_context"] == true
-                        {
+                        if destination_node["provenance"]["scope_context"] == true {
                             return Err(error(
                                 "CONTROL.STALE_TARGET",
                                 "drag endpoints must be inside their observed scopes",
@@ -1644,6 +1638,7 @@ impl Session {
                         }
                     }
                 }
+                backend.check_action_support(&observation.raw, action, drag_destination.is_some())?;
                 if !backend
                     .capabilities()
                     .iter()
