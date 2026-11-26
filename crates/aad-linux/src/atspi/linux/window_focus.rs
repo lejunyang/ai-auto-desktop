@@ -137,7 +137,13 @@ impl LinuxBackend {
                     .iter()
                     .find(|node| node.parent_index == Some(0) && node.native == native)
                     .and_then(|node| node.bounds)
-                    .map_or_else(|| self.window_bounds(&native, deadline), Ok)?;
+                    .map_or_else(
+                        || {
+                            let raw = self.window_bounds(&native, deadline)?;
+                            self.physical_window_bounds(&native, raw, deadline)
+                        },
+                        Ok,
+                    )?;
                 Ok((native, bounds))
             })
             .collect()
