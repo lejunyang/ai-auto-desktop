@@ -262,7 +262,6 @@ impl LinuxBackend {
                 "input requires an observed top-level window",
             )
         })?;
-        self.input_helper("window-focus", deadline)?;
         let focus = self.focus(target, Some(window), deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
         let window_id = self
@@ -510,8 +509,7 @@ impl LinuxBackend {
         if args.first().is_some_and(|command| command == "key-chord")
             || args.iter().any(|arg| arg == "--modifiers")
         {
-            support.require("focus-info")?;
-            support.require("window-focus")?;
+            support.require_keyboard_route()?;
         }
         let path = support.path;
         let focus = if args.first().is_some_and(|command| command == "key-chord") {
@@ -630,10 +628,18 @@ impl LinuxBackend {
     fn input_helper(&self, feature: &str, deadline: Instant) -> Result<PathBuf, AutomationError> {
         let support = self.probe_input(deadline)?;
         support.require(feature)?;
+        if matches!(feature, "type-text" | "type-text-keys" | "paste") {
+            support.require_keyboard_route()?;
+        }
         if self.cancellation.is_some()
             && matches!(
                 feature,
-                "type-text" | "paste" | "pointer-click" | "window-action" | "global-key"
+                "type-text"
+                    | "type-text-keys"
+                    | "paste"
+                    | "pointer-click"
+                    | "window-action"
+                    | "global-key"
             )
         {
             support.require("cooperative-cancel")?;
@@ -790,8 +796,7 @@ impl LinuxBackend {
         // Qt Quick can report hidden states for its actual focused text input.
         // Recover only keyboard actions, with independent live focus ownership;
         // input paths repeat the focus check after GrabFocus before dispatch.
-        let visibility_recovery = input
-            .is_some_and(|support| support.has("focus-info") && support.has("window-focus"))
+        let visibility_recovery = input.is_some_and(InputSupport::has_keyboard_route)
             && !fully_interactive
             && toolkit == Some("Qt")
             && states.is_some_and(|states| {
@@ -827,9 +832,8 @@ impl LinuxBackend {
             && !protected
         {
             for (action, feature) in [("type_text", "type-text"), ("paste", "paste")] {
-                if input.is_some_and(|support| {
-                    support.has(feature) && support.has("focus-info") && support.has("window-focus")
-                }) {
+                if input.is_some_and(|support| support.has(feature) && support.has_keyboard_route())
+                {
                     actions.push(action.into());
                 }
             }
@@ -853,11 +857,8 @@ impl LinuxBackend {
                 }
             }
             if fully_interactive
-                && input.is_some_and(|support| {
-                    support.has("key-chord")
-                        && support.has("focus-info")
-                        && support.has("window-focus")
-                })
+                && input
+                    .is_some_and(|support| support.has("key-chord") && support.has_keyboard_route())
             {
                 actions.push("key_chord".into());
             }
@@ -1084,8 +1085,7 @@ impl AtspiBackend for LinuxBackend {
         let support = self.probe_input(deadline)?;
         support.require(feature)?;
         if matches!(action, "type_text" | "key_chord" | "paste") {
-            support.require("focus-info")?;
-            support.require("window-focus")?;
+            support.require_keyboard_route()?;
         }
         Ok(())
     }
@@ -1849,7 +1849,6 @@ impl AtspiBackend for LinuxBackend {
                 "input requires an observed top-level window",
             )
         })?;
-        self.input_helper("window-focus", deadline)?;
         let focus = self.focus(target, Some(window), deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
         let window_id = self
@@ -2201,6 +2200,7 @@ impl LinuxBackend {
 }
 
 const INPUT_HELPER_PROTOCOL: u64 = 1;
+const KEYBOARD_ROUTE_FEATURES: [&str; 3] = ["focus-info", "window-focus", "atomic-key-dispatch"];
 
 /// Capabilities describe the binary, not the user's display. Live display,
 /// focus, UID and hit checks still run for every actual operation.
@@ -2223,6 +2223,19 @@ impl InputSupport {
                     .with_detail("required_feature", json!(feature)),
             )
         }
+    }
+
+    fn has_keyboard_route(&self) -> bool {
+        KEYBOARD_ROUTE_FEATURES
+            .iter()
+            .all(|feature| self.has(feature))
+    }
+
+    fn require_keyboard_route(&self) -> Result<(), AutomationError> {
+        for feature in KEYBOARD_ROUTE_FEATURES {
+            self.require(feature)?;
+        }
+        Ok(())
     }
 }
 
@@ -3548,6 +3561,27 @@ mod capture_tests {
         assert_eq!(error.details["required_feature"], "bounded-hold");
         assert!(!support.has("focus-info"));
         assert!(!support.has("window-focus"));
+    }
+
+    #[test]
+    fn old_helper_supports_plain_pointer_input_without_proving_keyboard_dispatch() {
+        let features = parse_helper_description(HelperOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: br#"{"helper":"aad-linux-xtest","protocol":1,"features":["pointer-gesture","type-text","key-chord","paste","focus-info","window-focus"]}"#.to_vec(),
+            stderr: vec![],
+        }).unwrap();
+        let mut support = InputSupport {
+            path: "/unused".into(),
+            features,
+        };
+        assert!(support.require("pointer-gesture").is_ok());
+        assert!(!support.has_keyboard_route());
+        let error = support.require_keyboard_route().unwrap_err();
+        assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+        assert_eq!(error.details["required_feature"], "atomic-key-dispatch");
+        support.features.insert("atomic-key-dispatch".into());
+        assert!(support.has_keyboard_route());
+        assert!(support.require_keyboard_route().is_ok());
     }
 
     #[test]
