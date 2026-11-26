@@ -122,6 +122,13 @@ impl LinuxBackend {
             monotonic_deadline_ns(deadline)?.to_string(),
         ]);
         let validate = |_| self.verify_keyboard_anchor(target, process_id, deadline);
+        // Clipboard handoff is allowed to finish on its own two-second
+        // deadline, even if the request was cancelled or timed out.
+        let cleanup_grace = if args[0] == "paste" {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_millis(500)
+        };
         let output = anchored_helper::run(anchored_helper::Request {
             path,
             args: &args,
@@ -129,6 +136,7 @@ impl LinuxBackend {
             payload,
             handshakes: strokes,
             poll: ANCHOR_POLL,
+            cleanup_grace,
             deadline,
             token: self.cancellation.as_ref(),
             validation: anchored_helper::Validation::Inline(&validate),
@@ -137,7 +145,7 @@ impl LinuxBackend {
         if !output.status.success()
             && helper_error_code(&output.stdout).as_deref() == Some("deadline_exceeded")
         {
-            return Err(with_helper_progress(
+            return Err(with_helper_receipt(
                 super::super::timeout_error(helper_dispatched(&output.stdout)),
                 &output.stdout,
             ));

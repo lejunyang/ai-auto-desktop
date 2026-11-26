@@ -67,11 +67,14 @@ int HandleXError(Display *, XErrorEvent *) {
     return 0;
 }
 
-void EmitError(std::string_view code, std::string_view phase, bool dispatched) {
+void EmitError(std::string_view code, std::string_view phase, bool dispatched,
+               std::string_view restored = {}) {
     std::cout << "{\"ok\":false,\"code\":\"" << code
               << "\",\"phase\":\"" << phase
               << "\",\"dispatch_started\":"
-              << (dispatched ? "true" : "false") << "}" << std::endl;
+              << (dispatched ? "true" : "false");
+    if (!restored.empty()) std::cout << ",\"restored\":\"" << restored << '"';
+    std::cout << "}" << std::endl;
 }
 
 bool DeadlineExpired(std::uint64_t deadline_ns) {
@@ -2319,15 +2322,14 @@ int RunClipboardRead(int argc, char **argv) {
 }
 
 // A server timestamp for selection ownership (ICCCM forbids CurrentTime).
-Time ServerTime(const Selection &selection) {
+Time ServerTime(const Selection &selection, std::uint64_t deadline_ns) {
     const Atom stamp = XInternAtom(selection.display, "AAD_TIMESTAMP", False);
     unsigned char zero = 0;
     XChangeProperty(selection.display, selection.window, stamp, XA_STRING, 8, PropModeAppend,
                     &zero, 0);
     XFlush(selection.display);
     XEvent event{};
-    if (WaitEvent(selection.display, selection.window, PropertyNotify, &event,
-                  std::numeric_limits<std::uint64_t>::max(), 1000)) {
+    if (WaitEvent(selection.display, selection.window, PropertyNotify, &event, deadline_ns, 1000)) {
         return event.xproperty.time;
     }
     return CurrentTime;
@@ -2431,50 +2433,59 @@ std::optional<std::vector<Item>> SaveClipboard(const Selection &selection,
     return saved;
 }
 
-// Own CLIPBOARD with the saved contents from a detached process until another
-// client takes it (or an hour passes), so the person's clipboard survives.
-bool StartRestorer(const std::vector<Item> &saved, int inherited_display_fd) {
+// Restore only the offer this action acquired. The worker has its own session
+// and startup bound, then serves the saved contents until ownership changes.
+std::string_view RestoreClipboard(const std::vector<Item> &saved, const Selection &offer) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const auto deadline_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        deadline.time_since_epoch()).count();
     int ready[2];
     if (pipe(ready) != 0) {
-        return false;
+        return "lost";
     }
     const pid_t child = fork();
     if (child < 0) {
         close(ready[0]);
         close(ready[1]);
-        return false;
+        return "lost";
     }
     if (child == 0) {
         close(ready[0]);
-        if (fork() != 0) {
-            _exit(0);  // the grandchild is reparented and never waited for
-        }
-        // This new process owns only clipboard restoration, not the cancelled
-        // input operation. Its bounded server-timestamp wait must still run.
+        if (setsid() == -1) _exit(1);
         g_input_cancelled = 0;
         std::signal(SIGTERM, SIG_DFL);
         std::signal(SIGINT, SIG_DFL);
+        std::signal(SIGPIPE, SIG_IGN);
+        // Also bound Xlib startup if the X server stops answering. Leave time
+        // to report the handoff after its separate two-second deadline.
+        alarm(3);
         // Never touch the parent's X connection; just let go of its socket.
-        close(inherited_display_fd);
+        close(ConnectionNumber(offer.display));
         const int null = open("/dev/null", O_RDWR);
-        if (null >= 0) {
-            dup2(null, 0);
-            dup2(null, 1);
-            dup2(null, 2);
-        }
+        if (null < 0) _exit(1);
+        dup2(null, 0);
+        dup2(null, 1);
+        dup2(null, 2);
+        if (null > STDERR_FILENO) close(null);
         Display *display = XOpenDisplay(nullptr);
         if (display == nullptr) {
             _exit(1);
         }
         const Selection selection = OpenSelection(display);
-        XSelectInput(display, selection.window, PropertyChangeMask);
-        const Time time = ServerTime(selection);
-        XSetSelectionOwner(display, selection.clipboard, selection.window, time);
-        const bool owned = XGetSelectionOwner(display, selection.clipboard) == selection.window;
-        const char signal = owned ? '1' : '0';
-        if (write(ready[1], &signal, 1) < 0) {
-            _exit(1);
-        }
+        const Time time = ServerTime(selection, deadline_ns);
+        const auto problem = AtomicBurst(display, [&]() -> std::string_view {
+            if (DeadlineExpired(deadline_ns) || time == CurrentTime) return "deadline_exceeded";
+            return XGetSelectionOwner(display, selection.clipboard) == offer.window
+                ? "" : "ownership_changed";
+        }, [&] {
+            XSetSelectionOwner(display, selection.clipboard, selection.window, time);
+            return XGetSelectionOwner(display, selection.clipboard) == selection.window;
+        }, [] {});
+        const bool owned = problem.empty();
+        alarm(0);
+        const char signal = owned ? '1' : problem == "ownership_changed" ? '2' : '0';
+        // Keep serving after a successful handoff even if the action exited.
+        (void)write(ready[1], &signal, 1);
         close(ready[1]);
         const auto until = std::chrono::steady_clock::now() + std::chrono::hours(1);
         while (owned && std::chrono::steady_clock::now() < until) {
@@ -2494,13 +2505,23 @@ bool StartRestorer(const std::vector<Item> &saved, int inherited_display_fd) {
         _exit(0);
     }
     close(ready[1]);
-    int status = 0;
-    waitpid(child, &status, 0);
-    char signal = '0';
+    std::string_view result = "unknown";
     pollfd fds[1] = {{ready[0], POLLIN, 0}};
-    const bool answered = poll(fds, 1, 2000) > 0 && read(ready[0], &signal, 1) == 1;
+    for (auto now = std::chrono::steady_clock::now(); now < deadline;
+         now = std::chrono::steady_clock::now()) {
+        const auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count();
+        const int polled = poll(fds, 1, static_cast<int>(left));
+        if (polled < 0 && errno == EINTR) continue;
+        if (polled > 0) {
+            char signal = '0';
+            const auto length = read(ready[0], &signal, 1);
+            if (length < 0 && errno == EINTR) continue;
+            result = signal == '1' ? "restored" : signal == '2' ? "ownership_changed" : "lost";
+        }
+        break;
+    }
     close(ready[0]);
-    return answered && signal == '1';
+    return result;
 }
 
 std::optional<std::vector<KeyCode>> ChordCodes(Display *display,
@@ -2665,7 +2686,7 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding,
     auto refuse = [&](std::string_view code, std::string_view phase, int exit_code) {
         progress.Emit(display);
         XCloseDisplay(display);
-        EmitError(code, phase, false);
+        EmitError(code, phase, false, "untouched");
         return exit_code;
     };
     const Atom pid_atom = XInternAtom(display, "_NET_WM_PID", True);
@@ -2683,28 +2704,31 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding,
     }
     const Selection selection = OpenSelection(display);
     auto fail = [&](std::string_view code, std::string_view phase, bool dispatched,
-                    int pre_dispatch_exit) {
+                    int pre_dispatch_exit, std::string_view restored = "untouched") {
         XDestroyWindow(display, selection.window);
         progress.Emit(display);
         XCloseDisplay(display);
-        EmitError(code, phase, dispatched);
+        EmitError(code, phase, dispatched, restored);
         return dispatched ? kExitUnknownEffect : pre_dispatch_exit;
     };
     // Keep what the person had before anything changes.
-    const bool had_owner = XGetSelectionOwner(display, selection.clipboard) != None;
+    const Window previous_owner = XGetSelectionOwner(display, selection.clipboard);
     std::vector<Item> saved;
-    if (had_owner) {
+    if (previous_owner != None) {
         std::string problem;
-        const auto kept = SaveClipboard(selection, deadline.value(), &problem);
+        auto kept = SaveClipboard(selection, deadline.value(), &problem);
         if (!kept.has_value()) {
             return fail(problem, "clipboard_preflight", false, kExitTooLarge);
         }
-        saved = kept.value();
+        saved = std::move(*kept);
     }
     // A cancelled clipboard read can have returned only part of the original
     // offer. Never replace its owner unless the entire preflight completed.
     if (DeadlineExpired(deadline.value())) {
         return fail("deadline_exceeded", "clipboard_preflight", false, kExitTimeoutBeforeDispatch);
+    }
+    if (previous_owner != None && saved.empty()) {
+        return fail("clipboard_busy", "clipboard_preflight", false, kExitUnavailable);
     }
     const std::vector<Item> offer = {
         {selection.utf8, selection.utf8, 8, text},
@@ -2712,27 +2736,8 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding,
         {selection.text, selection.utf8, 8, text},
         {selection.password_hint, selection.password_hint, 8, "secret"},
     };
-    const Time time = ServerTime(selection);
-    XSetSelectionOwner(display, selection.clipboard, selection.window, time);
-    if (XGetSelectionOwner(display, selection.clipboard) != selection.window) {
-        return fail("clipboard_busy", "clipboard_preflight", false, kExitUnavailable);
-    }
-    auto restore = [&]() -> std::string {
-        // A new owner may represent a later user copy. Restore only while this
-        // transaction still owns the temporary selection.
-        if (XGetSelectionOwner(display, selection.clipboard) != selection.window) {
-            return "ownership_changed";
-        }
-        if (!had_owner) {
-            XSetSelectionOwner(display, selection.clipboard, None, CurrentTime);
-            XSync(display, False);
-            return "cleared";
-        }
-        if (saved.empty()) {
-            return "none";
-        }
-        return StartRestorer(saved, ConnectionNumber(display)) ? "restored" : "lost";
-    };
+    const auto mask = ResourceMask(display, selection.window);
+    const Time time = ServerTime(selection, *deadline);
     // The caller has just focused the element; give the focus change a moment.
     const auto focus_until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     while (!FocusMatchesWindow(display, static_cast<unsigned long>(pid.value()), pid_atom, binding) &&
@@ -2742,39 +2747,54 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding,
     }
     if (DeadlineExpired(deadline.value()) ||
         !FocusMatchesWindow(display, static_cast<unsigned long>(pid.value()), pid_atom, binding)) {
-        restore();
         return fail("focus_owner_mismatch", "target_preflight", false, kExitTargetMismatch);
+    }
+    if (time == CurrentTime) {
+        return fail("clipboard_busy", "clipboard_preflight", false, kExitUnavailable);
     }
     if (const auto problem = ValidateKeyboardAnchor(anchor_token, 0, display, *pid,
                                                     pid_atom, binding, *deadline); !problem.empty()) {
-        restore();
         return fail(problem, "keyboard_preflight", false,
                     problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
     }
-    const auto mask = ResourceMask(display, selection.window);
     Window pid_window = None;
     bool dispatched = false;
     bool attempted = false;
+    bool clipboard_busy = false;
+    auto restore = [&]() -> std::string_view {
+        if (!attempted) return "untouched";
+        if (XGetSelectionOwner(display, selection.clipboard) != selection.window) {
+            return "ownership_changed";
+        }
+        // Destroying this offer's window also clears the initially empty selection.
+        return previous_owner == None ? "cleared" : RestoreClipboard(saved, selection);
+    };
     const auto problem = AtomicBurst(display, [&]() -> std::string_view {
         if (const auto focus = KeyboardFocusProblem(display, *pid, pid_atom, binding, *deadline);
             !focus.empty()) return focus;
-        if (XGetSelectionOwner(display, selection.clipboard) != selection.window) return "clipboard_busy";
+        // A copy made during the save or while awaiting ACK belongs to the user.
+        if (XGetSelectionOwner(display, selection.clipboard) != previous_owner) return "clipboard_busy";
         pid_window = FocusedPidWindow(display, *pid, pid_atom);
         if (pid_window == None) return "focus_owner_changed";
         if (const auto keys = VerifyStrokeKeys(display, v, control); !keys.empty()) return keys;
         return DeadlineExpired(*deadline) ? "deadline_exceeded" : "";
     }, [&] {
+        XSetSelectionOwner(display, selection.clipboard, selection.window, time);
+        if (XGetSelectionOwner(display, selection.clipboard) != selection.window) {
+            clipboard_busy = true;
+            return false;
+        }
         attempted = true;
         return SubmitKeystroke(display, v, control);
-    }, [&] { ReleaseKeystroke(display, v, control); });
+    }, [&] { if (attempted) ReleaseKeystroke(display, v, control); });
     if (attempted) {
         MarkDispatchStarted(dispatched);
         progress.RecordKey(v, binding, control);
     }
     if (!problem.empty()) {
-        restore();
-        return fail(problem, "keyboard_dispatch", dispatched,
-                    problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
+        return fail(clipboard_busy ? "clipboard_busy" : problem, "keyboard_dispatch", dispatched,
+                    problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch,
+                    restore());
     }
     progress.delivered = 1;
     // Serve the text only to the expected process; wait (bounded) for it.
@@ -2800,8 +2820,7 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding,
             break;
         }
         if (!FocusMatchesWindow(display, static_cast<unsigned long>(*pid), pid_atom, binding)) {
-            restore();
-            return fail("focus_owner_changed", "paste_delivery", true, kExitUnknownEffect);
+            return fail("focus_owner_changed", "paste_delivery", true, kExitUnknownEffect, restore());
         }
         unsigned batch_events = 0;
         while (!lost && XPending(display) > 0 && !DeadlineExpired(deadline.value()) &&
@@ -2833,7 +2852,7 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding,
         pollfd fds[1] = {{ConnectionNumber(display), POLLIN, 0}};
         poll(fds, 1, 10);
     }
-    const std::string restored = restore();
+    const auto restored = restore();
     XDestroyWindow(display, selection.window);
     progress.Emit(display);
     XCloseDisplay(display);
