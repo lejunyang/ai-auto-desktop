@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use zbus::blocking::{connection, Connection, Proxy};
 
 mod actions;
+mod anchored_helper;
 mod coordinates;
 mod drag_between;
 mod drag_path;

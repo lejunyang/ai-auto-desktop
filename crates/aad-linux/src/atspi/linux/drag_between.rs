@@ -127,7 +127,7 @@ impl LinuxBackend {
         if let Some(ms) = hold_ms {
             args.extend(["--hold-ms".into(), ms.to_string()]);
         }
-        let output = drag_path::run(
+        let output = anchored_helper::run_drag(
             &support.path,
             &args,
             &nonce,
