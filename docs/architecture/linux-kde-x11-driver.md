@@ -1,7 +1,7 @@
 # Linux KDE/X11 AT-SPI Rust 驱动
 
-> 当前实现：`crates/aad-linux`。已在本机 KDE/X11 验证下述应用流程；X11 helper 不再按
-> 桌面品牌拒绝，但 GNOME/XFCE 真机仍待验收。不能外推为 Wayland、XWayland 或所有 toolkit。
+> 当前实现位于 `crates/aad-linux`。本机 KDE/X11 的历史验收证据截至 `1733e58c`。
+> `window-geometry-proof-v1` 的验收环境和待验项见[平台能力验收矩阵](../testing/platform-capability-matrix.md)。
 
 ## 能力与实现
 
@@ -164,8 +164,8 @@ plugins/linux_atspi/build_x11_capture_helper.sh
 尚未开始观察前就已打开、且之后没有发焦点事件的编辑框不保证发现。
 本机 Dolphin 已完成 F2→发现编辑框→中文重命名→磁盘回读；虚拟 table 的不完整父链仍拒绝 scope。
 
-`tests/linux/verify-window-focus.ps1` 在本机运行两个同 PID Qt 窗口，刻意模拟过期的 AX Focused
-位与无效果的 focus 动作；错误窗口的操作被拒绝，两个实际事件计数均为零。正确聚焦或激活后，
+几何绑定改动前（证据截至 `1733e58c`），`verify-window-focus.ps1` 在本机运行两个同 PID Qt 窗口，
+刻意模拟过期的 AX Focused 位与无效果的 focus 动作。错误窗口的操作被拒绝，两个实际事件计数均为零。正确聚焦或激活后，
 对应窗口独立回报一次按下、一次释放。`verify-x11-window-focus.ps1` 在私有 Xvfb 复现旧
 PID-only 判定的缺口，并验证新窗口绑定、子窗口焦点、长按途中同 PID 焦点切换和窗口移动后的释放。
 这些测试不证明此前 VS Code 实验每一次输入的实际落点。后续独立 VS Code profile 已通过
@@ -177,16 +177,26 @@ PID-only 判定的缺口，并验证新窗口绑定、子窗口焦点、长按�
 不能把私有三格式案例当成 Code 的实际请求序列。Code 原生指针命中仍需单独解决。
 
 `verify-x11-drag-path.ps1` 的私有 Xvfb 十项检查回读真实轨迹与键鼠释放；
-`verify-native-drag-path.ps1` 的本机 Qt 七项检查包含窄 surface scope 外的 sibling overlay，
-实际事件确认正向路径三次移动、坏锚点零 down、几何变化/遮挡/取消后 up。
+`verify-native-drag-path.ps1` 的本机 Qt 七项检查来自几何绑定改动前（证据截至 `1733e58c`）。
+窄 surface scope 外的 sibling overlay 也在覆盖范围内。实际事件确认正向路径三次移动、坏锚点零 down，
+几何变化、遮挡或取消后收到 up。
 小 fixture 的两中间点整窗口路径约 734 ms，窄 scope 加窗口复核约 1114 ms；取消后的 up
 约 3 ms，窄 scope 遮挡后的 up 约 189 ms。这些是本次测试耗时，不能外推复杂应用或 32 点性能。
 
 `verify-x11-cross-drag.ps1` 私有 Xvfb 17 项通过，独立双 PID 窗口回读 12 次持键移动，
 验证可信/伪造 frame、单像素外部窗口、悬停覆盖、期限/取消、几何改变与外部持键保护。
-`verify-native-cross-drag.ps1` 本机 Qt 四项通过：两个独立进程实际传递精确 MIME 数据，
-目标可见标签变化；取消后 45 ms、窗口变化后 77 ms 内返回并已释放，悬停覆盖零 button-down。
+`verify-native-cross-drag.ps1` 的本机 Qt 四项通过来自几何绑定改动前（证据截至 `1733e58c`）。
+两个独立进程实际传递精确 MIME 数据并改变目标可见标签。取消后 45 ms、窗口变化后 77 ms 内返回并已释放，
+悬停覆盖零 button-down。
 成功动作约 4840 ms；两端每阶段 fresh 带来的成本不能用私有 Xvfb 协议耗时代替。
+
+`window-geometry-proof-v1` 已在私有 Xvfb、D-Bus 和 bspwm 0.9.10 下复验。Qt 5.15.8 使用
+无边框浮动窗口，按键、激活与两类拖拽的 helper 证明中 `frames` 为空。焦点拒绝与按放事件、
+同窗逐段轨迹、双进程 MIME 与目标标签、1/1.5/2 倍点击和 F2 文本及 PNG 尺寸均通过。
+缩放的歧义和非 X11 拒绝以及局部截图 scope 的覆盖与保护检查也通过。
+这些 Qt 夹具禁用桌面平台主题，避免 Qt 在 XFCE 下加载 GTK3 主题并为同一进程注册一个没有控件的
+GTK AT-SPI 应用。各脚本的命令见[可以复现的本机检查](../testing/platform-capability-matrix.md#可以复现的本机检查)。
+
 私有 Xvfb、独立 D-Bus、GTK 3.24.38 和 xfwm4 4.18 实测中，带装饰和无装饰窗口的已观察
 文本框点击均命中控件。布局键及默认 Unicode 各组 3/3，GTK 按键、逐字变化和 AT-SPI 最终值
 一致。曲线拖放移开夹具图标热点后，带装饰和无装饰各 5/5，每次 12 段和一次实际放置。
