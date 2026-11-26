@@ -90,6 +90,24 @@ XTest 回执的 `input_progress` 包含 `unit`、`delivered`、`total`、`proven
 部分派发失败仍返回 `effect=unknown`，进度放在错误 `details` 中。进程完成清理并输出进度时，取消和超时回包也携带该记录。
 保密字段的错误只返回脱敏结果。
 
+`type_text` 的 Unicode 与 keys 模式每笔派发前都向 Rust 请求控件焦点证明。`paste` 和
+`key_chord` 在各自首次按下前请求一次。后端直接对观察到的 AT-SPI 总线名与对象路径调用
+`GetState`，确认节点仍为 Focused、Enabled、Sensitive，并复核总线连接的 PID。证明通过
+才确认这一笔。helper 在空闲时等待确认，随后通过 X11 server grab 再校验窗口并提交输入。
+这三条路径额外要求 helper 声明 `anchored-type-text`。带修饰键的指针动作仍按观察目标的
+实时命中与窗口级键盘焦点校验。
+
+同窗换焦会在下一次按下前中止。尚未派发时返回 `DRIVER.FOCUS_LOST / not_applied`。
+已有派发时返回 `DRIVER.UNKNOWN_EFFECT / unknown`，`details.cause` 为
+`focused_element_changed`。跨窗换焦可看 `details.helper_code=focus_owner_changed`。
+`details.input_progress` 记录 helper 已派发的笔数 `delivered`、计划笔数 `total`、
+已验证窗口及释放状态。这个计数以本机派发为准。读取字段的实际内容需要重新观察。
+
+每笔保证按下前刚验证过观察节点的焦点。应用仍可在证明之后、处理该笔之前切换内部焦点，
+这时该笔可能进入相邻控件。X11 只能固定本机焦点窗口，无法固定应用内部的焦点或确认哪一个
+控件最终处理了该事件。长文本可将 `timeout_ms` 提高到 30000，或在支持时用 `fill` 直接
+替换值。超时后先结合 `input_progress` 和重新观察的值确认进度。
+
 显式 keys 模式额外要求 `type-text-keys`，只从当前 XKB group 和锁定状态中寻找现有键位与
 Shift 组合，不创建 Unicode 映射、不使用剪贴板、不切换输入法；无法表示的字符在整个字符串
 派发前拒绝。每笔按键复核窗口、PID、键位和状态，拒绝抢占外部持键，取消或变化时仅释放自己
@@ -139,7 +157,7 @@ frame 必须为端点的真实祖先、与 WM check 窗口属于同一 X 客户�
 | `capture` | 上述 X11 root XGetImage，按 fresh bounds 裁剪 | protected 子树、被别的窗口或子树外可见节点覆盖、非 showing 均拒绝；最小化窗口不可截 |
 | `read_text` | 会话对 capture 的 PNG 运行 `aad-ocr`（Tesseract，`prlimit` 资源限制）；BCP-47 映射为 traineddata（en→eng、zh-Hans→chi_sim 等） | 没有 tesseract 或 prlimit 时 `reads` 不列 `read_text`，调用返回 `DRIVER.OCR_UNAVAILABLE`；缺语言数据时同码并列出 `available_languages` |
 | 窗口动作 | 顶层窗口节点（应用节点的直接子节点：Qt 主窗口是 frame，裸 QWidget 窗口是 filler）。helper 找到该进程 `_NET_WM_PID` 且根坐标几何等于该节点 bounds 的唯一 client 窗口，向窗口管理器发 `WM_CHANGE_STATE`（XIconifyWindow）、`_NET_WM_STATE` 最大化/还原、`_NET_ACTIVE_WINDOW`、`_NET_CLOSE_WINDOW`，再（最多 3 秒）读回 `_NET_WM_STATE` / `WM_STATE` / `_NET_ACTIVE_WINDOW` / 窗口是否消失 | 只在有 EWMH 窗口管理器（`_NET_SUPPORTING_WM_CHECK`）时按当前状态提供；状态没达到返回 `DRIVER.UNKNOWN_EFFECT`；找不到唯一窗口 `DRIVER.STALE_SNAPSHOT` |
-| `paste` | 聚焦后 helper 先保存 CLIPBOARD 现有全部 target（单项不超过一次请求、合计 ≤32 MiB，否则 `DRIVER.CLIPBOARD_TOO_LARGE` 不粘贴），以真实时间戳占有 CLIPBOARD，只向拥有目标进程焦点窗口的同一 X client（`_NET_WM_PID`，或与该窗口同一 resource-id 基址——Qt/GTK 的取数窗口没有 pid 属性）提供文字，证明焦点后发 Ctrl+V；之后由一个脱离的 restorer 进程持有原内容直到别人占有剪贴板（最长 1 小时） | 目标始终没来取：`DRIVER.PASTE_NOT_CONSUMED`、effect unknown；protected 元素不提供；原先没有 owner 时恢复为无 owner |
+| `paste` | 聚焦后 helper 先保存 CLIPBOARD 现有全部 target（单项不超过一次请求、合计 ≤32 MiB，否则 `DRIVER.CLIPBOARD_TOO_LARGE` 不粘贴），以真实时间戳占有 CLIPBOARD，只向拥有目标进程焦点窗口的同一 X client（`_NET_WM_PID`，或与该窗口同一 resource-id 基址——Qt/GTK 的取数窗口没有 pid 属性）提供文字，通过窗口和控件焦点证明后发 Ctrl+V；之后由一个脱离的 restorer 进程持有原内容直到别人占有剪贴板（最长 1 小时） | 目标始终没来取：`DRIVER.PASTE_NOT_CONSUMED`、effect unknown；protected 元素不提供；原先没有 owner 时恢复为无 owner |
 | `clipboard_read` | 读 CLIPBOARD 的 UTF8_STRING（否则 STRING），有界 | 带 `x-kde-passwordManagerHint`（KDE / KeePassXC 的密码标记）时 `DRIVER.CLIPBOARD_PROTECTED`；INCR 大选区 `DRIVER.CLIPBOARD_TOO_LARGE` |
 | `global_key` | XTest 组合键发给当前焦点，不锚定元素 | 拒绝 Ctrl+Alt+Backspace（X zap）、Ctrl+Alt+Delete、Ctrl+Alt+L、Super+L（`DRIVER.KEY_RESERVED`）；结果 `verified: false` |
 | `launch` | 会话直接以 argv 启动白名单程序（`setsid`，不经 shell），按 AT-SPI 应用的 PID（或 `/proc/<pid>/exe` 的文件名）等待其出现 | shell、`xdg-open`、`gio` 等即使在白名单里也拒绝；不可执行文件拒绝 |
@@ -171,6 +189,33 @@ plugins/linux_atspi/build_x11_capture_helper.sh
 位与无效果的 focus 动作；错误窗口的操作被拒绝，两个实际事件计数均为零。正确聚焦或激活后，
 对应窗口独立回报一次按下、一次释放。`verify-x11-window-focus.ps1` 在私有 Xvfb 复现旧
 PID-only 判定的缺口，并验证新窗口绑定、子窗口焦点、长按途中同 PID 焦点切换和窗口移动后的释放。
+
+`tests/linux/verify_x11_element_focus.py` 在私有 Xvfb 和独立 D-Bus 中，通过 aad MCP 驱动
+GTK 3.24.38 的同窗双输入框。夹具在原框收到首字释放事件后切到相邻框。串行复测中，
+main@1733e58c 三次都将余下八字送进相邻框并回报成功。修正后连续三次原框仅有首字，
+相邻框无按键或文字，回包为 `focused_element_changed`、已派发 1/9、已释放。布局键路径
+同样通过。首次派发前人为切焦时，打字、键组合和粘贴都返回 `DRIVER.FOCUS_LOST`。
+通过 X11 剪贴板独立读回原内容。跨进程切焦时另一窗口收到零键，沿用 `focus_owner_changed`。
+
+对比 GTK 实际收到首个和最后一个按下事件的间隔，正常 Unicode 九字为 18.3 ms → 48.5–93.1 ms，
+布局键为 30.6 ms → 54.2–109.8 ms。1024 个 ASCII 字符的 MCP 调用为 2.81 s → 6.56–9.64 s，
+右侧是三次串行复测范围。并行构建的压力样本中，GTK 曾延迟约 134 ms 才处理首笔释放，
+相邻控件收到第二个字符。该样本回报 `delivered=2`，后续输入停止。
+
+用同一版本的 aad 和 helper 运行。环境需要 Xvfb、D-Bus、带 PyGObject 的 GTK3 和 xclip。
+若要核对旧行为，传入登记版本的二进制并加 `--baseline`。
+
+```powershell
+osdk exec -- cargo build --locked -p aad-cli
+$env:AI_AUTO_DESKTOP_LINUX_ATSPI_BUILD_DIR = Join-Path $PWD 'target/x11-element-focus'
+bash plugins/linux_atspi/build_x11_xtest_helper.sh
+foreach ($attempt in 1..3) {
+    /usr/bin/python3 tests/linux/verify_x11_element_focus.py target/debug/aad `
+        "$env:AI_AUTO_DESKTOP_LINUX_ATSPI_BUILD_DIR/x11_xtest_helper" "target/x11-focus-$attempt"
+    if ($LASTEXITCODE -ne 0) { throw "X11 element focus sample $attempt failed" }
+}
+```
+
 这些测试不证明此前 VS Code 实验每一次输入的实际落点。后续独立 VS Code profile 已通过
 `verify-code-paste.ps1`：所有输入走原生观察与操作入口，CDP 只读回选区、实际显示内容和截图，
 磁盘读取确认中文替换及 Ctrl+S 保存。重复 focus 未破坏该案例的 Ctrl+A 选区；旧 helper 的
