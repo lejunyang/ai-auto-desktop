@@ -89,6 +89,38 @@ int main() {
         }
         XSetInputFocus(display, child, RevertToParent, CurrentTime); XSync(display, False);
         RequireWindow(FocusMatchesWindow(display, pid, pid_atom, binding), "child focus within observed window rejected");
+        Display *other = XOpenDisplay(nullptr);
+        RequireWindow(other != nullptr, "second connection unavailable");
+        XSync(display, True);
+        const auto delivery = AtomicBurst(display, [&]() -> std::string_view {
+            if (!FocusMatchesWindow(display, pid, pid_atom, binding)) return "focus_owner_changed";
+            XSetInputFocus(other, sibling, RevertToParent, CurrentTime);
+            XFlush(other);
+            return {};
+        }, [&] {
+            return XTestFakeKeyEvent(display, f2, True, 1) &&
+                   XTestFakeKeyEvent(display, f2, False, 1);
+        }, [&] { XTestFakeKeyEvent(display, f2, False, 0); });
+        XSync(other, False);
+        Window focus = None;
+        int revert = 0;
+        XGetInputFocus(display, &focus, &revert);
+        RequireWindow(delivery.empty() && focus == sibling, "queued focus switch did not complete");
+        XEvent key{};
+        RequireWindow(XCheckTypedEvent(display, KeyPress, &key) && key.xkey.window == child &&
+                      !XCheckTypedEvent(display, KeyPress, &key) && released(),
+                      "queued focus switch intercepted the key");
+        const auto denied_burst = AtomicBurst(display, [&]() -> std::string_view {
+            return FocusMatchesWindow(display, pid, pid_atom, binding) ? "" : "focus_owner_changed";
+        }, [&] { return XTestFakeKeyEvent(display, f2, True, 0) != 0; }, [] {});
+        RequireWindow(denied_burst == "focus_owner_changed" && released(), "rejected burst pressed a key");
+        XSetInputFocus(display, child, RevertToParent, CurrentTime); XSync(display, False);
+        const auto failed_burst = AtomicBurst(display, [] { return std::string_view{}; }, [&] {
+            XTestFakeKeyEvent(display, f2, True, 0);
+            return false;
+        }, [&] { XTestFakeKeyEvent(display, f2, False, 0); });
+        RequireWindow(failed_burst == "x11_error" && released(), "failed burst left a key held");
+        XCloseDisplay(other);
         const auto proof = invoke({"focus-info"}, true);
         RequireWindow(proof.code == 0 && proof.output.find("\"focused\":true") != std::string::npos, "exact-window proof failed");
         const auto success = invoke({"key-chord", "--keys", "f2"});
@@ -110,7 +142,7 @@ int main() {
         const auto moved_proof = invoke({"focus-info"}, true);
         RequireWindow(moved_proof.code == 0 && moved_proof.output.find("\"focused\":false") != std::string::npos, "single-window geometry mismatch accepted");
         XCloseDisplay(display);
-        std::cout << "PASS: PID-only gap reproduced; strict sibling denial, child acceptance, focus/move cleanup, and exact geometry verified\n";
+        std::cout << "PASS: strict window binding, queued focus switch, failed burst cleanup, and hold cleanup\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "FAIL: " << error.what() << '\n'; return 1;
