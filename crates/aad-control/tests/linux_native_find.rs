@@ -18,6 +18,7 @@ struct Tree {
     distinct: bool,
     after_first: Option<usize>,
     legacy_x11_helper: bool,
+    incompatible_handshake: bool,
     two_apps: bool,
     context_sibling: bool,
     captures: AtomicUsize,
@@ -42,7 +43,12 @@ impl AtspiBackend for Tree {
         "fixture"
     }
     fn session_info(&self) -> Map<String, Value> {
-        if self.legacy_x11_helper {
+        if self.incompatible_handshake {
+            Map::from_iter([(
+                "input_helper".into(),
+                json!({"ready":false,"code":"DRIVER.HELPER_INCOMPATIBLE","message":"fixture rejected describe"}),
+            )])
+        } else if self.legacy_x11_helper {
             Map::from_iter([(
                 "input_helper".into(),
                 json!({"ready":true,"protocol":1,"features":["type-text","window-focus","anchored-drag-between"]}),
@@ -229,9 +235,19 @@ fn session_wait_reobserves_native_ambiguity_until_unique_or_absent() {
 
 #[test]
 fn explicit_x11_actions_report_missing_geometry_feature_before_capability_rejection() {
+    assert_x11_helper_rejection(false);
+}
+
+#[test]
+fn explicit_x11_actions_report_incompatible_handshake_before_capability_rejection() {
+    assert_x11_helper_rejection(true);
+}
+
+fn assert_x11_helper_rejection(incompatible_handshake: bool) {
     let tree = Arc::new(Tree {
         distinct: true,
         legacy_x11_helper: true,
+        incompatible_handshake,
         context_sibling: true,
         ..Default::default()
     });
@@ -272,7 +288,13 @@ fn explicit_x11_actions_report_missing_geometry_feature_before_capability_reject
         let op =
             serde_json::from_value(json!({"method":"act","target":node["target"],"action":action}))
                 .unwrap();
-        assert_eq!(call(op).error.unwrap()["code"], code);
+        let response = call(op);
+        assert_eq!(response.effect, "not_applied");
+        let failure = response.error.unwrap();
+        assert_eq!(failure["code"], code);
+        if incompatible_handshake && code == "DRIVER.HELPER_INCOMPATIBLE" {
+            assert_eq!(failure["message"], "fixture rejected describe");
+        }
     }
     let context = &observed["nodes"][1];
     assert_eq!(context["provenance"]["scope_context"], true);

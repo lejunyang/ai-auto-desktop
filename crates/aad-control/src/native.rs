@@ -360,7 +360,7 @@ impl Backend for NativeBackend {
         cross_resource: bool,
     ) -> Result<()> {
         let helper = &snapshot["metadata"]["input_helper"];
-        if !matches!(self.flavor, Flavor::Linux) || helper["ready"] != true {
+        if !matches!(self.flavor, Flavor::Linux) {
             return Ok(());
         }
         let requires_geometry = match action {
@@ -378,7 +378,18 @@ impl Backend for NativeBackend {
             } => cross_resource || !path.is_empty() || !modifiers.is_empty(),
             _ => false,
         };
-        if requires_geometry
+        if !requires_geometry {
+            return Ok(());
+        }
+        if helper["ready"] == false && helper["code"] == "DRIVER.HELPER_INCOMPATIBLE" {
+            return Err(error(
+                "DRIVER.HELPER_INCOMPATIBLE",
+                helper["message"]
+                    .as_str()
+                    .unwrap_or("Linux XTest helper handshake is incompatible"),
+            ));
+        }
+        if helper["ready"] == true
             && !helper["features"].as_array().is_some_and(|features| {
                 features
                     .iter()
