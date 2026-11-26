@@ -546,7 +546,8 @@ std::string_view ValidateSegment(std::string_view token, std::size_t index,
                                     const std::function<std::string_view()> &verify, int poll_ms, bool recheck_on_eof = false) {
     std::cout << "{\"event\":\"validate_segment\",\"token\":\"" << token
               << "\",\"index\":" << index << "}" << std::endl;
-    std::string frame;
+    std::size_t received = 0;
+    char bytes[96];
     const std::string expected = "ack " + std::string(token) + " " + std::to_string(index) + "\n";
     for (;;) {
         if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
@@ -556,19 +557,19 @@ std::string_view ValidateSegment(std::string_view token, std::size_t index,
         if (ready < 0) { if (errno == EINTR) continue; return "path_ack_failed"; }
         if (ready == 0) continue;
         if ((input.revents & (POLLERR | POLLNVAL)) != 0) return "path_ack_failed";
-        char byte = 0;
-        const auto count = read(STDIN_FILENO, &byte, 1);
+        // The caller writes one short, atomic ACK. Check native focus once per
+        // poll/read, rather than querying X11 separately for every byte.
+        const auto count = read(STDIN_FILENO, bytes, std::min(sizeof(bytes), expected.size() - received));
         if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-        if (count != 1) {
+        if (count <= 0) {
             if (recheck_on_eof) {
                 if (const auto problem = verify(); !problem.empty()) return problem;
             }
             return "path_ack_eof";
         }
-        frame.push_back(byte);
-        if (frame.size() > 96) return "path_ack_invalid";
-        if (byte == '\n') {
-            if (frame != expected) return "path_ack_invalid";
+        if (!std::equal(bytes, bytes + count, expected.begin() + received)) return "path_ack_invalid";
+        received += static_cast<std::size_t>(count);
+        if (received == expected.size()) {
             if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
             return verify();
         }
@@ -810,7 +811,8 @@ void SleepUntilOrDeadline(unsigned milliseconds, std::uint64_t deadline_ns) {
 
 int RunGesture(Display *display, std::string_view command, const GestureRequest &request,
                std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom,
-               const std::optional<WindowBinding> &binding, InputProgress &progress) {
+               const std::optional<WindowBinding> &binding, InputProgress &progress,
+               std::string_view anchor_token) {
     auto refuse = [&](std::string_view code, std::string_view phase, int exit_code) {
         progress.Emit(display);
         XCloseDisplay(display);
@@ -926,6 +928,11 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         if (const auto problem = ValidateSegment(request.path_token, 0, deadline_ns, path_problem, 5); !problem.empty()) {
             return finish_failure(problem, "path_preflight", kExitTargetMismatch);
         }
+    }
+    if (const auto problem = ValidateKeyboardAnchor(anchor_token, 0, display, expected_pid,
+                                                    pid_atom, binding, deadline_ns); !problem.empty()) {
+        return finish_failure(problem, "keyboard_preflight",
+                              problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
     }
     g_x_error = false;
     bool submitted = true;
@@ -2625,7 +2632,8 @@ Window FocusedPidWindow(Display *display, unsigned long pid, Atom pid_atom) {
     return None;
 }
 
-int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding) {
+int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding,
+             std::string_view anchor_token) {
     InputCancellation cancellation;
     std::uint64_t pid_value = 0;
     std::uint64_t deadline_value = 0;
@@ -2637,8 +2645,14 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
     const std::optional<std::uint64_t> pid = pid_value;
     const std::optional<std::uint64_t> deadline = deadline_value;
     InputProgress progress("paste", 1);
-    const auto text = ReadStdin(kMaxPasteBytes);
-    if (!text.has_value() || text->empty() || !DecodeUtf8(*text).has_value()) {
+    std::string text;
+    if (anchor_token.empty()) {
+        text = ReadStdin(kMaxPasteBytes).value_or("");
+    } else if (const auto problem = ReadTextFrame(kMaxPasteBytes, *deadline, &text); !problem.empty()) {
+        EmitError(problem, "text_preflight", false);
+        return problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitUnsupportedText;
+    }
+    if (text.empty() || !DecodeUtf8(text).has_value()) {
         EmitError("unsupported_text", "text_preflight", false);
         return kExitUnsupportedText;
     }
@@ -2693,9 +2707,9 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
         return fail("deadline_exceeded", "clipboard_preflight", false, kExitTimeoutBeforeDispatch);
     }
     const std::vector<Item> offer = {
-        {selection.utf8, selection.utf8, 8, *text},
-        {selection.plain_utf8, selection.plain_utf8, 8, *text},
-        {selection.text, selection.utf8, 8, *text},
+        {selection.utf8, selection.utf8, 8, text},
+        {selection.plain_utf8, selection.plain_utf8, 8, text},
+        {selection.text, selection.utf8, 8, text},
         {selection.password_hint, selection.password_hint, 8, "secret"},
     };
     const Time time = ServerTime(selection);
@@ -2731,6 +2745,12 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
         restore();
         return fail("focus_owner_mismatch", "target_preflight", false, kExitTargetMismatch);
     }
+    if (const auto problem = ValidateKeyboardAnchor(anchor_token, 0, display, *pid,
+                                                    pid_atom, binding, *deadline); !problem.empty()) {
+        restore();
+        return fail(problem, "keyboard_preflight", false,
+                    problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
+    }
     const auto mask = ResourceMask(display, selection.window);
     Window pid_window = None;
     bool dispatched = false;
@@ -2738,6 +2758,7 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
     const auto problem = AtomicBurst(display, [&]() -> std::string_view {
         if (const auto focus = KeyboardFocusProblem(display, *pid, pid_atom, binding, *deadline);
             !focus.empty()) return focus;
+        if (XGetSelectionOwner(display, selection.clipboard) != selection.window) return "clipboard_busy";
         pid_window = FocusedPidWindow(display, *pid, pid_atom);
         if (pid_window == None) return "focus_owner_changed";
         if (const auto keys = VerifyStrokeKeys(display, v, control); !keys.empty()) return keys;
@@ -2921,7 +2942,8 @@ int main(int argc, char **argv) {
     std::vector<char *> filtered;
     std::string_view anchor_token;
     if (!ExtractInputAnchors(&argc, &argv, &filtered, &binding, &anchor_token) ||
-        (!anchor_token.empty() && (command != "type-text" || !binding)) ||
+        (!anchor_token.empty() &&
+         (!binding || (command != "type-text" && command != "key-chord" && command != "paste"))) ||
         (binding.has_value() && command != "focus-info" && binding->id == None)) {
         EmitError("invalid_window_binding", "arguments", false);
         return kExitInvalid;
@@ -2944,7 +2966,7 @@ int main(int argc, char **argv) {
         return RunFocusInfo(argc, argv, binding);
     }
     if (command == "paste") {
-        return RunPaste(argc, argv, binding);
+        return RunPaste(argc, argv, binding, anchor_token);
     }
     if (command == "global-key") {
         return RunGlobalKey(argc, argv);
@@ -2963,15 +2985,15 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
     } else if (command == "type-text") {
-        if ((argc != 6 && argc != 8) || std::string_view(argv[2]) != "--expected-pid" ||
-            std::string_view(argv[4]) != "--deadline-monotonic-ns" ||
-            (argc == 8 && (std::string_view(argv[6]) != "--mode" || std::string_view(argv[7]) != "keys"))) {
+        const auto pairs = ParsePairs(argc, argv, {"expected-pid", "deadline-monotonic-ns", "mode"});
+        const auto mode = pairs ? Pair(*pairs, "mode") : std::nullopt;
+        if (!pairs || (mode && *mode != "keys")) {
             EmitError("invalid_arguments", "arguments", false);
             return kExitInvalid;
         }
-        expected_pid = ParseUnsigned(argv[3]);
-        deadline_ns = ParseUnsigned(argv[5]);
-        physical_keys = argc == 8;
+        expected_pid = ParseUnsigned(Pair(*pairs, "expected-pid").value_or(""));
+        deadline_ns = ParseUnsigned(Pair(*pairs, "deadline-monotonic-ns").value_or(""));
+        physical_keys = mode.has_value();
     } else if (command == "pointer-click") {
         if (argc != 10 || std::string_view(argv[2]) != "--expected-pid" ||
             std::string_view(argv[4]) != "--x" || std::string_view(argv[6]) != "--y" ||
@@ -3076,7 +3098,7 @@ int main(int argc, char **argv) {
     }
     if (gesture.has_value()) {
         return RunGesture(display, command, gesture.value(), expected_pid.value(),
-                          deadline_ns.value(), pid_atom, binding, *progress);
+                          deadline_ns.value(), pid_atom, binding, *progress, anchor_token);
     }
     if (command == "pointer-click") {
         if (!click_x.has_value() || !click_y.has_value() ||

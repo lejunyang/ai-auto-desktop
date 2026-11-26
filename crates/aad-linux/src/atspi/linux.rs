@@ -256,36 +256,28 @@ impl LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path =
-            self.input_helper(if keys { "type-text-keys" } else { "type-text" }, deadline)?;
-        let window = window.ok_or_else(|| {
-            driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                "input requires an observed top-level window",
-            )
-        })?;
-        let focus = self.focus(target, Some(window), deadline)?;
-        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-        let window_id = self
-            .verify_focused_with_helper(target, Some(window), process_id, deadline, &path)
-            .map_err(after_focus)?;
+        let mut args = vec![
+            "type-text".to_string(),
+            "--expected-pid".into(),
+            process_id.to_string(),
+        ];
+        if keys {
+            args.extend(["--mode".into(), "keys".into()]);
+        }
+        let (path, focus) = self.prepare_anchored_keyboard(
+            if keys { "type-text-keys" } else { "type-text" },
+            target,
+            window,
+            process_id,
+            deadline,
+            &mut args,
+        )?;
         // Unicode insertion cannot silently become IME composition. Explicit
         // keys mode intentionally participates in the current input method.
         if !keys {
             self.check_text_input_method(deadline)
                 .map_err(after_focus)?;
         }
-        let mut args = vec![
-            "type-text".to_string(),
-            "--expected-pid".into(),
-            process_id.to_string(),
-            "--deadline-monotonic-ns".into(),
-            monotonic_deadline_ns(deadline)?.to_string(),
-        ];
-        if keys {
-            args.extend(["--mode".into(), "keys".into()]);
-        }
-        append_window_args(&mut args, window, Some(window_id));
         let input = self.run_anchored_keyboard(AnchoredKeyboard {
             path: &path,
             args,
@@ -503,8 +495,8 @@ impl LinuxBackend {
         .map_err(|error| native_failure("Component proxy", target, error))
     }
 
-    /// Keyboard input needs focus; pointer input is proven by live hit tests.
-    fn run_input(
+    /// Pointer input is proven by live hit tests, with window focus for modifiers.
+    fn run_pointer_input(
         &self,
         target: &NativeRef,
         window: Option<&WindowAnchor>,
@@ -518,69 +510,41 @@ impl LinuxBackend {
         if self.cancellation.is_some() {
             support.require("cooperative-cancel")?;
         }
-        support.require(args.first().map(String::as_str).unwrap_or(""))?;
-        if args.iter().any(|arg| arg == "--modifiers") {
-            support.require("pointer-modifiers")?;
-        }
+        support.require(&args[0])?;
         if args.iter().any(|arg| arg == "--hold-ms") {
             support.require("bounded-hold")?;
         }
-        if args.first().is_some_and(|command| command == "key-chord")
-            || args.iter().any(|arg| arg == "--modifiers")
-        {
+        if args.iter().any(|arg| arg == "--modifiers") {
+            support.require("pointer-modifiers")?;
             support.require_keyboard_route()?;
-        }
-        let path = support.path;
-        let focus = if args.first().is_some_and(|command| command == "key-chord") {
-            let proof = self.focus(target, window, deadline)?;
-            std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-            self.verify_focused(target, window, process_id, deadline)
-                .map_err(after_focus)?;
-            Some(proof)
-        } else {
-            None
-        };
-        if args.first().is_some_and(|command| command == "key-chord")
-            || args.iter().any(|arg| arg == "--modifiers")
-        {
             let window = window.ok_or_else(|| {
                 driver_error(
                     "DRIVER.ACTION_UNSUPPORTED",
                     "input requires an observed top-level window",
                 )
             })?;
-            // Feature checked before any focus request or keyboard dispatch.
-            let window_id =
-                self.verify_window_with_helper(target, window, process_id, deadline, &path)?;
+            let window_id = self.verify_window_with_helper(
+                target,
+                window,
+                process_id,
+                deadline,
+                &support.path,
+            )?;
             append_window_args(&mut args, window, Some(window_id));
         }
-        let input_error = |error| {
-            if focus.is_some() {
-                after_focus(error)
-            } else {
-                error
-            }
-        };
         args.extend([
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ]);
-        let output = self
-            .run_helper(
-                &path,
-                &args,
-                None,
-                deadline,
-                XTEST_OUTPUT_LIMIT,
-                XTEST_OUTPUT_LIMIT,
-            )
-            .map_err(input_error)?;
-        let mut input = parse_input_helper(output, "input_dispatch", minimum_events, process_id)
-            .map_err(input_error)?;
-        if let Some(focus) = focus {
-            input["focus"] = focus;
-        }
-        Ok(input)
+        let output = self.run_helper(
+            &support.path,
+            &args,
+            None,
+            deadline,
+            XTEST_OUTPUT_LIMIT,
+            XTEST_OUTPUT_LIMIT,
+        )?;
+        parse_input_helper(output, "input_dispatch", minimum_events, process_id)
     }
 
     fn helper(&self, kind: HelperKind) -> Result<PathBuf, AutomationError> {
@@ -646,24 +610,9 @@ impl LinuxBackend {
 
     fn input_helper(&self, feature: &str, deadline: Instant) -> Result<PathBuf, AutomationError> {
         let support = self.probe_input(deadline)?;
-        if matches!(feature, "type-text" | "type-text-keys") {
-            support.require_anchored_keyboard(feature)?;
-        } else {
-            support.require(feature)?;
-            if feature == "paste" {
-                support.require_keyboard_route()?;
-            }
-        }
+        support.require(feature)?;
         if self.cancellation.is_some()
-            && matches!(
-                feature,
-                "type-text"
-                    | "type-text-keys"
-                    | "paste"
-                    | "pointer-click"
-                    | "window-action"
-                    | "global-key"
-            )
+            && matches!(feature, "pointer-click" | "window-action" | "global-key")
         {
             support.require("cooperative-cancel")?;
         }
@@ -855,18 +804,14 @@ impl LinuxBackend {
             && !protected
         {
             for (action, feature) in [("type_text", "type-text"), ("paste", "paste")] {
-                if input.is_some_and(|support| {
-                    if feature == "type-text" {
-                        support.has_anchored_keyboard(feature)
-                    } else {
-                        support.has(feature) && support.has_keyboard_route()
-                    }
-                }) {
+                if input.is_some_and(|support| support.has_anchored_keyboard(feature)) {
                     actions.push(action.into());
                 }
             }
         }
-        if visibility_recovery && input.is_some_and(|support| support.has("key-chord")) {
+        if visibility_recovery
+            && input.is_some_and(|support| support.has_anchored_keyboard("key-chord"))
+        {
             actions.push("key_chord".into());
         }
         if pointer_interactive
@@ -885,8 +830,7 @@ impl LinuxBackend {
                 }
             }
             if fully_interactive
-                && input
-                    .is_some_and(|support| support.has("key-chord") && support.has_keyboard_route())
+                && input.is_some_and(|support| support.has_anchored_keyboard("key-chord"))
             {
                 actions.push("key_chord".into());
             }
@@ -1111,14 +1055,11 @@ impl AtspiBackend for LinuxBackend {
             _ => return Ok(()),
         };
         let support = self.probe_input(deadline)?;
-        if action == "type_text" {
-            return support.require_anchored_keyboard(feature);
+        if matches!(action, "type_text" | "key_chord" | "paste") {
+            support.require_anchored_keyboard(feature)
+        } else {
+            support.require(feature)
         }
-        support.require(feature)?;
-        if matches!(action, "key_chord" | "paste") {
-            support.require_keyboard_route()?;
-        }
-        Ok(())
     }
 
     fn list_applications(
@@ -1577,7 +1518,7 @@ impl AtspiBackend for LinuxBackend {
         if let Some(ms) = hold_ms {
             args.extend(["--hold-ms".into(), ms.to_string()]);
         }
-        let input = self.run_input(
+        let input = self.run_pointer_input(
             target,
             window,
             args,
@@ -1665,7 +1606,7 @@ impl AtspiBackend for LinuxBackend {
         if let Some(ms) = hold_ms {
             args.extend(["--hold-ms".into(), ms.to_string()]);
         }
-        let input = self.run_input(
+        let input = self.run_pointer_input(
             target,
             window,
             args,
@@ -1729,8 +1670,26 @@ impl AtspiBackend for LinuxBackend {
         if let Some(ms) = hold_ms {
             args.extend(["--hold-ms".into(), ms.to_string()]);
         }
-        let minimum = 2 * keys.len() as u64;
-        let input = self.run_input(target, window, args, minimum, process_id, deadline)?;
+        let (path, focus) = self.prepare_anchored_keyboard(
+            "key-chord",
+            target,
+            window,
+            process_id,
+            deadline,
+            &mut args,
+        )?;
+        let mut input = self.run_anchored_keyboard(AnchoredKeyboard {
+            path: &path,
+            args,
+            payload: None,
+            strokes: 1,
+            target,
+            process_id,
+            deadline,
+            phase: "input_dispatch",
+            minimum_events: 2 * keys.len() as u64,
+        })?;
+        input["focus"] = focus;
         Ok(
             json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "keys": keys}),
         )
@@ -1873,35 +1832,24 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.input_helper("paste", deadline)?;
-        let window = window.ok_or_else(|| {
-            driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                "input requires an observed top-level window",
-            )
-        })?;
-        let focus = self.focus(target, Some(window), deadline)?;
-        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-        let window_id = self
-            .verify_focused(target, Some(window), process_id, deadline)
-            .map_err(after_focus)?;
         let mut args = vec![
             "paste".to_string(),
             "--expected-pid".into(),
             process_id.to_string(),
-            "--deadline-monotonic-ns".into(),
-            monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        append_window_args(&mut args, window, Some(window_id));
-        let output = self.run_helper(
-            &path,
-            &args,
-            Some(text.as_bytes()),
+        let (path, focus) = self
+            .prepare_anchored_keyboard("paste", target, window, process_id, deadline, &mut args)?;
+        let input = self.run_anchored_keyboard(AnchoredKeyboard {
+            path: &path,
+            args,
+            payload: Some(text.as_bytes()),
+            strokes: 1,
+            target,
+            process_id,
             deadline,
-            XTEST_OUTPUT_LIMIT,
-            XTEST_OUTPUT_LIMIT,
-        )?;
-        let input = parse_input_helper(output, "keyboard_dispatch", 4, process_id)?;
+            phase: "keyboard_dispatch",
+            minimum_events: 4,
+        })?;
         if input["consumed"] != true {
             let mut error = driver_error(
                 "DRIVER.PASTE_NOT_CONSUMED",

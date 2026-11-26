@@ -50,11 +50,47 @@ fn keyboard_anchor_error(mut error: AutomationError) -> AutomationError {
     }
     if error.effect == "unknown" {
         error.retryable = false;
+        if error.code == "DRIVER.TIMEOUT" {
+            error.details.insert("phase".into(), json!("post_dispatch"));
+        }
     }
     error
 }
 
 impl LinuxBackend {
+    pub(super) fn prepare_anchored_keyboard(
+        &self,
+        feature: &str,
+        target: &NativeRef,
+        window: Option<&WindowAnchor>,
+        process_id: u32,
+        deadline: Instant,
+        args: &mut Vec<String>,
+    ) -> Result<(PathBuf, Value), AutomationError> {
+        self.check_cancelled(false)?;
+        let support = self.probe_input(deadline)?;
+        support.require_anchored_keyboard(feature)?;
+        if self.cancellation.is_some() {
+            support.require("cooperative-cancel")?;
+        }
+        if args.iter().any(|arg| arg == "--hold-ms") {
+            support.require("bounded-hold")?;
+        }
+        let window = window.ok_or_else(|| {
+            driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "input requires an observed top-level window",
+            )
+        })?;
+        let focus = self.focus(target, Some(window), deadline)?;
+        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        let window_id = self
+            .verify_focused_with_helper(target, Some(window), process_id, deadline, &support.path)
+            .map_err(after_focus)?;
+        append_window_args(args, window, Some(window_id));
+        Ok((support.path, focus))
+    }
+
     pub(super) fn run_anchored_keyboard(
         &self,
         request: AnchoredKeyboard<'_>,
@@ -71,7 +107,12 @@ impl LinuxBackend {
             minimum_events,
         } = request;
         let nonce = uuid::Uuid::new_v4().simple().to_string();
-        args.extend(["--anchor-token".into(), nonce.clone()]);
+        args.extend([
+            "--anchor-token".into(),
+            nonce.clone(),
+            "--deadline-monotonic-ns".into(),
+            monotonic_deadline_ns(deadline)?.to_string(),
+        ]);
         let validate = |_| self.verify_keyboard_anchor(target, process_id, deadline);
         let output = anchored_helper::run(anchored_helper::Request {
             path,
