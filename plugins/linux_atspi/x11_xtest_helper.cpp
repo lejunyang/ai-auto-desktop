@@ -34,6 +34,7 @@ namespace {
 
 constexpr std::size_t kMaxInputBytes = 4096;
 constexpr std::size_t kMaxCodepoints = 1024;
+constexpr useconds_t kTextStrokeGapUs = 2000;
 constexpr int kExitInvalid = 64;
 constexpr int kExitUnavailable = 69;
 constexpr int kExitUnknownEffect = 70;
@@ -270,18 +271,25 @@ bool KeyIsDown(const char (&keys)[32], KeyCode code) {
     return (static_cast<unsigned char>(keys[code / 8]) & (1U << (code % 8))) != 0;
 }
 
-bool SubmitTextStroke(Display *display, KeyCode key, KeyCode shift) {
-    return (!shift || XTestFakeKeyEvent(display, shift, True, 1)) &&
-           XTestFakeKeyEvent(display, key, True, 1) &&
-           XTestFakeKeyEvent(display, key, False, 1) &&
-           (!shift || XTestFakeKeyEvent(display, shift, False, 1));
+std::string_view VerifyStrokeKeys(Display *display, KeyCode key, KeyCode modifier = 0) {
+    char keys[32]{};
+    if (!XQueryKeymap(display, keys)) return "x11_error";
+    if (KeyIsDown(keys, key) || (modifier && KeyIsDown(keys, modifier))) return "input_already_held";
+    return {};
 }
 
-void ReleaseTextStroke(Display *display, KeyCode key, KeyCode shift) {
+bool SubmitKeystroke(Display *display, KeyCode key, KeyCode modifier) {
+    return (!modifier || XTestFakeKeyEvent(display, modifier, True, 1)) &&
+           XTestFakeKeyEvent(display, key, True, 1) &&
+           XTestFakeKeyEvent(display, key, False, 1) &&
+           (!modifier || XTestFakeKeyEvent(display, modifier, False, 1));
+}
+
+void ReleaseKeystroke(Display *display, KeyCode key, KeyCode modifier = 0) {
     char keys[32]{};
-    XQueryKeymap(display, keys);
-    if (KeyIsDown(keys, key)) XTestFakeKeyEvent(display, key, False, 0);
-    if (shift && KeyIsDown(keys, shift)) XTestFakeKeyEvent(display, shift, False, 0);
+    const bool known = XQueryKeymap(display, keys) != 0;
+    if (!known || KeyIsDown(keys, key)) XTestFakeKeyEvent(display, key, False, 0);
+    if (modifier && (!known || KeyIsDown(keys, modifier))) XTestFakeKeyEvent(display, modifier, False, 0);
 }
 
 void MarkDispatchStarted(bool &dispatched) {
@@ -495,18 +503,8 @@ int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoin
                     std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom,
                     const std::optional<WindowBinding> &binding) {
     bool dispatched = false;
-    std::vector<KeyCode> owned;
     unsigned long events = 0;
-    auto release = [&]() {
-        for (auto it = owned.rbegin(); it != owned.rend(); ++it) {
-            XTestFakeKeyEvent(display, *it, False, 1);
-            ++events;
-        }
-        owned.clear();
-        XSync(display, False);
-    };
     auto fail = [&](std::string_view code, int exit_code) {
-        release();
         XCloseDisplay(display);
         EmitError(code, dispatched ? "keyboard_dispatch" : "text_preflight", dispatched);
         return dispatched ? kExitUnknownEffect : exit_code;
@@ -554,23 +552,19 @@ int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoin
         if (!found) return fail("unsupported_keyboard_mapping", kExitUnsupportedText);
     }
     auto verify = [&](const PhysicalStroke &stroke) -> std::string_view {
-        if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
         if (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid))) return "untrusted_process";
-        if (!FocusMatchesWindow(display, expected_pid, pid_atom, binding)) return "focus_owner_changed";
+        if (const auto problem = KeyboardFocusProblem(display, expected_pid, pid_atom, binding, deadline_ns);
+            !problem.empty()) return problem;
         XkbStateRec state{};
         if (XkbGetState(display, XkbUseCoreKbd, &state) != Success) return "keyboard_map_unavailable";
-        const bool own_shift = std::find(owned.begin(), owned.end(), shift) != owned.end();
         if (state.group != initial.group || state.locked_mods != initial.locked_mods ||
-            state.latched_mods != 0 || state.base_mods != (own_shift ? ShiftMask : 0)) {
+            state.latched_mods != 0 || state.base_mods != 0) {
             return "keyboard_state_changed";
         }
         char down[32]{};
-        XQueryKeymap(display, down);
-        for (unsigned code = 0; code < 256; ++code) {
-            if ((static_cast<unsigned char>(down[code / 8]) & (1U << (code % 8))) != 0 &&
-                std::find(owned.begin(), owned.end(), static_cast<KeyCode>(code)) == owned.end()) {
-                return "input_already_held";
-            }
+        if (!XQueryKeymap(display, down)) return "x11_error";
+        if (std::any_of(std::begin(down), std::end(down), [](char keys) { return keys != 0; })) {
+            return "input_already_held";
         }
         PhysicalMap current(display);
         if (!PhysicalSymbol(current.value, stroke.code, state.group,
@@ -580,32 +574,22 @@ int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoin
         if (stroke.shift && !PhysicalShift(current.value, shift)) {
             return "keyboard_mapping_changed";
         }
-        if (g_x_error) return "x11_error";
-        return {};
+        return DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "";
     };
-    for (const auto &stroke : plan) {
-        if (const auto problem = verify(stroke); !problem.empty()) {
+    for (std::size_t index = 0; index < plan.size(); ++index) {
+        const auto &stroke = plan[index];
+        const KeyCode stroke_shift = stroke.shift ? shift : 0;
+        bool attempted = false;
+        const auto problem = AtomicBurst(display, [&] { return verify(stroke); }, [&] {
+            attempted = true;
+            return SubmitKeystroke(display, stroke.code, stroke_shift);
+        }, [&] { ReleaseKeystroke(display, stroke.code, stroke_shift); });
+        if (attempted) MarkDispatchStarted(dispatched);
+        if (!problem.empty()) {
             return fail(problem, problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
         }
-        auto press = [&](KeyCode code) -> bool {
-            if (!dispatched) {
-                std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
-                dispatched = true;
-            }
-            owned.push_back(code);
-            const bool ok = XTestFakeKeyEvent(display, code, True, 1) != 0;
-            ++events;
-            XSync(display, False);
-            return ok && !g_x_error;
-        };
-        if (stroke.shift) {
-            if (!press(shift)) return fail("x11_error", kExitUnknownEffect);
-            if (const auto problem = verify(stroke); !problem.empty()) return fail(problem, kExitUnknownEffect);
-        }
-        if (!press(stroke.code)) return fail("x11_error", kExitUnknownEffect);
-        if (const auto problem = verify(stroke); !problem.empty()) return fail(problem, kExitUnknownEffect);
-        release();
-        if (g_x_error) return fail("x11_error", kExitUnknownEffect);
+        events += stroke_shift ? 4 : 2;
+        if (index + 1 < plan.size()) usleep(kTextStrokeGapUs);
     }
     XCloseDisplay(display);
     std::cout << "{\"ok\":true,\"dispatch_started\":true,\"mode\":\"keys\",\"events\":"
@@ -878,8 +862,6 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             return finish_failure(problem, "path_preflight", kExitTargetMismatch);
         }
     }
-    std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
-    dispatch_started = true;
     g_x_error = false;
     bool submitted = true;
     unsigned long event_count = 0;
@@ -921,22 +903,34 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             usleep(5000);
         }
     };
-    for (const auto code : modifiers) {
-        if (DeadlineExpired(deadline_ns) || !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) {
-            return finish_failure(DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "focus_owner_changed", "input_dispatch", kExitUnknownEffect);
+    auto press = [&](KeyCode code, std::vector<KeyCode> &pressed) -> std::string_view {
+        bool attempted = false;
+        const auto problem = AtomicBurst(display, [&]() -> std::string_view {
+            if (const auto focus = KeyboardFocusProblem(display, expected_pid, pid_atom, binding, deadline_ns);
+                !focus.empty()) return focus;
+            if (const auto keys = VerifyStrokeKeys(display, code); !keys.empty()) return keys;
+            return DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "";
+        }, [&] {
+            attempted = true;
+            return XTestFakeKeyEvent(display, code, True, 1) != 0;
+        }, [&] { ReleaseKeystroke(display, code); });
+        if (attempted) {
+            MarkDispatchStarted(dispatch_started);
+            pressed.push_back(code);
+            ++event_count;
         }
-        pressed_modifiers.push_back(code);
-        submit(XTestFakeKeyEvent(display, code, True, 1) != 0);
-        XSync(display, False);
+        return problem;
+    };
+    auto press_failed = [&](std::string_view problem) {
+        return finish_failure(problem, "input_dispatch",
+                              problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
+    };
+    for (const auto code : modifiers) {
+        if (const auto problem = press(code, pressed_modifiers); !problem.empty()) return press_failed(problem);
     }
     if (command == "key-chord") {
         for (const KeyCode code : chord) {
-            if (DeadlineExpired(deadline_ns) || !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) {
-                return finish_failure(DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "focus_owner_changed", "input_dispatch", kExitUnknownEffect);
-            }
-            pressed_chord.push_back(code);
-            submit(XTestFakeKeyEvent(display, code, True, 1) != 0);
-            XSync(display, False);
+            if (const auto problem = press(code, pressed_chord); !problem.empty()) return press_failed(problem);
         }
         if (const auto problem = hold(); !problem.empty()) {
             return finish_failure(problem, "input_hold", kExitUnknownEffect);
@@ -947,6 +941,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         XSync(display, False);
         if (submitted && !g_x_error) pressed_chord.clear();
     } else {
+        MarkDispatchStarted(dispatch_started);
         if (DeadlineExpired(deadline_ns)) {
             return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
         }
@@ -2617,16 +2612,26 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
         restore();
         return fail("focus_owner_mismatch", "target_preflight", false, kExitTargetMismatch);
     }
-    const Window pid_window =
-        FocusedPidWindow(display, static_cast<unsigned long>(pid.value()), pid_atom);
     const auto mask = ResourceMask(display, selection.window);
-    std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
-    if (!PressChord(display, {control, v}, [&] {
-            return !DeadlineExpired(*deadline) &&
-                   FocusMatchesWindow(display, static_cast<unsigned long>(*pid), pid_atom, binding);
-        })) {
+    Window pid_window = None;
+    bool dispatched = false;
+    bool attempted = false;
+    const auto problem = AtomicBurst(display, [&]() -> std::string_view {
+        if (const auto focus = KeyboardFocusProblem(display, *pid, pid_atom, binding, *deadline);
+            !focus.empty()) return focus;
+        pid_window = FocusedPidWindow(display, *pid, pid_atom);
+        if (pid_window == None) return "focus_owner_changed";
+        if (const auto keys = VerifyStrokeKeys(display, v, control); !keys.empty()) return keys;
+        return DeadlineExpired(*deadline) ? "deadline_exceeded" : "";
+    }, [&] {
+        attempted = true;
+        return SubmitKeystroke(display, v, control);
+    }, [&] { ReleaseKeystroke(display, v, control); });
+    if (attempted) MarkDispatchStarted(dispatched);
+    if (!problem.empty()) {
         restore();
-        return fail("x11_error", "keyboard_dispatch", true, kExitUnknownEffect);
+        return fail(problem, "keyboard_dispatch", dispatched,
+                    problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
     }
     // Serve the text only to the expected process; wait (bounded) for it.
     bool consumed = false;
@@ -3094,16 +3099,12 @@ int main(int argc, char **argv) {
                                                         binding, deadline_ns.value()); !focus.empty()) {
                 return focus;
             }
-            char keys[32]{};
-            XQueryKeymap(display, keys);
-            if (KeyIsDown(keys, stroke.keycode) || (stroke_shift && KeyIsDown(keys, stroke_shift))) {
-                return "input_already_held";
-            }
+            if (const auto keys = VerifyStrokeKeys(display, stroke.keycode, stroke_shift); !keys.empty()) return keys;
             return DeadlineExpired(deadline_ns.value()) ? "deadline_exceeded" : "";
         }, [&] {
             attempted = true;
-            return SubmitTextStroke(display, stroke.keycode, stroke_shift);
-        }, [&] { ReleaseTextStroke(display, stroke.keycode, stroke_shift); });
+            return SubmitKeystroke(display, stroke.keycode, stroke_shift);
+        }, [&] { ReleaseKeystroke(display, stroke.keycode, stroke_shift); });
         if (attempted) MarkDispatchStarted(dispatch_started);
         if (!problem.empty()) {
             return finish_failure(problem, "keyboard_dispatch",
@@ -3111,7 +3112,7 @@ int main(int argc, char **argv) {
         }
         event_count += stroke_shift ? 4 : 2;
         // Let the target process the completed stroke between server grabs.
-        if (index + 1 < plan->strokes.size()) usleep(2000);
+        if (index + 1 < plan->strokes.size()) usleep(kTextStrokeGapUs);
     }
     restore_mapping();
     XSync(display, False);
