@@ -74,7 +74,7 @@ selection 协议访问（见下文）。观察前通过无输入的 `describe` �
 明确发生在派发前的拒绝保留 `not_applied`；首次输入/指针事件后的不确定失败按 `DRIVER.UNKNOWN_EFFECT` 处理；
 成功仍须 fresh snapshot 验证。截图不会自动触发 OCR。
 
-锚定的键盘输入要求 helper 同时声明 `window-focus` 和 `atomic-key-dispatch`。后端从同一 fresh snapshot 的结构父链取得顶层
+锚定的键盘输入要求 helper 同时声明 `focus-info`、`window-focus` 和 `atomic-key-dispatch`。后端从同一 fresh snapshot 的结构父链取得顶层
 窗口，在派发前复核 AT-SPI bounds，并由 helper 找到同 PID、几何匹配的唯一 X11 client。
 `type_text`、`key_chord`、`paste` 和带修饰键的指针动作向 helper 传入内部窗口绑定；实际焦点
 必须属于该 client 或其子窗口。另一个同 PID 窗口、窗口移动或失焦都不能沿用原证明。
