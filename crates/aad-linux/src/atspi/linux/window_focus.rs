@@ -84,8 +84,10 @@ impl LinuxBackend {
         })?;
         let focus = self.focus(target, Some(window), deadline)?;
         std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        // Resolve the native window here. The first handshake proves the
+        // element and can report a focus change before any stroke was sent.
         let window_id = self
-            .verify_focused_with_helper(target, Some(window), process_id, deadline, &support.path)
+            .verify_window_with_helper(target, window, process_id, deadline, &support.path)
             .map_err(after_focus)?;
         append_window_args(args, window, Some(window_id));
         Ok((support.path, focus))
