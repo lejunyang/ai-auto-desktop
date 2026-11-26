@@ -251,9 +251,18 @@ int RunDragBetween(int argc, char **argv) {
     if (const auto problem=ValidatePathSegment(request,1,*deadline,verify);!problem.empty()) return fail(problem,"hover_validation");
     if (!unheld()) return fail("input_already_held","modifier_preflight");
     for(const auto code:modifier_codes) {
-        if (const auto problem=verify();!problem.empty()) return fail(problem,"modifier_dispatch");
-        owned_modifiers.push_back(code); g_x_error=false;
-        if (!send(XTestFakeKeyEvent(display,code,True,1)!=0)) return fail("x11_error","modifier_dispatch");
+        bool attempted = false;
+        const auto problem = AtomicBurst(display, [&]() -> std::string_view {
+            if (const auto target = verify(); !target.empty()) return target;
+            if (const auto keys = VerifyStrokeKeys(display, code); !keys.empty()) return keys;
+            return DeadlineExpired(*deadline) ? "deadline_exceeded" : "";
+        }, [&] {
+            attempted = true;
+            return XTestFakeKeyEvent(display, code, True, 1) != 0;
+        }, [&] { ReleaseKeystroke(display, code); });
+        if (attempted) owned_modifiers.push_back(code);
+        if (!problem.empty()) return fail(problem, "modifier_dispatch");
+        ++event_count;
     }
     if (const auto problem=ValidatePathSegment(request,2,*deadline,verify);!problem.empty()) return fail(problem,"modifier_validation");
     if (!unheld(true)) return fail("input_already_held","button_preflight");

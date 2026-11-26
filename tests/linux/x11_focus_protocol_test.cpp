@@ -33,7 +33,7 @@ int main() {
             for (auto &arg : strings) args.push_back(arg.data());
             std::ostringstream output;
             auto *saved = std::cout.rdbuf(output.rdbuf());
-            const int code = RunFocusInfo(static_cast<int>(args.size()), args.data());
+            const int code = RunFocusInfo(static_cast<int>(args.size()), args.data(), std::nullopt);
             std::cout.rdbuf(saved);
             return std::pair<int, std::string>{code, output.str()};
         };
