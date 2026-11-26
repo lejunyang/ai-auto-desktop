@@ -8,6 +8,7 @@
 #include <X11/extensions/record.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -222,6 +223,7 @@ struct Geometry {
 struct WindowBinding {
     Window id = None;
     Geometry bounds;
+    bool request_proof = false;
 };
 bool FocusMatchesWindow(Display *, unsigned long, Atom, const std::optional<WindowBinding> &);
 bool PointMatchesWindow(Display *, int, int, unsigned long, Atom, const std::optional<WindowBinding> &);
@@ -1468,29 +1470,6 @@ std::optional<long> IcccmState(const Ewmh &ewmh, Window window) {
     return result;
 }
 
-void CollectClients(Display *display, Window window, int depth, std::vector<Window> *out) {
-    Window root = None;
-    Window parent = None;
-    Window *children = nullptr;
-    unsigned int count = 0;
-    g_x_error = false;
-    const Status status = XQueryTree(display, window, &root, &parent, &children, &count);
-    XSync(display, False);
-    if (!status || g_x_error) {
-        return;
-    }
-    for (unsigned int index = 0; index < count && out->size() < 4096; ++index) {
-        out->push_back(children[index]);
-        if (depth < 3) {
-            CollectClients(display, children[index], depth + 1, out);
-        }
-    }
-    if (children != nullptr) {
-        XFree(children);
-    }
-}
-
-
 std::optional<Geometry> RootGeometry(Display *display, Window window) {
     XWindowAttributes attributes{};
     g_x_error = false;
@@ -1519,36 +1498,20 @@ bool Exists(Display *display, Window window) {
     return status && !g_x_error;
 }
 
+#include "x11_window_geometry.hpp"
+
 // The one top-level client window of `pid` at `want` (the AT-SPI frame's
 // screen extents). With a single client window of that process its geometry
 // may be stale (e.g. while minimized), so it is accepted alone.
 std::optional<Window> FindClientWindow(const Ewmh &ewmh, unsigned long pid, const Geometry &want,
                                        std::string *problem, bool allow_single = true) {
-    std::vector<Window> all;
-    if (ewmh.present) {
-        Atom actual_type = None;
-        int actual_format = 0;
-        unsigned long count = 0;
-        unsigned long bytes_after = 0;
-        unsigned char *data = nullptr;
-        g_x_error = false;
-        if (XGetWindowProperty(ewmh.display, ewmh.root, ewmh.client_list, 0, 4096, False,
-                               XA_WINDOW, &actual_type, &actual_format, &count, &bytes_after,
-                               &data) == Success &&
-            actual_type == XA_WINDOW && actual_format == 32 && data != nullptr) {
-            const auto *windows = reinterpret_cast<Window *>(data);
-            all.assign(windows, windows + count);
-        }
-        if (data != nullptr) {
-            XFree(data);
-        }
-        XSync(ewmh.display, False);
-    }
-    if (all.empty()) {
-        CollectClients(ewmh.display, ewmh.root, 0, &all);
+    const auto all = WindowCandidates(ewmh);
+    if (!all) {
+        *problem = "window_inventory_unproven";
+        return std::nullopt;
     }
     std::vector<Window> owned;
-    for (const Window window : all) {
+    for (const Window window : *all) {
         if (OwnPid(ewmh.display, window, ewmh.pid) != pid) {
             continue;
         }
@@ -1567,9 +1530,7 @@ std::optional<Window> FindClientWindow(const Ewmh &ewmh, unsigned long pid, cons
     std::vector<Window> exact;
     for (const Window window : owned) {
         const auto geometry = RootGeometry(ewmh.display, window);
-        if (geometry.has_value() && std::abs(static_cast<long long>(geometry->x) - want.x) <= 2 &&
-            std::abs(static_cast<long long>(geometry->y) - want.y) <= 2 && geometry->width == want.width &&
-            geometry->height == want.height) {
+        if (geometry && GeometryMatches(*geometry, want, 2)) {
             exact.push_back(window);
         }
     }
@@ -1647,15 +1608,19 @@ bool ExtractWindowBinding(int *argc, char ***argv, std::vector<char *> *filtered
         if (option == "--window-width") { bit = 4; destination = &parsed.bounds.width; }
         if (option == "--window-height") { bit = 8; destination = &parsed.bounds.height; }
         if (option == "--window-id") bit = 16;
+        if (option == "--geometry-proof") bit = 32;
         if (bit == 0) { filtered->push_back((*argv)[i]); continue; }
         if ((seen & bit) != 0 || ++i >= *argc) return false;
         seen |= bit;
         if (destination) {
             if (!ParseInt((*argv)[i], destination)) return false;
-        } else {
+        } else if (bit == 16) {
             const auto id = ParseUnsigned((*argv)[i]);
             if (!id.has_value() || *id == 0 || *id > 0xffffffffUL) return false;
             parsed.id = static_cast<Window>(*id);
+        } else {
+            if (std::string_view((*argv)[i]) != "1") return false;
+            parsed.request_proof = true;
         }
     }
     if (seen) {
@@ -1717,6 +1682,7 @@ struct WindowArgs {
     std::uint64_t deadline_ns = 0;
     Geometry geometry;
     std::string action;
+    bool request_proof = false;
 };
 
 std::optional<WindowArgs> ParseWindowArgs(int argc, char **argv, bool action) {
@@ -1724,11 +1690,11 @@ std::optional<WindowArgs> ParseWindowArgs(int argc, char **argv, bool action) {
                                              "deadline-monotonic-ns"};
     if (action) {
         allowed.push_back("action");
+    } else {
+        allowed.push_back("geometry-proof");
     }
     const auto pairs = ParsePairs(argc, argv, allowed);
-    if (!pairs.has_value() || pairs->size() != allowed.size()) {
-        return std::nullopt;
-    }
+    if (!pairs) return std::nullopt;
     WindowArgs parsed;
     const auto pid = ParseUnsigned(Pair(*pairs, "expected-pid").value_or(""));
     const auto deadline = ParseUnsigned(Pair(*pairs, "deadline-monotonic-ns").value_or(""));
@@ -1743,6 +1709,10 @@ std::optional<WindowArgs> ParseWindowArgs(int argc, char **argv, bool action) {
     }
     parsed.pid = pid.value();
     parsed.deadline_ns = deadline.value();
+    if (const auto proof = Pair(*pairs, "geometry-proof")) {
+        if (*proof != "1") return std::nullopt;
+        parsed.request_proof = true;
+    }
     if (action) {
         parsed.action = Pair(*pairs, "action").value_or("");
         if (parsed.action != "minimize" && parsed.action != "maximize" &&
@@ -1791,9 +1761,12 @@ int RunWindow(std::string_view command, int argc, char **argv) {
         return exit_code;
     }
     const Ewmh ewmh = LoadEwmh(display);
-    std::string problem;
-    const auto window = FindClientWindow(ewmh, static_cast<unsigned long>(args->pid),
-                                         args->geometry, &problem);
+    std::string problem = "window_not_found";
+    const auto pid = static_cast<unsigned long>(args->pid);
+    const auto proof = args->request_proof ? FindGeometryProof(ewmh, pid, args->geometry) : std::nullopt;
+    const auto window = args->request_proof ?
+        (proof ? std::optional<Window>(proof->client) : std::nullopt) :
+        FindClientWindow(ewmh, pid, args->geometry, &problem);
     if (!window.has_value()) {
         XCloseDisplay(display);
         EmitError(problem, "target_preflight", false);
@@ -1812,8 +1785,9 @@ int RunWindow(std::string_view command, int argc, char **argv) {
                   << ",\"maximize\":" << (maximize ? "true" : "false")
                   << ",\"activate\":" << (activate ? "true" : "false")
                   << ",\"close\":" << (close ? "true" : "false") << "}," << StateJson(before)
-                  << WindowTitleJson(display,window.value())
-                  << "}" << std::endl;
+                  << WindowTitleJson(display,window.value());
+        if (proof) std::cout << ",\"geometry_proof\":" << GeometryProofJson(*proof);
+        std::cout << "}" << std::endl;
         XCloseDisplay(display);
         return 0;
     }
@@ -2061,11 +2035,18 @@ int RunFocusInfo(int argc, char **argv, std::optional<WindowBinding> binding) {
         return exit_code;
     }
     const Atom pid_atom = XInternAtom(display, "_NET_WM_PID", True);
+    std::optional<WindowGeometryProof> proof;
     if (binding.has_value()) {
         const auto ewmh = LoadEwmh(display);
-        std::string problem;
-        const auto window = FindClientWindow(ewmh, static_cast<unsigned long>(pid), binding->bounds, &problem, false);
-        binding->id = window.value_or(None);
+        if (binding->request_proof) {
+            proof = FindGeometryProof(ewmh, static_cast<unsigned long>(pid), binding->bounds);
+            binding->id = proof ? proof->client : None;
+            if (proof) binding->bounds = proof->client_bounds;
+        } else {
+            std::string problem;
+            const auto window = FindClientWindow(ewmh, static_cast<unsigned long>(pid), binding->bounds, &problem, false);
+            binding->id = window.value_or(None);
+        }
     }
     const bool focused = pid_atom != None &&
                          FocusMatchesWindow(display, static_cast<unsigned long>(pid), pid_atom, binding);
@@ -2077,7 +2058,9 @@ int RunFocusInfo(int argc, char **argv, std::optional<WindowBinding> binding) {
     std::cout << "{\"ok\":true,\"focused\":" << (focused ? "true" : "false")
               << ",\"expected_pid\":" << pid
               << ",\"window_bound\":" << (binding.has_value() ? "true" : "false")
-              << ",\"window\":" << (binding.has_value() ? binding->id : None) << "}" << std::endl;
+              << ",\"window\":" << (binding.has_value() ? binding->id : None);
+    if (proof) std::cout << ",\"geometry_proof\":" << GeometryProofJson(*proof);
+    std::cout << "}" << std::endl;
     return 0;
 }
 
@@ -2719,14 +2702,14 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
         // This protocol handshake does not open a display or touch input state.
-        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys","anchored-drag-between"]})"
+        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys","anchored-drag-between","window-geometry-proof-v1"]})"
                   << std::endl;
         return 0;
     }
     std::optional<WindowBinding> binding;
     std::vector<char *> filtered;
-    if (!ExtractWindowBinding(&argc, &argv, &filtered, &binding) ||
-        (binding.has_value() && command != "focus-info" && binding->id == None)) {
+    if ((command != "window-info" && !ExtractWindowBinding(&argc, &argv, &filtered, &binding)) ||
+        (binding.has_value() && command != "focus-info" && (binding->id == None || binding->request_proof))) {
         EmitError("invalid_window_binding", "arguments", false);
         return kExitInvalid;
     }

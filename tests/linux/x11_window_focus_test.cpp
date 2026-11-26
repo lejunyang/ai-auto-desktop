@@ -109,8 +109,86 @@ int main() {
         XUnmapWindow(display, sibling); XSync(display, False);
         const auto moved_proof = invoke({"focus-info"}, true);
         RequireWindow(moved_proof.code == 0 && moved_proof.output.find("\"focused\":false") != std::string::npos, "single-window geometry mismatch accepted");
+
+        Display *wm = XOpenDisplay(nullptr);
+        RequireWindow(wm != nullptr, "private WM connection unavailable");
+        const Atom wm_check = XInternAtom(display, "_NET_SUPPORTING_WM_CHECK", False);
+        const Atom client_list = XInternAtom(display, "_NET_CLIENT_LIST", False);
+        const Atom frame_extents = XInternAtom(display, "_NET_FRAME_EXTENTS", False);
+        const Window identity = XCreateSimpleWindow(wm, root, 0, 0, 1, 1, 0, 0, 0);
+        const Window frame = XCreateSimpleWindow(wm, root, 15, 10, 210, 215, 0, 0, 0);
+        auto property = [](Display *connection, Window window, Atom name, Atom type,
+                           const unsigned long *values, int count) {
+            XChangeProperty(connection, window, name, type, 32, PropModeReplace,
+                            reinterpret_cast<const unsigned char *>(values), count);
+        };
+        property(wm, root, wm_check, XA_WINDOW, &identity, 1);
+        property(wm, identity, wm_check, XA_WINDOW, &identity, 1);
+        property(wm, identity, pid_atom, XA_CARDINAL, &pid, 1);
+        XMapWindow(wm, frame);
+        XSync(wm, False);
+        XReparentWindow(display, target, frame, 5, 10);
+        XMapWindow(display, target);
+        XSetInputFocus(display, child, RevertToParent, CurrentTime);
+        const unsigned long extents[] = {5, 5, 10, 5};
+        property(display, target, frame_extents, XA_CARDINAL, extents, 4);
+        const Window listed[] = {target, target};
+        property(display, root, client_list, XA_WINDOW, listed, 2);
+        XSync(display, False);
+        const Geometry outer{15, 10, 210, 215};
+        auto geometry_proof = [&](const Geometry &bounds) {
+            return FindGeometryProof(LoadEwmh(display), pid, bounds);
+        };
+        auto decorated = geometry_proof(outer);
+        RequireWindow(decorated && decorated->client == target && decorated->observed_window == frame &&
+                      GeometryMatches(decorated->client_bounds, {20, 20, 200, 200}, 0) &&
+                      decorated->frames.size() == 1 && decorated->wm->identity == identity &&
+                      decorated->extents == FrameExtents{5, 5, 10, 5},
+                      "trusted frame did not bind to unique real client");
+        const auto client_proof = geometry_proof({21, 22, 200, 200});
+        RequireWindow(client_proof && client_proof->observed_window == target &&
+                      client_proof->frames.size() == 1, "client match discarded trusted frame");
+        RequireWindow(!geometry_proof({23, 20, 200, 200}), "client tolerance exceeded two pixels");
+        const auto helper_proof = invoke({"focus-info", "--geometry-proof", "1"}, true);
+        RequireWindow(helper_proof.code == 0 && helper_proof.output.find("\"focused\":true") != std::string::npos &&
+                      helper_proof.output.find("\"geometry_proof\":") != std::string::npos,
+                      "helper did not emit focus and geometry proof");
+        XDeleteProperty(display, target, frame_extents);
+        XSync(display, False);
+        const auto absent = geometry_proof(outer);
+        RequireWindow(absent && !absent->extents && GeometryProofJson(*absent) != GeometryProofJson(*decorated),
+                      "verified frame without extents property failed or lost change evidence");
+        property(display, target, frame_extents, XA_CARDINAL, extents, 3);
+        XSync(display, False);
+        RequireWindow(!geometry_proof(outer), "partial extents accepted");
+        const unsigned long wrong_extents[] = {4, 6, 10, 5};
+        property(display, target, frame_extents, XA_CARDINAL, wrong_extents, 4);
+        XSync(display, False);
+        RequireWindow(!geometry_proof(outer), "extents inconsistent with measured frame accepted");
+        property(display, target, frame_extents, XA_CARDINAL, extents, 4);
+        XMoveResizeWindow(display, sibling, outer.x, outer.y, outer.width, outer.height);
+        XMapWindow(display, sibling);
+        const Window ambiguous[] = {target, sibling};
+        property(display, root, client_list, XA_WINDOW, ambiguous, 2);
+        XSync(display, False);
+        RequireWindow(!geometry_proof(outer), "client and frame candidate union was ambiguous");
+        std::vector<Window> excessive(4097, target);
+        property(display, root, client_list, XA_WINDOW, excessive.data(), static_cast<int>(excessive.size()));
+        XSync(display, False);
+        RequireWindow(!geometry_proof(outer), "truncated EWMH client list accepted");
+        XDeleteProperty(display, root, client_list);
+        XSync(display, False);
+        RequireWindow(!geometry_proof(outer), "missing EWMH client list accepted");
+        property(display, root, client_list, XA_WINDOW, &target, 1);
+        const Window fake = XCreateSimpleWindow(display, root, outer.x, outer.y, outer.width, outer.height, 0, 0, 0);
+        XMapWindow(display, fake);
+        XReparentWindow(display, target, fake, 5, 10);
+        XMapWindow(display, target);
+        XSync(display, False);
+        RequireWindow(!geometry_proof(outer), "non-WM frame accepted despite matching declared extents");
+        XCloseDisplay(wm);
         XCloseDisplay(display);
-        std::cout << "PASS: PID-only gap reproduced; strict sibling denial, child acceptance, focus/move cleanup, and exact geometry verified\n";
+        std::cout << "PASS: strict focus binding and cleanup; trusted frame, candidate union, incomplete list and forged frame verified\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "FAIL: " << error.what() << '\n'; return 1;
