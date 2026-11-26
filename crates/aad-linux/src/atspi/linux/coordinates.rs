@@ -291,12 +291,14 @@ impl LinuxBackend {
                     self.check_cancelled(false)?;
                     remaining(deadline, false)?;
                     let Some(info) =
-                        self.window_info(process, bounds(client), &input.path, deadline)
+                        self.window_info(process, bounds(client), &input.path, deadline, false)
                     else {
                         continue;
                     };
                     let hex: String = raw.iter().map(|byte| format!("{byte:02x}")).collect();
-                    if info["window"].as_u64() == Some(u64::from(client.id))
+                    if info["ewmh"] == true
+                        && info["window_binding"] != "single_client_fallback"
+                        && info["window"].as_u64() == Some(u64::from(client.id))
                         && info["wm_name_raw_hex"].as_str() == Some(hex.as_str())
                     {
                         client.legacy_title = info["wm_name_utf8"]

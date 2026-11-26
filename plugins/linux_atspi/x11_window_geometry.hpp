@@ -195,12 +195,11 @@ std::optional<WindowGeometryProof> ReadClientGeometry(const Ewmh &ewmh, Window w
     return proof;
 }
 
-std::optional<WindowGeometryProof> FindGeometryProof(const Ewmh &ewmh, unsigned long pid,
-                                                     const Geometry &observed) {
-    if (!PidBelongsToCurrentUser(pid) || !ValidGeometry(observed)) return std::nullopt;
+std::optional<std::vector<Window>> OwnedWindows(const Ewmh &ewmh, unsigned long pid) {
+    if (!PidBelongsToCurrentUser(pid)) return std::nullopt;
     const auto windows = WindowCandidates(ewmh);
     if (!windows) return std::nullopt;
-    std::optional<WindowGeometryProof> match;
+    std::vector<Window> owned;
     for (Window window : *windows) {
         if (!ValidXid(window) || window == ewmh.root) return std::nullopt;
         const auto owner = ReadProperty32(ewmh.display, window, ewmh.pid, XA_CARDINAL, 1);
@@ -211,27 +210,62 @@ std::optional<WindowGeometryProof> FindGeometryProof(const Ewmh &ewmh, unsigned 
         if (!XGetWindowAttributes(ewmh.display, window, &attributes) || g_x_error) return std::nullopt;
         if (attributes.override_redirect || attributes.c_class != InputOutput ||
             (attributes.map_state != IsViewable && !IcccmState(ewmh, window))) continue;
-        // Without EWMH, the bounded discovery walk also visits ordinary child
-        // windows. Only root children can provide a client-only proof.
+        // Without EWMH the bounded discovery walk can also see ordinary
+        // widget windows. Only root children count as top-level clients.
         if (!ewmh.present) {
             const auto parent = WindowParent(ewmh, window);
             if (!parent) return std::nullopt;
             if (*parent != ewmh.root) continue;
         }
-        auto proof = ReadClientGeometry(ewmh, window, pid, observed);
-        if (!proof) return std::nullopt;
-        if (GeometryMatches(proof->client_bounds, observed, 2)) {
-            proof->observed_window = window;
-        } else {
-            for (const auto &frame : proof->frames) {
-                if (GeometryMatches(frame.bounds, observed, 2)) proof->observed_window = frame.id;
+        owned.push_back(window);
+    }
+    return owned;
+}
+
+struct WindowResolution {
+    Window client = None;
+    std::optional<WindowGeometryProof> proof;
+    bool fallback = false;
+    std::string_view problem = "window_not_found";
+};
+
+WindowResolution ResolveWindow(const Ewmh &ewmh, unsigned long pid, const Geometry &observed,
+                               bool include_frames, bool allow_single = false) {
+    const auto owned = OwnedWindows(ewmh, pid);
+    if (!owned || !ValidGeometry(observed)) return {None, {}, false, "window_inventory_unproven"};
+    WindowResolution match;
+    for (Window window : *owned) {
+        std::optional<WindowGeometryProof> proof;
+        if (include_frames) {
+            proof = ReadClientGeometry(ewmh, window, pid, observed);
+            if (!proof) return {None, {}, false, "window_mapping_unproven"};
+            if (GeometryMatches(proof->client_bounds, observed, 2)) {
+                proof->observed_window = window;
+            } else {
+                for (const auto &frame : proof->frames) {
+                    if (GeometryMatches(frame.bounds, observed, 2)) proof->observed_window = frame.id;
+                }
             }
+            if (!proof->observed_window) continue;
+        } else {
+            const auto geometry = RootGeometry(ewmh.display, window);
+            if (!geometry || !ValidGeometry(*geometry)) return {None, {}, false, "window_mapping_unproven"};
+            if (!GeometryMatches(*geometry, observed, 2)) continue;
         }
-        if (!proof->observed_window) continue;
-        if (match) return std::nullopt;
-        match = std::move(proof);
+        if (match.client != None) return {None, {}, false, "window_ambiguous"};
+        match.client = window;
+        match.proof = std::move(proof);
+    }
+    if (match.client == None && allow_single && owned->size() == 1) {
+        match.client = owned->front();
+        match.fallback = true;
     }
     return match;
+}
+
+std::optional<WindowGeometryProof> FindGeometryProof(const Ewmh &ewmh, unsigned long pid,
+                                                     const Geometry &observed) {
+    return ResolveWindow(ewmh, pid, observed, true).proof;
 }
 
 std::string GeometryJson(const Geometry &rect) {

@@ -1121,6 +1121,9 @@ impl AtspiBackend for LinuxBackend {
         };
         let support = self.probe_input(deadline)?;
         support.require(feature)?;
+        if super::WINDOW_ACTIONS.contains(&action) {
+            support.require(GEOMETRY_FEATURE)?;
+        }
         if matches!(action, "type_text" | "key_chord" | "paste") {
             support.require("focus-info")?;
             support.require("window-focus")?;
@@ -1817,26 +1820,35 @@ impl AtspiBackend for LinuxBackend {
     fn window_action(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
         action: &str,
         bounds: Bounds,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
         let path = self.input_helper("window-action", deadline)?;
-        if let Err(unproven) = self.verify_coordinate_target(target, deadline) {
-            // A minimized window is unmapped, so it can never be calibrated.
-            // EWMH actions need no pointer coordinates: accept it only when
-            // the helper binds exactly these bounds to this process's
-            // minimized client, as the snapshot did when offering restore.
-            let minimized = unproven.code == "DRIVER.COORDINATE_UNPROVEN"
-                && self
-                    .window_info(process_id, bounds, &path, deadline)
-                    .is_some_and(|info| info["minimized"] == true);
-            if !minimized {
-                return Err(unproven);
-            }
-        }
+        self.input_helper(GEOMETRY_FEATURE, deadline)?;
+        let binding = window
+            .filter(|window| window.native == *target && window.bounds == bounds)
+            .and_then(|window| window.x11.as_ref())
+            .ok_or_else(|| {
+                driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "observation has no proven window action target",
+                )
+            })?;
         let mut args = window_args("window-action", process_id, bounds);
+        args.extend(["--window-id".into(), binding.client.to_string()]);
+        if let Some(proof) = &binding.proof {
+            args.extend(["--window-proof".into(), proof.to_string()]);
+        } else if matches!(action, "activate" | "restore") {
+            args.extend(["--single-client-fallback".into(), "1".into()]);
+        } else {
+            return Err(driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "window action requires matching geometry",
+            ));
+        }
         args.extend([
             "--action".into(),
             if action == "close_window" {
@@ -1857,10 +1869,13 @@ impl AtspiBackend for LinuxBackend {
             XTEST_OUTPUT_LIMIT,
         )?;
         let result = parse_input_helper(output, "window_dispatch", 1, process_id)?;
-        if result["reached"] != true {
+        if result["reached"] != true
+            || result["window"] != binding.client
+            || result["window_binding"] != binding.mode()
+        {
             return Err(driver_error(
                 "DRIVER.UNKNOWN_EFFECT",
-                "the window manager did not report the requested window state in time",
+                "the window manager did not confirm the requested window state and binding",
             )
             .with_effect("unknown")
             .with_detail(
@@ -1869,7 +1884,7 @@ impl AtspiBackend for LinuxBackend {
             ));
         }
         Ok(
-            json!({"native_interface": "EWMH", "action": action, "window": result["window"], "verified": true, "observed_state": {"exists": result["exists"], "minimized": result["minimized"], "maximized": result["maximized"], "active": result["active"]}}),
+            json!({"native_interface": "EWMH", "action": action, "window": result["window"], "window_binding": result["window_binding"], "verified": true, "observed_state": {"exists": result["exists"], "minimized": result["minimized"], "maximized": result["maximized"], "active": result["active"]}}),
         )
     }
 
@@ -2032,13 +2047,6 @@ impl LinuxBackend {
             deadline,
         )?;
         self.normalize_coordinates(&mut snapshot, deadline)?;
-        let process_id = snapshot
-            .application
-            .get("process_id")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value > 0);
-        self.add_window_actions(&mut snapshot.nodes, process_id, input.as_ref(), deadline);
         Ok(snapshot)
     }
 
@@ -2137,16 +2145,19 @@ impl LinuxBackend {
         })
     }
 
-    /// The window manager's view of a top-level frame, when the X11 helper
-    /// and an EWMH window manager are there; `None` offers no window actions.
+    // A read-only view for window actions or exact client title conversion.
     fn window_info(
         &self,
         process_id: u32,
         bounds: Bounds,
         path: &Path,
         deadline: Instant,
+        request_proof: bool,
     ) -> Option<Value> {
         let mut args = window_args("window-info", process_id, bounds);
+        if request_proof {
+            args.extend(["--geometry-proof".into(), "1".into()]);
+        }
         args.extend([
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline).ok()?.to_string(),
@@ -2165,74 +2176,8 @@ impl LinuxBackend {
             return None;
         }
         let info = parse_one_json_object(&output.stdout, "window info").ok()?;
-        (info.get("ok") == Some(&Value::Bool(true)) && info.get("ewmh") == Some(&Value::Bool(true)))
+        (info.get("ok") == Some(&json!(true)) && !info.contains_key("dispatch_started"))
             .then_some(Value::Object(info))
-    }
-
-    /// Offer window actions on each top-level frame, by its current state.
-    fn add_window_actions(
-        &self,
-        nodes: &mut [BackendNode],
-        process_id: Option<u32>,
-        input: Option<&InputSupport>,
-        deadline: Instant,
-    ) {
-        let Some(input) =
-            input.filter(|input| input.has("window-info") && input.has("window-action"))
-        else {
-            return;
-        };
-        let Some(process_id) = process_id else {
-            return;
-        };
-        for node in nodes.iter_mut() {
-            // Uncalibrated bounds stay toolkit-logical, so a mapped window is
-            // skipped. A minimized one is unmapped and can never be calibrated;
-            // the helper below still binds it by these exact bounds.
-            let unproven =
-                node.provenance.get("coordinate_space") == Some(&json!("unproven_toolkit"));
-            // A direct child of the application is a top-level window: GTK and
-            // Qt main windows say frame/dialog, a bare QWidget window filler.
-            // The helper still proves an X11 client window of this process
-            // has exactly these bounds before anything is offered.
-            let top_level = node.parent_index == Some(0);
-            let Some(bounds) = node.bounds.filter(|b| b.width > 0 && b.height > 0) else {
-                continue;
-            };
-            if !top_level || remaining(deadline, false).is_err() {
-                continue;
-            }
-            let Some(info) = self.window_info(process_id, bounds, &input.path, deadline) else {
-                continue;
-            };
-            let supports = |name: &str| info["supports"][name] == true;
-            let minimized = info["minimized"] == true;
-            if unproven && !minimized {
-                continue;
-            }
-            let maximized = info["maximized"] == true;
-            let mut offered = Vec::new();
-            if !minimized {
-                offered.push("minimize");
-            }
-            if supports("maximize") && !maximized && !minimized {
-                offered.push("maximize");
-            }
-            if (minimized && supports("activate")) || (maximized && supports("maximize")) {
-                offered.push("restore");
-            }
-            if supports("close") {
-                offered.push("close_window");
-            }
-            if supports("activate") && !minimized && info["active"] != true {
-                offered.push("activate");
-            }
-            node.actions.extend(offered.into_iter().map(String::from));
-            node.provenance.insert(
-                "window".into(),
-                json!({"x11_window": info["window"], "minimized": minimized, "maximized": maximized, "active": info["active"]}),
-            );
-        }
     }
 }
 
@@ -2687,6 +2632,7 @@ fn parse_input_helper(
             "restored",
             "reached",
             "window",
+            "window_binding",
             "action",
             "exists",
             "minimized",
@@ -2785,7 +2731,7 @@ fn map_helper_code(code: &str) -> Option<AutomationError> {
             "DRIVER.ACTION_UNSUPPORTED",
             "the window manager does not support this EWMH window request",
         ),
-        "window_not_found" | "window_ambiguous" => driver_error(
+        "window_not_found" | "window_ambiguous" | "target_window_changed" => driver_error(
             "DRIVER.STALE_SNAPSHOT",
             "no single top-level X11 window of the process matches the observed frame",
         ),

@@ -5,12 +5,15 @@ pub(super) const GEOMETRY_FEATURE: &str = "window-geometry-proof-v1";
 
 impl WindowAnchor {
     pub(super) fn input_binding(&self) -> Result<&X11WindowBinding, AutomationError> {
-        self.x11.as_ref().ok_or_else(|| {
-            driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                "observation has no proven X11 window",
-            )
-        })
+        self.x11
+            .as_ref()
+            .filter(|binding| binding.proof.is_some())
+            .ok_or_else(|| {
+                driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "observation has no proven X11 window",
+                )
+            })
     }
 }
 
@@ -35,7 +38,7 @@ pub(super) fn append_window_args(
             "--window-id".into(),
             binding.client.to_string(),
             "--window-proof".into(),
-            binding.proof.to_string(),
+            binding.input_proof().to_string(),
         ]);
     }
 }
@@ -49,15 +52,73 @@ fn matches_bounds(value: &Value, observed: Bounds) -> bool {
     })
 }
 
+fn proof_payload(proof: &Value, client: u32, process_id: u32, bounds: Bounds) -> Option<Value> {
+    (proof["version"] == 1
+        && proof["expected_pid"] == process_id
+        && proof["client"] == client
+        && proof["observed_bounds"] == bounds.to_json())
+    .then(|| proof.clone())
+}
+
+fn reply_client(value: &Value) -> Option<u32> {
+    u32::try_from(value.as_u64()?).ok().filter(|id| *id > 0)
+}
+
 impl X11WindowBinding {
-    fn matches(&self, observed: Bounds) -> bool {
-        matches_bounds(&self.proof["client_bounds"], observed)
-            || self.proof["frames"].as_array().is_some_and(|frames| {
-                frames
-                    .iter()
-                    .any(|f| matches_bounds(&f["bounds"], observed))
-            })
+    pub(super) fn input_proof(&self) -> &Value {
+        self.proof.as_ref().expect("input binding has geometry")
     }
+
+    pub(super) fn mode(&self) -> &'static str {
+        if self.proof.is_some() {
+            "geometry"
+        } else {
+            "single_client_fallback"
+        }
+    }
+
+    fn matches(&self, observed: Bounds) -> bool {
+        self.proof.as_ref().is_some_and(|proof| {
+            matches_bounds(&proof["client_bounds"], observed)
+                || proof["frames"].as_array().is_some_and(|frames| {
+                    frames
+                        .iter()
+                        .any(|f| matches_bounds(&f["bounds"], observed))
+                })
+        })
+    }
+}
+
+fn add_window_actions(node: &mut BackendNode, info: &Value, binding: &X11WindowBinding) {
+    let supports = |name: &str| info["supports"][name] == true;
+    let minimized = info["minimized"] == true;
+    let maximized = info["maximized"] == true;
+    let active = info["active"] == true;
+    let actions = [
+        ("minimize", !minimized && supports("minimize")),
+        ("maximize", !minimized && !maximized && supports("maximize")),
+        ("restore", (minimized || maximized) && supports("restore")),
+        ("close_window", supports("close")),
+        ("activate", !active && supports("activate")),
+    ];
+    node.actions.extend(
+        actions
+            .into_iter()
+            .filter(|(action, allowed)| {
+                *allowed && (binding.proof.is_some() || matches!(*action, "activate" | "restore"))
+            })
+            .map(|(action, _)| action.to_string()),
+    );
+    node.provenance.insert(
+        "window".into(),
+        json!({
+            "x11_window": binding.client,
+            "window_binding": binding.mode(),
+            "minimized": minimized,
+            "maximized": maximized,
+            "active": active,
+        }),
+    );
 }
 
 impl LinuxBackend {
@@ -132,26 +193,23 @@ impl LinuxBackend {
         };
         let client = response
             .get("window")
-            .and_then(Value::as_u64)
-            .and_then(|id| u32::try_from(id).ok())
-            .filter(|id| *id > 0)
+            .and_then(reply_client)
             .ok_or_else(invalid_proof)?;
-        let proof = response.get("geometry_proof").ok_or_else(invalid_proof)?;
         if !output.status.success()
             || response.get("ok") != Some(&json!(true))
             || response.get("window_bound") != Some(&json!(true))
             || response.get("expected_pid") != Some(&json!(process_id))
             || response.contains_key("dispatch_started")
-            || proof["version"] != 1
-            || proof["expected_pid"] != process_id
-            || proof["client"] != client
-            || proof["observed_bounds"] != window.bounds.to_json()
         {
             return Err(invalid_proof());
         }
+        let proof = response
+            .get("geometry_proof")
+            .and_then(|proof| proof_payload(proof, client, process_id, window.bounds))
+            .ok_or_else(invalid_proof)?;
         let binding = X11WindowBinding {
             client,
-            proof: proof.clone(),
+            proof: Some(proof),
         };
         if window
             .x11
@@ -165,7 +223,7 @@ impl LinuxBackend {
 
     pub(super) fn capture_x11_window_bindings(
         &self,
-        snapshot: &BackendSnapshot,
+        snapshot: &mut BackendSnapshot,
         deadline: Instant,
     ) -> BTreeMap<usize, X11WindowBinding> {
         let Some(app) = snapshot.nodes.first() else {
@@ -179,37 +237,57 @@ impl LinuxBackend {
         else {
             return BTreeMap::new();
         };
-        let Ok(path) = self.input_helper(GEOMETRY_FEATURE, deadline) else {
+        let Ok(support) = self.probe_input(deadline) else {
             return BTreeMap::new();
         };
+        if !support.has(GEOMETRY_FEATURE) || !support.has("window-info") {
+            return BTreeMap::new();
+        }
         let Ok(windows) = self.direct_window_bounds(&app.native, &snapshot.nodes, deadline) else {
             return BTreeMap::new();
         };
         snapshot
             .nodes
-            .iter()
+            .iter_mut()
             .enumerate()
             .filter(|(_, node)| node.parent_index == Some(0))
             .filter_map(|(index, node)| {
-                if node.provenance.get("coordinate_space") == Some(&json!("unproven_toolkit")) {
-                    return None;
-                }
                 let bounds = node.bounds.filter(|b| b.width > 0 && b.height > 0)?;
                 if !windows.iter().any(|(native, _)| *native == node.native) {
                     return None;
                 }
-                let window = WindowAnchor {
-                    native: node.native.clone(),
-                    bounds,
-                    x11: None,
+                let info = self.window_info(process_id, bounds, &support.path, deadline, true)?;
+                let client = reply_client(&info["window"])?;
+                let proof = match info["window_binding"].as_str()? {
+                    "geometry" => Some(proof_payload(
+                        &info["geometry_proof"],
+                        client,
+                        process_id,
+                        bounds,
+                    )?),
+                    "single_client_fallback"
+                        if windows.len() == 1 && info.get("geometry_proof").is_none() =>
+                    {
+                        None
+                    }
+                    _ => return None,
                 };
-                let (binding, _) = self
-                    .window_proof(&window, process_id, &path, deadline)
-                    .ok()?;
-                windows
+                let binding = X11WindowBinding { client, proof };
+                if windows
                     .iter()
-                    .all(|(native, bounds)| *native == window.native || !binding.matches(*bounds))
-                    .then_some((index, binding))
+                    .any(|(native, bounds)| *native != node.native && binding.matches(*bounds))
+                {
+                    return None;
+                }
+                let unproven =
+                    node.provenance.get("coordinate_space") == Some(&json!("unproven_toolkit"));
+                if unproven && info["minimized"] != true && binding.proof.is_some() {
+                    return None;
+                }
+                if support.has("window-action") && info["ewmh"] == true {
+                    add_window_actions(node, &info, &binding);
+                }
+                Some((index, binding))
             })
             .collect()
     }

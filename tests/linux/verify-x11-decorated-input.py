@@ -14,6 +14,8 @@ import time
 
 
 ENTRY = "aad geometry entry"
+PRIMARY = "aad decorated primary"
+SIBLING = "aad decorated sibling"
 
 
 def fixture(decorated):
@@ -77,7 +79,159 @@ def try_until(query, accept):
     raise AssertionError(f"private fixture did not become ready: {result}")
 
 
+def window_fixture():
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("GdkX11", "3.0")
+    from gi.repository import GdkX11, GLib, Gtk
+
+    primary = Gtk.Window(title=PRIMARY)
+    sibling = Gtk.Window(title=SIBLING)
+    for window, x, width in ((primary, 40, 380), (sibling, 540, 320)):
+        window.set_default_size(width, 140)
+        window.move(x, 80)
+        window.show_all()
+    sibling.present()
+
+    def handle(stream, _condition):
+        request = stream.readline().strip()
+        if request == "move":
+            primary.move(100, 210)
+        elif request == "present":
+            primary.present()
+        else:
+            Gtk.main_quit()
+            return False
+        return True
+
+    GLib.io_add_watch(sys.stdin, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, handle)
+    print(json.dumps([GdkX11.X11Window.get_xid(w.get_window()) for w in (primary, sibling)]), flush=True)
+    Gtk.main()
+
+
+def window_actions(aad):
+    def xprop(*args):
+        return subprocess.check_output(["xprop", *args], text=True, timeout=5)
+
+    def state(xid):
+        props = xprop("-id", xid, "WM_STATE", "_NET_WM_STATE")
+        return ("Iconic" in props or "_NET_WM_STATE_HIDDEN" in props,
+                "_NET_WM_STATE_MAXIMIZED_HORZ" in props and "_NET_WM_STATE_MAXIMIZED_VERT" in props)
+
+    with (
+        subprocess.Popen([sys.executable, __file__, "--window-fixture"], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, text=True) as gtk,
+        subprocess.Popen([aad, "control", "serve", "--allow-input"], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, text=True) as control,
+    ):
+        session = None
+        sequence = 0
+
+        def call(method, **fields):
+            nonlocal session, sequence
+            sequence += 1
+            request = {"request_id": str(sequence), "timeout_ms": 6000,
+                       "operation": {"method": method, **fields}}
+            if session is not None:
+                request["session_id"] = session
+            control.stdin.write(json.dumps(request) + "\n")
+            control.stdin.flush()
+            response = json.loads(control.stdout.readline())
+            assert response["request_id"] == str(sequence), response
+            session = response["session_id"]
+            return response
+
+        try:
+            assert "data" in call("capabilities")
+            primary, sibling = (hex(id_) for id_ in json.loads(gtk.stdout.readline()))
+            try_until(lambda: xprop("-root", "_NET_ACTIVE_WINDOW"), lambda text: sibling in text)
+            apps = lambda: [r for r in call("targets")["data"]["resources"]
+                            if r["metadata"].get("process_id") == gtk.pid]
+            resource = try_until(apps, lambda rows: len(rows) == 1)[0]["resource_id"]
+
+            def observe(name):
+                response = call("observe", resource_id=resource, view={"mode": "nodes"})
+                nodes = [n for n in response["data"]["nodes"] if n["name"] == name]
+                assert len(nodes) == 1, response
+                return nodes[0]
+
+            def act(node, action, xid, binding="geometry"):
+                response = call("act", target=node["target"], action={"type": action})
+                assert response["effect"] == "applied", response
+                result = response["data"]["backend_result"]["backend_result"]
+                assert result["window"] == int(xid, 16) and result["window_binding"] == binding, result
+
+            act(observe(PRIMARY), "activate", primary)
+            assert primary in xprop("-root", "_NET_ACTIVE_WINDOW")
+            assert state(sibling) == (False, False)
+            act(observe(PRIMARY), "maximize", primary)
+            assert state(primary) == (False, True) and state(sibling) == (False, False)
+            act(observe(PRIMARY), "restore", primary)
+            assert state(primary) == state(sibling) == (False, False)
+            moved = observe(PRIMARY)
+            get_geometry = lambda: subprocess.check_output(["xwininfo", "-id", primary], text=True, timeout=5)
+            geometry = get_geometry()
+            gtk.stdin.write("move\n")
+            gtk.stdin.flush()
+            try_until(get_geometry, lambda text: text != geometry)
+            stale = call("act", target=moved["target"], action={"type": "close_window"})
+            assert stale["effect"] == "not_applied" and "STALE" in stale["error"]["code"], stale
+            assert primary in xprop("-root", "_NET_CLIENT_LIST")
+            act(observe(PRIMARY), "minimize", primary)
+            assert state(primary) == (True, False) and state(sibling) == (False, False)
+            # Closed from a fresh, visible observation after moving the focus
+            # back to this exact window in the private fixture.
+            gtk.stdin.write("present\n")
+            gtk.stdin.flush()
+            try_until(lambda: state(primary), lambda current: current == (False, False))
+            act(observe(PRIMARY), "close_window", primary)
+            clients = xprop("-root", "_NET_CLIENT_LIST")
+            assert primary not in clients and sibling in clients and state(sibling) == (False, False)
+            print("PASS decorated same-PID activate, maximize, restore, minimize, close and stale rejection", flush=True)
+
+            def helper(command, *options):
+                return subprocess.run([os.environ["AAD_LINUX_XTEST_HELPER"], command,
+                                       "--expected-pid", str(gtk.pid), "--x", "900", "--y", "720",
+                                       "--width", "20", "--height", "20", "--deadline-monotonic-ns",
+                                       str(time.monotonic_ns() + 3_000_000_000), *options],
+                                      capture_output=True, text=True, timeout=5)
+
+            observed = json.loads(helper("window-info", "--geometry-proof", "1").stdout)
+            assert observed["window_binding"] == "single_client_fallback", observed
+            assert not observed["supports"]["close"] and not observed["supports"]["minimize"], observed
+            for name in ("close", "minimize", "maximize"):
+                denied = helper("window-action", "--action", name)
+                assert denied.returncode == 73 and json.loads(denied.stdout)["dispatch_started"] is False, denied
+            act(observe(SIBLING), "minimize", sibling)
+            assert state(sibling) == (True, False)
+            restore = helper("window-action", "--action", "restore", "--window-id", str(int(sibling, 16)),
+                             "--single-client-fallback", "1")
+            reply = json.loads(restore.stdout.splitlines()[-1])
+            assert restore.returncode == 0 and reply["reached"] and reply["window_binding"] == "single_client_fallback", reply
+            assert state(sibling) == (False, False)
+            act(observe(SIBLING), "minimize", sibling)
+            restore_target = observe(SIBLING)
+            act(restore_target, "restore", sibling,
+                restore_target["provenance"]["window"]["window_binding"])
+            assert state(sibling) == (False, False)
+            act(observe(SIBLING), "minimize", sibling)
+            activate = helper("window-action", "--action", "activate", "--window-id", str(int(sibling, 16)),
+                              "--single-client-fallback", "1")
+            reply = json.loads(activate.stdout.splitlines()[-1])
+            assert activate.returncode == 0 and reply["reached"] and reply["window_binding"] == "single_client_fallback", reply
+            assert state(sibling) == (False, False) and sibling in xprop("-root", "_NET_ACTIVE_WINDOW")
+            print("PASS single-client fallback restore and activate; mismatched close, minimize and maximize rejected", flush=True)
+        finally:
+            control.terminate()
+            gtk.terminate()
+
+
 def run(aad):
+    display = os.environ.get("DISPLAY", "").removeprefix(":")
+    assert display.isdecimal() and int(display) >= 170
+    assert os.environ.get("XAUTHORITY") and os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+
     def cli(*args):
         return json.loads(subprocess.check_output([aad, "--compact", *args], text=True, timeout=15))
 
@@ -124,6 +278,7 @@ def run(aad):
                             print(f"PASS {mode} {'keys' if options else 'unicode'} {len(text)} characters", flush=True)
                     finally:
                         gtk.terminate()
+            window_actions(aad)
         finally:
             wm.terminate()
 
@@ -131,6 +286,8 @@ def run(aad):
 if __name__ == "__main__":
     if sys.argv[1] == "--fixture":
         fixture(sys.argv[2] == "decorated")
+    elif sys.argv[1] == "--window-fixture":
+        window_fixture()
     elif sys.argv[1] == "--private":
         run(sys.argv[2])
     else:
@@ -142,7 +299,8 @@ if __name__ == "__main__":
                         "AT_SPI_BUS_ADDRESS", "DBUS_SESSION_BUS_ADDRESS", "SESSION_MANAGER",
                         "NO_AT_BRIDGE", "GDK_SCALE", "GDK_DPI_SCALE", "GTK_MODULES"):
                 env.pop(key, None)
-            for key in ("XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"):
+            for key in ("XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+                        "AAD_CONTROL_LEASE_DIR"):
                 isolated = Path(profile) / key
                 isolated.mkdir(mode=0o700)
                 env[key] = str(isolated)

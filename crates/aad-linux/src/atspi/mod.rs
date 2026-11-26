@@ -94,7 +94,7 @@ pub struct WindowAnchor {
 #[derive(Clone, Debug, PartialEq)]
 pub struct X11WindowBinding {
     client: u32,
-    proof: Value,
+    proof: Option<Value>,
 }
 
 /// Private native path: source, intermediate anchors, then destination. Every
@@ -530,6 +530,7 @@ pub trait AtspiBackend: Send + Sync {
     fn window_action(
         &self,
         _target: &NativeRef,
+        _window: Option<&WindowAnchor>,
         _action: &str,
         _bounds: Bounds,
         _process_id: u32,
@@ -1442,6 +1443,7 @@ impl AtspiProvider {
             None
         };
         let pin_x11_window = matches!(action, "type_text" | "key_chord" | "paste")
+            || WINDOW_ACTIONS.contains(&action)
             || !modifiers.is_empty()
             || !path.is_empty();
         let (fresh, fresh_id, node, native) =
@@ -1821,11 +1823,17 @@ impl AtspiProvider {
                     self.backend
                         .paste(&native, window.as_ref(), text, process, deadline)
                 }
-                window if WINDOW_ACTIONS.contains(&window) => {
+                window_action if WINDOW_ACTIONS.contains(&window_action) => {
                     let process = process_id(&node, &fresh)?;
                     let bounds = parse_bounds(node.get("bounds"))?;
-                    self.backend
-                        .window_action(&native, window, bounds, process, deadline)
+                    self.backend.window_action(
+                        &native,
+                        window.as_ref(),
+                        window_action,
+                        bounds,
+                        process,
+                        deadline,
+                    )
                 }
                 "toggle" => self.backend.named_action(&native, "click", deadline),
                 "expand" | "collapse" => self.backend.named_action(&native, "activate", deadline),
@@ -4169,6 +4177,7 @@ mod tests {
         fn window_action(
             &self,
             _target: &NativeRef,
+            _window: Option<&WindowAnchor>,
             action: &str,
             bounds: Bounds,
             process_id: u32,

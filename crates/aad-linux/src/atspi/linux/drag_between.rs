@@ -78,7 +78,7 @@ impl LinuxBackend {
                 ("x", end.point.0.to_string()),
                 ("y", end.point.1.to_string()),
                 ("window-id", binding.client.to_string()),
-                ("window-proof", binding.proof.to_string()),
+                ("window-proof", binding.input_proof().to_string()),
                 ("window-x", bounds.x.to_string()),
                 ("window-y", bounds.y.to_string()),
                 ("window-width", bounds.width.to_string()),
