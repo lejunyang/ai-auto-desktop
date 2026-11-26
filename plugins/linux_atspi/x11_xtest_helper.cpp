@@ -79,6 +79,37 @@ bool DeadlineExpired(std::uint64_t deadline_ns) {
     return g_input_cancelled != 0 || now_ns < 0 || static_cast<std::uint64_t>(now_ns) >= deadline_ns;
 }
 
+// Other clients cannot change focus between the proof and XTest processing.
+// Callbacks may query this connection, but must not wait for another client.
+template <typename Verify, typename Emit, typename Release>
+std::string_view AtomicBurst(Display *display, Verify verify, Emit emit, Release release) {
+    g_x_error = false;
+    XGrabServer(display);
+    XSync(display, False);
+    std::string_view problem;
+    if (g_x_error) {
+        problem = "server_grab_failed";
+    } else {
+        problem = verify();
+        if (problem.empty()) {
+            if (g_x_error) {
+                problem = "x11_error";
+            } else {
+                const bool submitted = emit();
+                XSync(display, False);
+                if (!submitted || g_x_error) {
+                    release();
+                    XSync(display, False);
+                    problem = "x11_error";
+                }
+            }
+        }
+    }
+    XUngrabServer(display);
+    XSync(display, False);
+    return problem;
+}
+
 std::optional<std::uint64_t> ParseUnsigned(std::string_view value) {
     if (value.empty()) {
         return std::nullopt;
