@@ -146,7 +146,9 @@ int main() {
             }
         }, "a汉Bcd");
         RequireWindow(switched && interrupted.code == kExitUnknownEffect && wrong_window == 0 &&
-                      interrupted.output.find("focus_owner_changed") != std::string::npos,
+                      interrupted.output.find("focus_owner_changed") != std::string::npos &&
+                      interrupted.output.find("\"delivered\":1,\"total\":5,\"proven_window\":" +
+                                              std::to_string(target) + ",\"released\":true") != std::string::npos,
                       "Unicode typing reached the other window after focus changed");
         char keys[32]{};
         XQueryKeymap(display, keys);
@@ -162,7 +164,10 @@ int main() {
                 changed = true; XSetInputFocus(display, sibling, RevertToParent, CurrentTime); XSync(display, False);
             }
         });
-        RequireWindow(changed && changed_focus.code == kExitUnknownEffect && released(), "same-PID focus change left owned keys held");
+        RequireWindow(changed && changed_focus.code == kExitUnknownEffect && released() &&
+                      changed_focus.output.find("\"delivered\":1,\"total\":1,\"proven_window\":" +
+                                                std::to_string(target) + ",\"released\":true") != std::string::npos,
+                      "same-PID focus change left owned keys held or lost chord progress");
         XSetInputFocus(display, child, RevertToParent, CurrentTime); XSync(display, False);
         changed = false;
         const auto moved = invoke({"key-chord", "--keys", "f2", "--hold-ms", "200"}, false, [&](const XEvent &event) {

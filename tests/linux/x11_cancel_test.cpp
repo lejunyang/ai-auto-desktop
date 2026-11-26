@@ -96,6 +96,9 @@ int main() {
 
         const auto typed = invoke({"type-text"}, std::string(1024, 'a'), false);
         RequireCancel(typed.presses > 0 && typed.presses < 1024, "type cancellation did not stop remaining strokes");
+        RequireCancel(typed.output.find("\"delivered\":" + std::to_string(typed.presses) + ",\"total\":1024,\"proven_window\":" +
+                                        std::to_string(target) + ",\"released\":true") != std::string::npos,
+                      "type cancellation did not report the independently observed progress");
         const auto global = invoke({"global-key", "--keys", "ctrl,shift,alt,meta,f2"}, "", true);
         RequireCancel(global.presses > 0 && global.presses <= 5, "global chord did not dispatch its expected prefix");
 
@@ -104,8 +107,13 @@ int main() {
         RequireCancel(XGetSelectionOwner(display, original.clipboard) == original.window, "cannot seed private clipboard");
         const auto preflight = invoke({"paste"}, "private-replacement", false, true);
         RequireCancel(preflight.presses == 0 && XGetSelectionOwner(display, original.clipboard) == original.window, "preflight cancellation replaced original clipboard owner");
+        RequireCancel(preflight.output.find("\"delivered\":0,\"total\":1,\"proven_window\":0,\"released\":true") != std::string::npos,
+                      "cancelled paste preflight did not report zero progress");
         const auto pasted = invoke({"paste"}, "private-replacement", false);
         RequireCancel(pasted.presses > 0, "paste did not reach Ctrl+V before cancellation");
+        RequireCancel(pasted.output.find("\"delivered\":1,\"total\":1,\"proven_window\":" +
+                                         std::to_string(target) + ",\"released\":true") != std::string::npos,
+                      "cancelled paste did not report the released chord");
         const Selection reader = OpenSelection(display);
         const auto deadline = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() + 2000000000LL;
         const auto restored = Convert(reader, reader.utf8, 1024, deadline);
