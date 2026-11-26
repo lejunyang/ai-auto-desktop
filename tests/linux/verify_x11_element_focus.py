@@ -367,7 +367,15 @@ def trial(aad, helper, out, baseline, scenario):
 
         def paste_recovery():
             def copy_original():
+                previous_owner = x.clipboard_owner()
                 subprocess.run(["xclip", "-selection", "clipboard"], input=b"original clip", check=True)
+
+                def new_owner():
+                    owner = x.clipboard_owner()
+                    return owner if owner != previous_owner else None
+
+                # xclip can return after forking but before the child owns CLIPBOARD.
+                return until(new_owner, "xclip to take clipboard ownership")
 
             def read_clipboard(case):
                 read = subprocess.run(["xclip", "-selection", "clipboard", "-o"], capture_output=True)
@@ -395,9 +403,7 @@ def trial(aad, helper, out, baseline, scenario):
             empty = {"Target entry": "", "Sibling entry": ""}
             original = (0, b"original clip")
 
-            copy_original()
-            original_owner = x.clipboard_owner()
-            assert original_owner
+            original_owner = copy_original()
             refused, refused_values, presses = run("paste_refused", dict(type="paste", text="must not be inserted"))
             refused_clipboard = read_clipboard("paste_refused")
             owner_at_proof = int(state_file.with_suffix(".clipboard-owner").read_text())
