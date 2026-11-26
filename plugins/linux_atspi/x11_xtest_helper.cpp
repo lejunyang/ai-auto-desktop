@@ -695,13 +695,30 @@ std::string_view ValidatePathSegment(const GestureRequest &request, std::size_t 
 
 int RunGesture(Display *display, std::string_view command, const GestureRequest &request,
                std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom,
-               const std::optional<WindowBinding> &binding = std::nullopt) {
+               const std::optional<WindowBinding> &binding = std::nullopt,
+               const std::optional<WindowBinding> &destination_binding = std::nullopt) {
     InputCancellation cancellation;
     std::vector<KeyCode> chord;
     std::vector<KeyCode> modifiers;
     std::vector<KeyCode> pressed_modifiers;
     std::vector<KeyCode> pressed_chord;
     bool button_pressed = false;
+    const auto &end_binding = destination_binding ? destination_binding : binding;
+    auto point_matches = [&](int x, int y, const std::optional<WindowBinding> &window) {
+        return WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom) &&
+            (!window || PointMatchesWindow(display, x, y, expected_pid, pid_atom, window));
+    };
+    auto endpoints_match = [&]() {
+        return point_matches(request.x, request.y, binding) &&
+            (command != "drag" || point_matches(request.to_x, request.to_y, end_binding));
+    };
+    auto pointer_at = [&](int x, int y) {
+        Window root = None, child = None;
+        int rx = 0, ry = 0, wx = 0, wy = 0;
+        unsigned mask = 0;
+        return XQueryPointer(display, DefaultRootWindow(display), &root, &child, &rx, &ry, &wx, &wy, &mask)
+            && rx == x && ry == y;
+    };
     char held_keys[32]{};
     XQueryKeymap(display, held_keys);
     for (const auto &name : request.modifiers) {
@@ -734,21 +751,6 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             }
             seen_main = last;
             chord.push_back(code);
-        }
-    } else {
-        std::vector<std::pair<int, int>> points = {{request.x, request.y}};
-        if (command == "drag") {
-            points.emplace_back(request.to_x, request.to_y);
-            points.insert(points.end(), request.path.begin(), request.path.end());
-        }
-        for (const auto &point : points) {
-            if (!WindowAtPointBelongsToPid(display, point.first, point.second, expected_pid,
-                                           pid_atom) || (!request.path.empty() &&
-                !PointMatchesWindow(display, point.first, point.second, expected_pid, pid_atom, binding))) {
-                XCloseDisplay(display);
-                EmitError("target_point_mismatch", "target_preflight", false);
-                return kExitTargetMismatch;
-            }
         }
     }
     if (request.hold_ms != 0 || !request.path.empty()) {
@@ -791,10 +793,10 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
     if ((command == "key-chord" || !modifiers.empty()) && !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) {
         return finish_failure("focus_owner_changed", "target_preflight", kExitTargetMismatch);
     }
-    if (command != "key-chord" &&
-        (!WindowAtPointBelongsToPid(display, request.x, request.y, expected_pid, pid_atom) ||
-         (command == "drag" && !WindowAtPointBelongsToPid(display, request.to_x, request.to_y,
-                                                         expected_pid, pid_atom)))) {
+    if (command != "key-chord" && (!endpoints_match() ||
+        std::any_of(request.path.begin(), request.path.end(), [&](const auto &point) {
+            return !point_matches(point.first, point.second, binding);
+        }))) {
         return finish_failure("target_point_mismatch", "target_preflight", kExitTargetMismatch);
     }
     int path_x = request.x, path_y = request.y;
@@ -803,11 +805,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         if (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid))) return "untrusted_process";
         if (!modifiers.empty() && !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) return "focus_owner_changed";
         if (!PointMatchesWindow(display, path_x, path_y, expected_pid, pid_atom, binding)) return "target_point_mismatch";
-        if (button_pressed) {
-            Window root = None, child = None; int rx = 0, ry = 0, wx = 0, wy = 0; unsigned mask = 0;
-            if (!XQueryPointer(display, DefaultRootWindow(display), &root, &child, &rx, &ry, &wx, &wy, &mask)
-                || rx != path_x || ry != path_y) return "pointer_position_changed";
-        }
+        if (button_pressed && !pointer_at(path_x, path_y)) return "pointer_position_changed";
         if (g_x_error) return "x11_error";
         return {};
     };
@@ -815,10 +813,16 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         if (const auto problem = ValidatePathSegment(request, 0, deadline_ns, path_problem); !problem.empty()) {
             return finish_failure(problem, "path_preflight", kExitTargetMismatch);
         }
+        if (!endpoints_match()) {
+            return finish_failure("target_point_mismatch", "path_preflight", kExitTargetMismatch);
+        }
     }
-    std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
-    dispatch_started = true;
-    g_x_error = false;
+    auto start_dispatch = [&]() {
+        if (dispatch_started) return;
+        std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
+        dispatch_started = true;
+        g_x_error = false;
+    };
     bool submitted = true;
     unsigned long event_count = 0;
     auto submit = [&](bool ok) {
@@ -834,16 +838,8 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         if ((command == "key-chord" || !modifiers.empty()) &&
             !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) return "focus_owner_changed";
         if (command != "key-chord") {
-            Window root = None, child = None;
-            int rx = 0, ry = 0, wx = 0, wy = 0;
-            unsigned mask = 0;
-            if (!XQueryPointer(display, DefaultRootWindow(display), &root, &child, &rx, &ry,
-                               &wx, &wy, &mask) || rx != request.x || ry != request.y) {
-                return "pointer_position_changed";
-            }
-            if (!WindowAtPointBelongsToPid(display, request.x, request.y, expected_pid, pid_atom) ||
-                (command == "drag" && !WindowAtPointBelongsToPid(display, request.to_x,
-                    request.to_y, expected_pid, pid_atom))) return "target_point_mismatch";
+            if (!pointer_at(request.x, request.y)) return "pointer_position_changed";
+            if (!endpoints_match()) return "target_point_mismatch";
         }
         if (!submitted || g_x_error) return "x11_error";
         return {};
@@ -861,8 +857,12 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
     };
     for (const auto code : modifiers) {
         if (DeadlineExpired(deadline_ns) || !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) {
-            return finish_failure(DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "focus_owner_changed", "input_dispatch", kExitUnknownEffect);
+            return finish_failure(DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "focus_owner_changed", "input_dispatch", kExitTargetMismatch);
         }
+        if (!endpoints_match()) {
+            return finish_failure("target_point_mismatch", "modifier_dispatch", kExitTargetMismatch);
+        }
+        start_dispatch();
         pressed_modifiers.push_back(code);
         submit(XTestFakeKeyEvent(display, code, True, 1) != 0);
         XSync(display, False);
@@ -870,8 +870,9 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
     if (command == "key-chord") {
         for (const KeyCode code : chord) {
             if (DeadlineExpired(deadline_ns) || !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) {
-                return finish_failure(DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "focus_owner_changed", "input_dispatch", kExitUnknownEffect);
+                return finish_failure(DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "focus_owner_changed", "input_dispatch", kExitTargetMismatch);
             }
+            start_dispatch();
             pressed_chord.push_back(code);
             submit(XTestFakeKeyEvent(display, code, True, 1) != 0);
             XSync(display, False);
@@ -888,11 +889,18 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         if (DeadlineExpired(deadline_ns)) {
             return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
         }
+        if (binding && !endpoints_match()) {
+            return finish_failure("target_point_mismatch", "pointer_dispatch", kExitTargetMismatch);
+        }
+        start_dispatch();
         submit(XTestFakeMotionEvent(display, -1, request.x, request.y, 1) != 0);
         if (command == "drag") {
             XSync(display, False);
             if (DeadlineExpired(deadline_ns)) {
                 return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+            }
+            if (binding && (!endpoints_match() || !pointer_at(request.x, request.y))) {
+                return finish_failure("target_point_mismatch", "button_dispatch", kExitTargetMismatch);
             }
             button_pressed = true;
             submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
@@ -922,33 +930,43 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                     return finish_failure(problem, "path_release", kExitUnknownEffect);
                 }
             } else {
-            // Glide in steps: many toolkits only start a drag after the
-            // pointer has moved a few pixels with the button held.
-            constexpr int kSteps = 12;
-            for (int step = 1; step <= kSteps; ++step) {
-                if (DeadlineExpired(deadline_ns)) {
-                    return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+                // Glide in steps: many toolkits only start a drag after the
+                // pointer has moved a few pixels with the button held.
+                constexpr int kSteps = 12;
+                for (int step = 1; step <= kSteps; ++step) {
+                    if (DeadlineExpired(deadline_ns)) {
+                        return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+                    }
+                    const int x = request.x + (request.to_x - request.x) * step / kSteps;
+                    const int y = request.y + (request.to_y - request.y) * step / kSteps;
+                    if (destination_binding && !endpoints_match()) {
+                        return finish_failure("target_point_mismatch", "input_dispatch", kExitTargetMismatch);
+                    }
+                    if (request.hold_ms != 0 &&
+                        (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid)) ||
+                         (!modifiers.empty() && !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) ||
+                         !WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom))) {
+                        return finish_failure("target_changed", "input_dispatch", kExitUnknownEffect);
+                    }
+                    submit(XTestFakeMotionEvent(display, -1, x, y, 1) != 0);
+                    XSync(display, False);
+                    SleepUntilOrDeadline(15, deadline_ns);
                 }
-                const int x = request.x + (request.to_x - request.x) * step / kSteps;
-                const int y = request.y + (request.to_y - request.y) * step / kSteps;
-                if (request.hold_ms != 0 &&
-                    (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid)) ||
-                     (!modifiers.empty() && !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) ||
-                     !WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom))) {
-                    return finish_failure("target_changed", "input_dispatch", kExitUnknownEffect);
+                if (destination_binding && (!endpoints_match() || !pointer_at(request.to_x, request.to_y))) {
+                    return finish_failure("target_point_mismatch", "drag_release", kExitTargetMismatch);
                 }
-                submit(XTestFakeMotionEvent(display, -1, x, y, 1) != 0);
-                XSync(display, False);
-                SleepUntilOrDeadline(15, deadline_ns);
-            }
             }
             submit(XTestFakeButtonEvent(display, request.button, False, 1) != 0);
             XSync(display, False);
             if (submitted && !g_x_error) button_pressed = false;
         } else if (request.mode == "click") {
+            if (binding) XSync(display, False);
             for (unsigned click = 0; click < request.count; ++click) {
                 if (DeadlineExpired(deadline_ns)) {
                     return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+                }
+                if (binding && (!endpoints_match() || !pointer_at(request.x, request.y))) {
+                    return finish_failure("target_point_mismatch", "button_dispatch", kExitTargetMismatch);
                 }
                 button_pressed = true;
                 submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
@@ -1566,19 +1584,24 @@ bool PointMatchesWindow(Display *display, int x, int y, unsigned long pid, Atom 
 // Strip internal window binding options before the legacy command parsers.
 // All four bounds are required together; actual dispatch additionally needs id.
 bool ExtractWindowBinding(int *argc, char ***argv, std::vector<char *> *filtered,
-                          std::optional<WindowBinding> *binding) {
+                          std::optional<WindowBinding> *binding, std::string_view prefix = "--") {
     filtered->assign(*argv, *argv + std::min(*argc, 2));
     WindowBinding parsed; unsigned seen = 0;
     for (int i = 2; i < *argc; ++i) {
-        const std::string_view option((*argv)[i]);
+        std::string_view option((*argv)[i]);
+        if (option.substr(0, prefix.size()) != prefix) {
+            filtered->push_back((*argv)[i]);
+            continue;
+        }
+        option.remove_prefix(prefix.size());
         unsigned bit = 0; int *destination = nullptr;
-        if (option == "--window-x") { bit = 1; destination = &parsed.bounds.x; }
-        if (option == "--window-y") { bit = 2; destination = &parsed.bounds.y; }
-        if (option == "--window-width") { bit = 4; destination = &parsed.bounds.width; }
-        if (option == "--window-height") { bit = 8; destination = &parsed.bounds.height; }
-        if (option == "--window-id") bit = 16;
-        if (option == "--geometry-proof") bit = 32;
-        if (option == "--window-proof") bit = 64;
+        if (option == "window-x") { bit = 1; destination = &parsed.bounds.x; }
+        if (option == "window-y") { bit = 2; destination = &parsed.bounds.y; }
+        if (option == "window-width") { bit = 4; destination = &parsed.bounds.width; }
+        if (option == "window-height") { bit = 8; destination = &parsed.bounds.height; }
+        if (option == "window-id") bit = 16;
+        if (option == "geometry-proof") bit = 32;
+        if (option == "window-proof") bit = 64;
         if (bit == 0) { filtered->push_back((*argv)[i]); continue; }
         if ((seen & bit) != 0 || ++i >= *argc) return false;
         seen |= bit;
@@ -2733,7 +2756,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     std::optional<WindowBinding> binding;
+    std::optional<WindowBinding> destination_binding;
     std::vector<char *> filtered;
+    std::vector<char *> filtered_destination;
     if ((command != "window-info" && command != "window-action" &&
          !ExtractWindowBinding(&argc, &argv, &filtered, &binding)) ||
         (binding.has_value() && command != "focus-info" && (binding->id == None || binding->request_proof))) {
@@ -2742,6 +2767,11 @@ int main(int argc, char **argv) {
     }
     if (binding.has_value() && command != "focus-info" && command != "type-text" &&
         command != "key-chord" && command != "paste" && command != "pointer-gesture" && command != "drag") {
+        EmitError("invalid_window_binding", "arguments", false);
+        return kExitInvalid;
+    }
+    if (command == "drag" &&
+        !ExtractWindowBinding(&argc, &argv, &filtered_destination, &destination_binding, "--destination-")) {
         EmitError("invalid_window_binding", "arguments", false);
         return kExitInvalid;
     }
@@ -2775,6 +2805,13 @@ int main(int argc, char **argv) {
         gesture = ParseGesture(command, argc, argv, &expected_pid, &deadline_ns);
         if (!gesture.has_value()) {
             EmitError("invalid_arguments", "arguments", false);
+            return kExitInvalid;
+        }
+        const bool needs_destination_proof = command == "drag" && gesture->path.empty() &&
+            !gesture->modifiers.empty() && binding && !binding->proof.empty();
+        if (needs_destination_proof != destination_binding.has_value() ||
+            (destination_binding && destination_binding->proof.empty())) {
+            EmitError("invalid_window_binding", "arguments", false);
             return kExitInvalid;
         }
     } else if (command == "type-text") {
@@ -2882,7 +2919,7 @@ int main(int argc, char **argv) {
     }
     if (gesture.has_value()) {
         return RunGesture(display, command, gesture.value(), expected_pid.value(),
-                          deadline_ns.value(), pid_atom, binding);
+                          deadline_ns.value(), pid_atom, binding, destination_binding);
     }
     if (command == "pointer-click") {
         if (!click_x.has_value() || !click_y.has_value() ||

@@ -407,6 +407,7 @@ pub trait AtspiBackend: Send + Sync {
         &self,
         target: &NativeRef,
         _window: Option<&WindowAnchor>,
+        _destination_window: Option<&WindowAnchor>,
         from: (i32, i32),
         to: (i32, i32),
         button: u8,
@@ -1449,10 +1450,9 @@ impl AtspiProvider {
         } else {
             None
         };
-        let pin_x11_window = matches!(action, "type_text" | "key_chord" | "paste")
+        let pin_x11_window = matches!(action, "type_text" | "key_chord" | "paste" | "drag")
             || WINDOW_ACTIONS.contains(&action)
-            || !modifiers.is_empty()
-            || !path.is_empty();
+            || !modifiers.is_empty();
         let (fresh, fresh_id, node, native) =
             self.fresh_target(args, deadline, action == "invoke", pin_x11_window)?;
         let available = node["actions"].as_array().expect("normalized action array");
@@ -1512,6 +1512,7 @@ impl AtspiProvider {
         }
         // The destination of a drag is re-verified exactly like the source.
         let mut qt_drop = None;
+        let mut destination_window = None;
         let destination = if action == "drag" {
             let mut to_args = Map::new();
             to_args.insert(
@@ -1522,12 +1523,13 @@ impl AtspiProvider {
                 "locator".into(),
                 args.get("to_locator").cloned().unwrap_or(Value::Null),
             );
-            let (to_id, to_node, to_native) = Self::revalidate_target(
-                &to_args,
-                drag_observation.as_ref().expect("captured for drag"),
-                &fresh,
-                deadline,
-            )?;
+            let observed = drag_observation.as_ref().expect("captured for drag");
+            let (observed_to_id, _, _) =
+                Self::revalidate_target(&to_args, observed, observed, deadline)?;
+            let (to_id, to_node, to_native) =
+                Self::revalidate_target(&to_args, observed, &fresh, deadline)?;
+            revalidate_x11_window(observed, &observed_to_id, &fresh, &to_id)?;
+            destination_window = input_window(&fresh, &to_id);
             if node["provenance"]["wayland_input_window"].is_string() {
                 if !path.is_empty() || hold_ms.is_some() {
                     return Err(driver_error(
@@ -1804,6 +1806,7 @@ impl AtspiProvider {
                     self.backend.drag_modified(
                         &native,
                         window.as_ref(),
+                        destination_window.as_ref(),
                         pointer.expect("computed above"),
                         destination.expect("computed above"),
                         button,
@@ -3763,6 +3766,8 @@ mod tests {
         path_supported: bool,
         path_changed_after: usize,
         path_window_visibility: u8,
+        drag_windows: bool,
+        move_drag_destination: bool,
         capture_only_target: bool,
         cancel_in_window_capture: bool,
         cross_supported: bool,
@@ -3862,6 +3867,21 @@ mod tests {
     }
 
     impl AtspiBackend for FakeBackend {
+        fn observe_x11_windows(
+            &self,
+            snapshot: &mut BackendSnapshot,
+            _deadline: Instant,
+        ) -> BTreeMap<usize, X11WindowBinding> {
+            if !self.drag_windows {
+                return BTreeMap::new();
+            }
+            [1, 2].into_iter().map(|index| {
+                (index, X11WindowBinding {
+                    client: index as u32,
+                    proof: Some(json!({"client_bounds": snapshot.nodes[index].bounds.unwrap().to_json()})),
+                })
+            }).collect()
+        }
         fn supports_cross_resource_drag(&self) -> bool {
             self.cross_supported
         }
@@ -3916,6 +3936,28 @@ mod tests {
                     token.cancel();
                     token.check()?;
                 }
+            }
+            if self.drag_windows {
+                let mut app = self.node("/app");
+                app.role = "application".into();
+                app.bounds = None;
+                let mut source = self.node("/source");
+                source.role = "frame".into();
+                source.parent_index = Some(0);
+                source.name = Some("Source".into());
+                let mut destination = source.clone();
+                destination.native.object_path = "/destination".into();
+                destination.name = Some("Destination".into());
+                destination.bounds.as_mut().unwrap().x += 100;
+                if self.move_drag_destination && self.captures.load(Ordering::SeqCst) > 1 {
+                    destination.bounds.as_mut().unwrap().x += 10;
+                }
+                return Ok(BackendSnapshot {
+                    application: Self::application(),
+                    nodes: vec![app, source, destination],
+                    truncated: false,
+                    truncation_reasons: vec![],
+                });
             }
             let path = if self.replaced && self.captures.load(Ordering::SeqCst) > 1 {
                 "/org/a11y/replacement"
@@ -4244,6 +4286,7 @@ mod tests {
             &self,
             target: &NativeRef,
             _window: Option<&WindowAnchor>,
+            _destination_window: Option<&WindowAnchor>,
             from: (i32, i32),
             to: (i32, i32),
             button: u8,
@@ -4788,6 +4831,40 @@ mod tests {
             1,
             "stale destination must not dispatch another drag"
         );
+    }
+
+    #[test]
+    fn straight_drag_rejects_a_moved_destination_window_before_dispatch() {
+        for moved in [false, true] {
+            let backend = Arc::new(FakeBackend {
+                drag_windows: true,
+                move_drag_destination: moved,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let target = |node_id| {
+                json!({"snapshot_id": observed["snapshot_id"],
+                "revision": observed["revision"], "node_id": node_id})
+            };
+            let result = provider.invoke(
+                "desktop.linux_atspi.drag@1",
+                json!({
+                    "target": target("n1"), "locator": {"name": "Source"},
+                    "to": target("n2"), "to_locator": {"name": "Destination"},
+                    "modifiers": ["ctrl"]
+                }),
+                Some(Duration::from_secs(2)),
+            );
+            if moved {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.code, "DRIVER.STALE_SNAPSHOT");
+                assert_eq!(failure.effect, "not_applied");
+            } else {
+                assert_eq!(result.unwrap()["backend_result"]["to"], json!([130, 30]));
+            }
+            assert_eq!(backend.writes.load(Ordering::SeqCst), usize::from(!moved));
+        }
     }
 
     fn path_args(observed: &Value) -> Value {

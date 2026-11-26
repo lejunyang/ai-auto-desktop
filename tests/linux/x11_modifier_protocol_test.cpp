@@ -69,6 +69,50 @@ int main() {
             return (keys[ctrl / 8] & (1 << (ctrl % 8))) == 0 && (mask & Button1Mask) == 0;
         };
         RequireModifier(released(), "successful click left input held");
+        XChangeProperty(display, other, pid_atom, XA_CARDINAL, 32, PropModeReplace,
+                        reinterpret_cast<const unsigned char *>(&pid), 1);
+        XSelectInput(display, other, KeyPressMask | KeyReleaseMask | ButtonPressMask |
+                                      ButtonReleaseMask | PointerMotionMask);
+        XSync(display, False);
+        auto append_proof = [&](std::vector<std::string> &args, Window window, std::string prefix) {
+            const auto bounds = RootGeometry(display, window);
+            RequireModifier(bounds.has_value(), "fixture geometry unavailable");
+            const auto proof = FindGeometryProof(LoadEwmh(display), pid, *bounds);
+            RequireModifier(proof.has_value() && proof->client == window, "fixture geometry not unique");
+            args.insert(args.end(), {prefix + "window-id", std::to_string(window),
+                prefix + "window-x", std::to_string(bounds->x), prefix + "window-y", std::to_string(bounds->y),
+                prefix + "window-width", std::to_string(bounds->width),
+                prefix + "window-height", std::to_string(bounds->height),
+                prefix + "window-proof", GeometryProofJson(*proof)});
+        };
+        auto bound_click = click;
+        append_proof(bound_click, target, "--");
+        std::vector<std::string> bound_drag = {"drag", "--x", "30", "--y", "30", "--to-x", "340",
+            "--to-y", "40", "--button", "1", "--modifiers", "ctrl"};
+        append_proof(bound_drag, target, "--");
+        append_proof(bound_drag, other, "--destination-");
+        auto denied_before_input = [&](const std::vector<std::string> &args, const char *message) {
+            XSync(display, True);
+            const auto result = invoke(args);
+            XSync(display, False);
+            RequireModifier(result.first == kExitTargetMismatch &&
+                            result.second.find("\"dispatch_started\":false") != std::string::npos &&
+                            result.second.find("target_point_mismatch") != std::string::npos &&
+                            XPending(display) == 0 && released(), message);
+        };
+        XMoveWindow(display, other, 25, 25);
+        XRaiseWindow(display, other);
+        XSync(display, False);
+        RequireModifier(FocusInClient(display, target) && PointInClient(display, 30, 30, other) &&
+                        WindowAtPointBelongsToPid(display, 30, 30, pid, pid_atom), "overlay preconditions failed");
+        denied_before_input(bound_click, "same-PID overlay received input from bound click");
+        XMoveWindow(display, other, 310, 20);
+        XSync(display, False);
+        RequireModifier(PointInClient(display, 340, 40, other), "moved destination no longer covers the old point");
+        denied_before_input(bound_drag, "drag sent input after its destination moved");
+        XMoveWindow(display, other, 300, 20);
+        XSync(display, False);
+        RequireModifier(invoke(bound_drag, 2000000000LL).first == 0 && released(), "bound two-window drag failed");
         click.back() = "ctrl,ctrl";
         RequireModifier(invoke(click).first == kExitInvalid, "duplicate modifiers accepted");
         std::vector<std::string> drag = {"drag", "--x", "30", "--y", "30", "--to-x", "180", "--to-y", "180", "--button", "1", "--modifiers", "ctrl"};
@@ -97,7 +141,7 @@ int main() {
         RequireModifier(WIFEXITED(status) && WEXITSTATUS(status) == kExitUnknownEffect, "termination bypassed cleanup");
         RequireModifier(released(), "termination left a modifier or button held");
         XCloseDisplay(display);
-        std::cout << "PASS: Ctrl-click state, focus guard, duplicates, deadline and termination cleanup\n";
+        std::cout << "PASS: Ctrl-click state, focus and client guards, two-window drag, duplicates, deadline and termination cleanup\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "FAIL: " << error.what() << '\n';

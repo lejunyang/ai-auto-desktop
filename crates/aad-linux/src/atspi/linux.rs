@@ -511,10 +511,12 @@ impl LinuxBackend {
     }
 
     /// Keyboard input needs focus; pointer input is proven by live hit tests.
+    #[allow(clippy::too_many_arguments)]
     fn run_input(
         &self,
         target: &NativeRef,
         window: Option<&WindowAnchor>,
+        destination_window: Option<&WindowAnchor>,
         mut args: Vec<String>,
         minimum_events: u64,
         process_id: u32,
@@ -526,14 +528,15 @@ impl LinuxBackend {
             support.require("cooperative-cancel")?;
         }
         support.require(args.first().map(String::as_str).unwrap_or(""))?;
-        if args.iter().any(|arg| arg == "--modifiers") {
+        let modified = args.iter().any(|arg| arg == "--modifiers");
+        if modified {
             support.require("pointer-modifiers")?;
         }
         if args.iter().any(|arg| arg == "--hold-ms") {
             support.require("bounded-hold")?;
         }
         let keyboard = args.first().is_some_and(|command| command == "key-chord");
-        let bound = if keyboard || args.iter().any(|arg| arg == "--modifiers") {
+        let bound = if keyboard || modified {
             for feature in ["focus-info", "window-focus", GEOMETRY_FEATURE] {
                 support.require(feature)?;
             }
@@ -547,6 +550,19 @@ impl LinuxBackend {
         } else {
             None
         };
+        if modified && args[0] == "drag" {
+            let destination = destination_window.ok_or_else(|| {
+                driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "drag requires an observed destination window",
+                )
+            })?;
+            let first = args.len();
+            append_window_args(&mut args, destination, Some(destination.input_binding()?));
+            for option in args[first..].iter_mut().step_by(2) {
+                option.insert_str(2, "destination-");
+            }
+        }
         let path = support.path;
         let mut focus = None;
         if let Some((window, binding)) = bound {
@@ -1595,6 +1611,7 @@ impl AtspiBackend for LinuxBackend {
         let input = self.run_input(
             target,
             window,
+            None,
             args,
             minimum + 2 * modifiers.len() as u64,
             process_id,
@@ -1617,6 +1634,7 @@ impl AtspiBackend for LinuxBackend {
         self.drag_modified(
             target,
             None,
+            None,
             from,
             to,
             button,
@@ -1631,6 +1649,7 @@ impl AtspiBackend for LinuxBackend {
         &self,
         target: &NativeRef,
         window: Option<&WindowAnchor>,
+        destination_window: Option<&WindowAnchor>,
         from: (i32, i32),
         to: (i32, i32),
         button: u8,
@@ -1683,6 +1702,7 @@ impl AtspiBackend for LinuxBackend {
         let input = self.run_input(
             target,
             window,
+            destination_window,
             args,
             3 + 2 * modifiers.len() as u64,
             process_id,
@@ -1745,7 +1765,7 @@ impl AtspiBackend for LinuxBackend {
             args.extend(["--hold-ms".into(), ms.to_string()]);
         }
         let minimum = 2 * keys.len() as u64;
-        let input = self.run_input(target, window, args, minimum, process_id, deadline)?;
+        let input = self.run_input(target, window, None, args, minimum, process_id, deadline)?;
         Ok(
             json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "keys": keys}),
         )
