@@ -373,9 +373,7 @@ impl Backend for NativeBackend {
             | Action::Restore {}
             | Action::CloseWindow {} => true,
             Action::Click { modifiers, .. } => !modifiers.is_empty(),
-            Action::Drag {
-                path, modifiers, ..
-            } => cross_resource || !path.is_empty() || !modifiers.is_empty(),
+            Action::Drag { .. } => true,
             _ => false,
         };
         let uses_x11_helper = requires_geometry
@@ -408,6 +406,19 @@ impl Backend for NativeBackend {
             return Err(error(
                 "DRIVER.HELPER_INCOMPATIBLE",
                 "Linux XTest helper is missing window-geometry-proof-v1",
+            ));
+        }
+        if matches!(action, Action::Drag { path, .. } if path.is_empty() && !cross_resource)
+            && helper["ready"] == true
+            && !helper["features"].as_array().is_some_and(|features| {
+                features
+                    .iter()
+                    .any(|feature| feature == "anchored-straight-drag")
+            })
+        {
+            return Err(error(
+                "DRIVER.HELPER_INCOMPATIBLE",
+                "Linux XTest helper is missing anchored-straight-drag. Upgrade aad and its helper together.",
             ));
         }
         Ok(())

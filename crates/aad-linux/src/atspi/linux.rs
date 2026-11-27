@@ -540,7 +540,7 @@ impl LinuxBackend {
         }
         let keyboard = args.first().is_some_and(|command| command == "key-chord");
         let requires_focus = keyboard || modified;
-        let bound_drag = args[0] == "drag" && (modified || support.has(STRAIGHT_DRAG_FEATURE));
+        let bound_drag = args[0] == "drag";
         if requires_focus {
             support.require("focus-info")?;
             support.require("window-focus")?;
@@ -901,11 +901,18 @@ impl LinuxBackend {
             for (action, feature) in [
                 ("pointer_click", "pointer-click"),
                 ("pointer_gesture", "pointer-gesture"),
-                ("drag", "drag"),
             ] {
                 if input.is_some_and(|support| support.has(feature)) {
                     actions.push(action.into());
                 }
+            }
+            if input.is_some_and(|support| {
+                support.has(GEOMETRY_FEATURE)
+                    && ((support.has("drag") && support.has(STRAIGHT_DRAG_FEATURE))
+                        || support.has("anchored-drag-path")
+                        || support.has("anchored-drag-between"))
+            }) {
+                actions.push("drag".into());
             }
             if fully_interactive
                 && input.is_some_and(|support| {
@@ -1152,6 +1159,10 @@ impl AtspiBackend for LinuxBackend {
         };
         let support = self.probe_input(deadline)?;
         support.require(feature)?;
+        if action == "drag" {
+            support.require(STRAIGHT_DRAG_FEATURE)?;
+            support.require(GEOMETRY_FEATURE)?;
+        }
         if super::WINDOW_ACTIONS.contains(&action) {
             support.require(GEOMETRY_FEATURE)?;
         }

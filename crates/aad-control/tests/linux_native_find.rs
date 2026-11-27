@@ -285,6 +285,10 @@ fn assert_x11_helper_rejection(incompatible_handshake: bool) {
         ),
         (json!({"type":"close_window"}), "DRIVER.HELPER_INCOMPATIBLE"),
         (
+            json!({"type":"drag","to":node["target"]}),
+            "DRIVER.HELPER_INCOMPATIBLE",
+        ),
+        (
             json!({"type":"click"}),
             if incompatible_handshake {
                 "DRIVER.HELPER_INCOMPATIBLE"

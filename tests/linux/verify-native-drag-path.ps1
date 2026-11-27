@@ -1,5 +1,5 @@
 param([string]$Aad = '', [string]$InputHelper = '', [string]$BuildDirectory = '', [switch]$BuildOnly,
-      [switch]$StraightGeometryOnly)
+      [switch]$StraightGeometryOnly, [switch]$ExpectIncompatibleStraightDrag)
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 if (-not $BuildDirectory) { $BuildDirectory = Join-Path ([IO.Path]::GetTempPath()) ('aad-qt-path-' + [guid]::NewGuid().ToString('N')) }
@@ -47,7 +47,7 @@ try {
     $info.EnvironmentVariables['AAD_LINUX_XTEST_HELPER']=(Resolve-Path $InputHelper).Path
     $script:server=[Diagnostics.Process]::Start($info)
     Call-Control @{method='capabilities'} | Out-Null
-    $cases = if ($StraightGeometryOnly) { @('geometry-straight') } else {
+    $cases = if ($StraightGeometryOnly -or $ExpectIncompatibleStraightDrag) { @('geometry-straight') } else {
         @('invalid','success','success-scoped','geometry','overlay','overlay-scoped','cancel','geometry-straight')
     }
     foreach ($caseName in $cases) {
@@ -86,7 +86,15 @@ try {
         }
         $script:caseClock=[Diagnostics.Stopwatch]::StartNew()
         $running=Send-Control @{method='act';target=$target;action=$action}
-        if ($mode -eq 'invalid') {
+        if ($ExpectIncompatibleStraightDrag) {
+            $result=Receive-Control $running
+            $pending=$fixture.StandardOutput.ReadLineAsync()
+            if ($pending.Wait(250)) { throw "incompatible helper sent input to the surface or cover: $($pending.Result)" }
+            if ($result.effect -ne 'not_applied' -or $result.error.code -ne 'DRIVER.HELPER_INCOMPATIBLE') {
+                throw "expected incompatible helper before dispatch, got $($result.effect) / $($result.error.code)"
+            }
+            $checks.Add(@{case=$caseName;effect=$result.effect;code=$result.error.code;events=@()})
+        } elseif ($mode -eq 'invalid') {
             $result=Receive-Control $running
             if (-not $result.error -or $result.effect -ne 'not_applied') { throw 'bad path was not rejected before dispatch' }
             $observed=Call-Control @{method='observe';resource_id=$rid;max_nodes=100;view=@{mode='nodes'}}

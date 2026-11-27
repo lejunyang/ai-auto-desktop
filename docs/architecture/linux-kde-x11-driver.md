@@ -114,10 +114,11 @@ X11 窗口/PID/几何/命中。Rust 只读 worker 不占主循环；AX 调用阻
 触发 helper 释放，迟到结果不再 ACK。每个 backend 同时只保留一个此类 worker，尚未退出的
 只读请求会阻止新路径。
 
-声明 `anchored-straight-drag` 的 helper 为普通直线拖拽冻结起终点的窗口几何证明。helper 在首次派发、
+普通 X11 直线拖拽要求 helper 同时声明 `anchored-straight-drag` 和 `window-geometry-proof-v1`，
+并携带起终点冻结的窗口几何证明。helper 在首次派发、
 按下、停留、每段移动和释放时复核两端。修饰键额外要求源窗口焦点。派发后发现端点失效会停止移动，
-释放本次按下的按钮，并返回 `DRIVER.POINT_NOT_PROVEN` 和 `unknown`。旧 helper 的无修饰键直线拖拽
-仍走原有指针路径。
+释放本次按下的按钮，并返回 `DRIVER.POINT_NOT_PROVEN` 和 `unknown`。缺少能力时直线拖拽在输入前
+返回 `DRIVER.HELPER_INCOMPATIBLE`，需同时升级 aad 和 helper。
 
 在 X11 会话中，Linux provider 为每个已解析应用保留最新一份观察，合计最多 16 份，每份在
 300 秒后过期。输入尝试使整组观察失效。使用旧 helper 的 X11 会话也适用这套保留规则。
