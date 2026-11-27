@@ -301,6 +301,7 @@ fn assert_x11_helper_rejection(incompatible_handshake: bool) {
             "CONTROL.ACTION_UNSUPPORTED",
         ),
     ] {
+        let straight_drag = action["type"] == "drag";
         let op =
             serde_json::from_value(json!({"method":"act","target":node["target"],"action":action}))
                 .unwrap();
@@ -310,6 +311,11 @@ fn assert_x11_helper_rejection(incompatible_handshake: bool) {
         assert_eq!(failure["code"], code);
         if incompatible_handshake && code == "DRIVER.HELPER_INCOMPATIBLE" {
             assert_eq!(failure["message"], "fixture rejected describe");
+        } else if straight_drag {
+            assert_eq!(
+                failure["message"],
+                "Linux XTest helper is missing window-geometry-proof-v1. Upgrade aad and its helper together."
+            );
         }
     }
     let context = &observed["nodes"][1];

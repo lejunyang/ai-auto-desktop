@@ -395,33 +395,30 @@ impl Backend for NativeBackend {
                     .unwrap_or("Linux XTest helper handshake is incompatible"),
             ));
         }
-        if requires_geometry
-            && helper["ready"] == true
-            && !helper["features"].as_array().is_some_and(|features| {
-                features
-                    .iter()
-                    .any(|feature| feature == "window-geometry-proof-v1")
-            })
-        {
-            return Err(error(
-                "DRIVER.HELPER_INCOMPATIBLE",
-                "Linux XTest helper is missing window-geometry-proof-v1",
-            ));
+        if helper["ready"] != true {
+            return Ok(());
         }
-        if matches!(action, Action::Drag { path, .. } if path.is_empty() && !cross_resource)
-            && helper["ready"] == true
-            && !helper["features"].as_array().is_some_and(|features| {
-                features
-                    .iter()
-                    .any(|feature| feature == "anchored-straight-drag")
-            })
-        {
-            return Err(error(
-                "DRIVER.HELPER_INCOMPATIBLE",
-                "Linux XTest helper is missing anchored-straight-drag. Upgrade aad and its helper together.",
-            ));
-        }
-        Ok(())
+        let straight_drag =
+            matches!(action, Action::Drag { path, .. } if path.is_empty() && !cross_resource);
+        let features = helper["features"].as_array();
+        let has_feature =
+            |name: &str| features.is_some_and(|list| list.iter().any(|feature| feature == name));
+        let missing = if requires_geometry && !has_feature("window-geometry-proof-v1") {
+            "window-geometry-proof-v1"
+        } else if straight_drag && !has_feature("anchored-straight-drag") {
+            "anchored-straight-drag"
+        } else {
+            return Ok(());
+        };
+        let upgrade_hint = if straight_drag {
+            ". Upgrade aad and its helper together."
+        } else {
+            ""
+        };
+        Err(error(
+            "DRIVER.HELPER_INCOMPATIBLE",
+            format!("Linux XTest helper is missing {missing}{upgrade_hint}"),
+        ))
     }
     fn lease_key(&self, _snapshot: &Value) -> Option<String> {
         Some("desktop-input".into())

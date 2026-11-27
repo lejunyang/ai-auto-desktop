@@ -94,7 +94,11 @@ try {
             if ($result.effect -ne 'not_applied' -or $result.error.code -ne 'DRIVER.HELPER_INCOMPATIBLE') {
                 throw "expected incompatible helper before dispatch, got $($result.effect) / $($result.error.code)"
             }
-            $checks.Add(@{case=$caseName;effect=$result.effect;code=$result.error.code;events=@()})
+            if ($result.error.message -notlike '*Upgrade aad and its helper together.') {
+                throw "expected an aad and helper upgrade hint, got: $($result.error.message)"
+            }
+            $checks.Add(@{case=$caseName;effect=$result.effect;code=$result.error.code;
+                message=$result.error.message;events=@()})
         } elseif ($mode -eq 'invalid') {
             $result=Receive-Control $running
             if (-not $result.error -or $result.effect -ne 'not_applied') { throw 'bad path was not rejected before dispatch' }
