@@ -354,11 +354,10 @@ struct KeyboardEventBarrier {
     }
 };
 
-std::string_view FinishTextStroke(const std::optional<KeyboardEventBarrier> &barrier, bool more,
+std::string_view FinishTextStroke(const std::optional<KeyboardEventBarrier> &barrier, bool wait_for_client,
                                   Display *display, unsigned long pid, Atom pid_atom,
                                   const std::optional<WindowBinding> &binding, std::uint64_t deadline_ns) {
-    // The last stroke can close the target. A reply only gates the next stroke.
-    if (!more) return DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "";
+    if (!wait_for_client) return DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "";
     if (!barrier) {
         usleep(kTextStrokeGapUs);
         return {};
@@ -3408,7 +3407,12 @@ int main(int argc, char **argv) {
         }
         event_count += stroke_shift ? 4 : 2;
         ++progress->delivered;
-        if (const auto wait = FinishTextStroke(event_barrier, index + 1 < plan->strokes.size(), display,
+        // A native final stroke can close the target. A temporary keycode
+        // must stay mapped until the client has processed it.
+        const bool wait_for_client = index + 1 < plan->strokes.size() ||
+            (event_barrier && std::any_of(plan->dynamic_mappings.begin(), plan->dynamic_mappings.end(),
+                                         [&](const DynamicMapping &mapping) { return mapping.keycode == stroke.keycode; }));
+        if (const auto wait = FinishTextStroke(event_barrier, wait_for_client, display,
                                               *expected_pid, pid_atom, binding, *deadline_ns); !wait.empty()) {
             return finish_failure(wait, "keyboard_dispatch", kExitTargetMismatch);
         }

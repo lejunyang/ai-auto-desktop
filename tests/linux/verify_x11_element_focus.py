@@ -90,33 +90,44 @@ def fixture(role, state_file):
     delayed = set()
     current_case = None
     trigger = state_file.with_suffix(".switch")
+    pause_x_queue = state_file.with_suffix(".pause-x-queue")
+    x_source = None
 
     def event(kind, **data):
         current = json.loads(state_file.read_text())
         emit(sys.stdout, kind, case=current["case"], role=role, **data)
         return current
 
+    def delay_x_events(current, source):
+        delayed.add(current["case"])
+        # Keep X events queued while the main loop can still answer AT-SPI.
+        assert source.get_name().startswith("GDK X11 Event source")
+        priority = source.get_priority()
+        source.set_priority(GLib.PRIORITY_LOW)
+        resume_at = time.monotonic() + current["queue_delay_ms"] / 1000
+        event("x_queue_delayed")
+
+        def queue_drained():
+            event("x_queue_drained")
+            return False
+
+        def resume_x_events():
+            if time.monotonic() < resume_at:
+                return True
+            source.set_priority(priority)
+            event("x_queue_resumed")
+            if current.get("pause_before_first_stroke"):
+                GLib.idle_add(queue_drained)
+            return False
+
+        GLib.idle_add(resume_x_events)
+
     def keyboard(_widget, ev, tag, phase):
         current = event("key_" + phase, target=tag, key=Gdk.keyval_name(ev.keyval),
                         keycode=ev.hardware_keycode, state=int(ev.state), x_time_ms=ev.time)
-        if owner and tag == "Target entry" and phase == "down" and current.get("queue_delay_ms"):
-            if current["case"] not in delayed:
-                delayed.add(current["case"])
-                # Keep X events queued while the main loop can still answer AT-SPI.
-                source = GLib.main_current_source()
-                assert source.get_name().startswith("GDK X11 Event source")
-                priority = source.get_priority()
-                source.set_priority(GLib.PRIORITY_LOW)
-                resume_at = time.monotonic() + current["queue_delay_ms"] / 1000
-
-                def resume_x_events():
-                    if time.monotonic() < resume_at:
-                        return True
-                    source.set_priority(priority)
-                    event("x_queue_resumed")
-                    return False
-
-                GLib.idle_add(resume_x_events)
+        if (owner and tag == "Target entry" and phase == "down" and current.get("queue_delay_ms")
+                and current["case"] not in delayed):
+            delay_x_events(current, GLib.main_current_source())
         if owner and tag == "Target entry" and phase == "up" and current.get("switch"):
             if current["case"] not in switched:
                 switched.add(current["case"])
@@ -131,6 +142,10 @@ def fixture(role, state_file):
         return False
 
     def focus_event(_widget, _ev, tag, kind):
+        nonlocal x_source
+        source = GLib.main_current_source()
+        if source and (source.get_name() or "").startswith("GDK X11 Event source"):
+            x_source = source
         event(kind, target=tag)
         return False
 
@@ -156,7 +171,8 @@ def fixture(role, state_file):
 
     def monitor_case():
         nonlocal current_case
-        case = json.loads(state_file.read_text())["case"]
+        current = json.loads(state_file.read_text())
+        case = current["case"]
         if case != current_case:
             current_case = case
             for entry in entries.values():
@@ -167,6 +183,9 @@ def fixture(role, state_file):
             event("focus_trigger", to_target="Sibling entry",
                   sibling_has_focus=entries["Sibling entry"].has_focus(), xid=x.focused())
             trigger.unlink()
+        if owner and pause_x_queue.exists():
+            delay_x_events(current, x_source)
+            pause_x_queue.unlink()
         return True
 
     GLib.timeout_add(3, monitor_case)
@@ -265,7 +284,9 @@ def helper_proxy(state_file, helper, args):
             LD_PRELOAD=str(state_file.with_name("text-ping-marker.so")),
             AAD_TEST_TEXT_PING=str(state_file.with_suffix(".text-ping")),
         )
-    if case not in {"first_stroke", "chord_refused", "paste_refused"} or "--anchor-token" not in args:
+    pause_before_stroke = current.get("pause_before_first_stroke") and args[0] == "type-text"
+    switch_focus = case in {"first_stroke", "chord_refused", "paste_refused"}
+    if not (pause_before_stroke or switch_focus) or "--anchor-token" not in args:
         os.execv(helper, [helper, *args])
     with subprocess.Popen([helper, *args], stdout=subprocess.PIPE, text=True) as child:
         for line in child.stdout:
@@ -273,9 +294,9 @@ def helper_proxy(state_file, helper, args):
             if frame.get("event") == "validate_segment" and frame["index"] == 0:
                 if case == "paste_refused":
                     state_file.with_suffix(".clipboard-owner").write_text(str(X11().clipboard_owner()))
-                trigger = state_file.with_suffix(".switch")
+                trigger = state_file.with_suffix(".pause-x-queue" if pause_before_stroke else ".switch")
                 trigger.touch()
-                until(lambda: not trigger.exists(), "same-window focus switch", seconds=2)
+                until(lambda: not trigger.exists(), "GTK fixture to handle the trigger", seconds=2)
             print(line, end="", flush=True)
         return child.wait()
 
@@ -377,6 +398,9 @@ def trial(aad, helper, out, baseline, scenario):
                 before_reply(case, pending)
             reply = mcp.recv(pending)
             elapsed_ms = (time.monotonic_ns() - start) / 1e6
+            if switch.get("pause_before_first_stroke"):
+                until(lambda: any(r["kind"] == "x_queue_drained" for r in rows("owner", case)),
+                      "GTK to drain its X event queue")
             if submit_on_return:
                 submission = until(lambda: next((r for r in rows("owner", case)
                                                   if r["kind"] == "submitted_and_closed"), None), case)
@@ -415,6 +439,13 @@ def trial(aad, helper, out, baseline, scenario):
             assert error["details"].get(cause[0]) == cause[1], reply
             progress = error["details"]["input_progress"]
             assert (progress["delivered"], progress["total"], progress["released"]) == (delivered, total, True), reply
+
+        def check_keyboard_mapping_restored(case, original):
+            actual = x.keyboard_mapping()
+            changed = sorted(code for code in original.keys() | actual.keys()
+                             if original.get(code) != actual.get(code))
+            emit(checkpoints, "keyboard_mapping_after", case=case, keymap=actual, changed_keycodes=changed)
+            assert not changed, changed
 
         def first_stroke_cross_window():
             reply, values, presses = type_text("first_stroke_cross_window", "abc",
@@ -541,6 +572,26 @@ def trial(aad, helper, out, baseline, scenario):
             complete_text(reply, text)
             assert reply["commit_state"] == "committed", reply
             return
+        if scenario == "final-temporary-key":
+            for case, delay in (("final_temporary_key", 150), ("unconfirmed_final_temporary_key", 450)):
+                text = "汉"
+                original = x.keyboard_mapping()
+                keysym = 0x01000000 | ord(text)
+                assert all(keysym not in symbols for symbols in original.values()), original
+                emit(checkpoints, "keyboard_mapping_before", case=case, keymap=original)
+                reply, values, presses = type_text(case, text, queue_delay_ms=delay, pause_before_first_stroke=True)
+                check_keyboard_mapping_restored(case, original)
+                owner_events = rows("owner", case)
+                resumed = next(r["monotonic_ns"] for r in owner_events if r["kind"] == "x_queue_resumed")
+                assert all(r["monotonic_ns"] > resumed for r in presses), presses
+                if delay == 150:
+                    complete_text(reply, text)
+                    assert reply["commit_state"] == "committed", reply
+                    assert values == {"Target entry": text, "Sibling entry": ""}, values
+                    assert [(r["target"], r["key"]) for r in presses] == [("Target entry", "U+6C49")], presses
+                else:
+                    denied(reply, "DRIVER.UNKNOWN_EFFECT", ("helper_code", "text_stroke_unconfirmed"), 1, 1, "unknown")
+            return
         if scenario == "stroke-barrier-cancel":
             original = x.keyboard_mapping()
 
@@ -654,7 +705,7 @@ if __name__ == "__main__":
         parser.add_argument("--baseline", action="store_true")
         parser.add_argument("--scenario", choices=["full", "window-preflight", "paste-recovery", "paste-unreadable",
                                                   "stroke-barrier", "stroke-barrier-cancel", "typing-speed",
-                                                  "submit-unicode", "submit-keys"],
+                                                  "submit-unicode", "submit-keys", "final-temporary-key"],
                             default="full")
         args = parser.parse_args()
         if args.baseline and args.scenario not in {"full", "stroke-barrier", "typing-speed"}:

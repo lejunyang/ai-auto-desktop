@@ -103,6 +103,9 @@ Unicode 与 keys 模式在每笔完整释放后、申请下一笔的控件证明
 和取消约束。窗口未声明该协议时在派发前拒绝。回执缺失时停止打字，回包保留
 `details.helper_code=text_stroke_unconfirmed` 和已派发笔数。[EWMH 窗口协议](https://specifications.freedesktop.org/wm/latest/ar01s06.html)
 
+末笔使用临时键位时也要等回执，收到后才恢复键表。回执超时时先恢复键表，再返回已派发进度和失败原因。
+末笔使用布局自带键位时可以直接完成，例如 Return 提交后立即关闭窗口。
+
 复核发现同窗换焦时会在下一次按下前中止。尚未派发时返回 `DRIVER.FOCUS_LOST / not_applied`。
 已有派发时返回 `DRIVER.UNKNOWN_EFFECT / unknown`，`details.cause` 为
 `focused_element_changed`。跨窗换焦可看 `details.helper_code=focus_owner_changed`。
