@@ -2,11 +2,14 @@ param(
     [string]$Aad = '',
     [string]$InputHelper = '',
     [string]$BuildDirectory = '',
-    [switch]$BuildOnly
+    [switch]$BuildOnly,
+    [switch]$ScopedGeometryOnly,
+    [switch]$ThreeWindowsOnly
 )
 
 # Run alone on an authorized interactive X11 desktop. This fixture independently
-# uses a deliberately stale accessibility Focused bit. Only counters leave its process.
+# uses a deliberately stale accessibility Focused bit. X11 tools manipulate
+# and inspect only the fixture's two windows.
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 if (-not $BuildDirectory) {
@@ -72,11 +75,210 @@ function Read-Timing([string]$pattern) {
     throw 'independent fixture timing status missing'
 }
 
+function Observe-SecondaryScope {
+    $frame = Find-Target 'AAD Secondary Window'
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $result = Call-Control @{method='observe';resource_id=$script:resourceId;max_nodes=100;view=@{mode='nodes';scope_target=$frame.target}}
+    $elapsed = $clock.Elapsed.TotalMilliseconds
+    $nodes = @($result.data.nodes | Where-Object { $_.name -eq 'Live secondary target' })
+    if ($result.error -or $result.data.truncated -or $nodes.Count -ne 1 -or
+        @($result.data.nodes | Where-Object { $_.name -in @('AAD Primary Window','Stale primary target') }).Count -ne 0) {
+        throw 'secondary scope missing its target or exposed the primary window'
+    }
+    return @{node=$nodes[0];elapsed_ms=$elapsed}
+}
+
+function Fixture-Window([string]$title) {
+    $windows = @(& xdotool search --onlyvisible --all --pid $fixture.Id --name "^$title$")
+    if ($LASTEXITCODE -ne 0 -or $windows.Count -ne 1) { throw "X11 fixture window unavailable: $title" }
+    return $windows[0]
+}
+
+function Window-Origin([string]$id) {
+    $geometry = (& xwininfo -id $id) -join "`n"
+    $x = [regex]::Match($geometry, 'Absolute upper-left X:\s*(-?\d+)')
+    $y = [regex]::Match($geometry, 'Absolute upper-left Y:\s*(-?\d+)')
+    if ($LASTEXITCODE -ne 0 -or -not $x.Success -or -not $y.Success) { throw 'X11 fixture geometry unavailable' }
+    return @{x=[int]$x.Groups[1].Value;y=[int]$y.Groups[1].Value}
+}
+
+function Move-FixtureWindow([string]$id, [int]$x, [int]$y) {
+    $actual = Window-Origin $id
+    $moveX = $x; $moveY = $y
+    for ($i=0; $i -lt 3; $i++) {
+        & xdotool windowmove $id $moveX $moveY
+        if ($LASTEXITCODE -ne 0) { throw 'X11 fixture window move failed' }
+        for ($poll=0; $poll -lt 20; $poll++) {
+            $after = Window-Origin $id
+            if ($after.x -eq $x -and $after.y -eq $y) { return }
+            if ($after.x -ne $actual.x -or $after.y -ne $actual.y) { break }
+            Start-Sleep -Milliseconds 25
+        }
+        # Reparenting WMs can apply the move to the frame instead of the client.
+        $moveX += $x - $after.x; $moveY += $y - $after.y
+        $actual = $after
+    }
+    throw "X11 fixture window did not reach $x,$y"
+}
+
+function Minimize-FixtureWindow([string]$id) {
+    & xdotool windowminimize $id
+    if ($LASTEXITCODE -ne 0) { throw 'fixture window minimize failed' }
+    for ($poll=0; $poll -lt 40; $poll++) {
+        $state = (& xprop -id $id WM_STATE) -join "`n"
+        $geometry = (& xwininfo -id $id) -join "`n"
+        if ($state -match 'window state: Iconic' -and $geometry -match 'Map State: IsUn(Mapped|viewable)') {
+            return
+        }
+        Start-Sleep -Milliseconds 25
+    }
+    throw 'fixture window did not become iconic and unviewable'
+}
+
+function Test-ScopedGeometry {
+    $primary = Fixture-Window 'AAD Primary Window'
+    $secondary = Fixture-Window 'AAD Secondary Window'
+    & xdotool windowactivate --sync $secondary
+    if ($LASTEXITCODE -ne 0) { throw 'secondary window activation failed' }
+    $primaryPattern = '^Stale primary target delivered (\d+) released (\d+)$'
+    $secondaryPattern = '^Live secondary target delivered (\d+) released (\d+)$'
+    $action = @{type='key';keys=@('f2')}
+    $attemptKey = {
+        param($case, $prepare, $expectedEffect, $expectedCode, $expectedSecondaryEvents)
+        $primaryBefore = @(Read-Timing $primaryPattern)
+        $secondaryBefore = @(Read-Timing $secondaryPattern)
+        $scoped = & $prepare
+        $result = Call-Control @{method='act';target=$scoped.node.target;action=$action}
+        $primaryAfter = @(Read-Timing $primaryPattern)
+        $secondaryAfter = @(Read-Timing $secondaryPattern)
+        $primaryEvents = @(($primaryAfter[0]-$primaryBefore[0]),($primaryAfter[1]-$primaryBefore[1]))
+        $secondaryEvents = @(($secondaryAfter[0]-$secondaryBefore[0]),($secondaryAfter[1]-$secondaryBefore[1]))
+        $checks.Add(@{case=$case;effect=$result.effect;code=$result.error.code;
+            primary_events=$primaryEvents;secondary_events=$secondaryEvents;
+            passed=($result.effect -eq $expectedEffect -and $result.error.code -eq $expectedCode -and
+                ($primaryEvents -join ',') -eq '0,0' -and ($secondaryEvents -join ',') -eq $expectedSecondaryEvents)})
+    }
+    $samples = @(for ($i=0; $i -lt 11; $i++) {
+        $scoped = Observe-SecondaryScope
+        if ($i -ge 2) { $scoped.elapsed_ms }
+    })
+    $primaryOrigin = Window-Origin $primary
+    $secondaryOrigin = Window-Origin $secondary
+    $verifySecondaryFocus = {
+        $unchanged = Window-Origin $secondary
+        if ($unchanged.x -ne $secondaryOrigin.x -or $unchanged.y -ne $secondaryOrigin.y -or
+            (& xdotool getwindowfocus) -ne $secondary) { throw 'the target moved or lost native focus' }
+    }
+    & $attemptKey 'scoped_sibling_moved' {
+        $scoped = Observe-SecondaryScope
+        Move-FixtureWindow $primary ($primaryOrigin.x + 40) $primaryOrigin.y
+        & $verifySecondaryFocus
+        $scoped
+    } 'applied' $null '1,1'
+    $sorted = @($samples | Sort-Object)
+    $checks[-1].observe_samples_ms = $samples
+    $checks[-1].observe_median_ms = $sorted[4]
+
+    & $attemptKey 'scoped_sibling_minimized_before_observation' {
+        Minimize-FixtureWindow $primary
+        & xdotool windowactivate --sync $secondary
+        if ($LASTEXITCODE -ne 0) { throw 'secondary window activation failed' }
+        & $verifySecondaryFocus
+        Observe-SecondaryScope
+    } 'applied' $null '1,1'
+    & xdotool windowactivate --sync $primary
+    if ($LASTEXITCODE -ne 0) { throw 'primary window restore failed' }
+    & xdotool windowactivate --sync $secondary
+    if ($LASTEXITCODE -ne 0) { throw 'secondary window activation failed' }
+
+    & $attemptKey 'scoped_target_moved' {
+        $scoped = Observe-SecondaryScope
+        Move-FixtureWindow $secondary ($secondaryOrigin.x + 30) $secondaryOrigin.y
+        $scoped
+    } 'not_applied' 'DRIVER.STALE_SNAPSHOT' '0,0'
+
+    $secondaryOrigin = Window-Origin $secondary
+    & $attemptKey 'scoped_target_covered_with_same_geometry' {
+        $scoped = Observe-SecondaryScope
+        Move-FixtureWindow $primary $secondaryOrigin.x $secondaryOrigin.y
+        & xdotool windowactivate --sync $primary
+        if ($LASTEXITCODE -ne 0) { throw 'fixture could not raise the covering window' }
+        $scoped
+    } 'not_applied' 'DRIVER.STALE_SNAPSHOT' '0,0'
+
+    Move-FixtureWindow $primary $primaryOrigin.x $primaryOrigin.y
+    & xdotool windowactivate --sync $secondary
+    if ($LASTEXITCODE -ne 0) { throw 'secondary window activation failed' }
+    & $attemptKey 'scoped_minimized_sibling_with_same_geometry' {
+        $scoped = Observe-SecondaryScope
+        Move-FixtureWindow $primary $secondaryOrigin.x $secondaryOrigin.y
+        Minimize-FixtureWindow $primary
+        $minimized = Window-Origin $primary
+        if ($minimized.x -ne $secondaryOrigin.x -or $minimized.y -ne $secondaryOrigin.y) {
+            throw 'minimized primary no longer has overlapping geometry'
+        }
+        & $verifySecondaryFocus
+        $scoped
+    } 'not_applied' 'DRIVER.STALE_SNAPSHOT' '0,0'
+}
+
+function Assert-ScopedGeometry {
+    $failed = @($checks | Where-Object { $_.passed -eq $false })
+    if ($failed.Count -gt 0) { throw "scoped geometry checks failed: $($failed.case -join ', ')" }
+}
+
+function Test-ThreeWindowGeometry {
+    $ids = $fixture.StandardOutput.ReadLineAsync()
+    if (-not $ids.Wait(5000) -or $ids.Result -notmatch '^\d+ \d+ \d+$') { throw 'fixture window IDs missing' }
+    $primary, $duplicate, $secondary = $ids.Result -split ' '
+    $primaryOrigin = Window-Origin $primary
+    $duplicateOrigin = Window-Origin $duplicate
+    if ($primaryOrigin.x -eq $duplicateOrigin.x -and $primaryOrigin.y -eq $duplicateOrigin.y) {
+        throw 'same-title siblings did not start at distinct origins'
+    }
+    $names = @('Stale primary target', 'Duplicate primary target', 'Live secondary target')
+    $counts = {
+        foreach ($name in $names) {
+            Read-Timing ('^' + [regex]::Escape($name) + ' delivered (\d+) released (\d+)$')
+        }
+    }
+    foreach ($overlap in @($false, $true)) {
+        if ($overlap) {
+            Move-FixtureWindow $duplicate $primaryOrigin.x $primaryOrigin.y
+            & xdotool windowactivate --sync $primary
+            $name = $names[0]; $focused = $primary; $expected = '0,0,0,0,0,0'
+        } else {
+            & xdotool windowactivate --sync $secondary
+            $name = $names[2]; $focused = $secondary; $expected = '0,0,0,0,1,1'
+        }
+        if ($LASTEXITCODE -ne 0 -or (& xdotool getwindowfocus) -ne $focused) { throw 'fixture focus mismatch' }
+        foreach ($scoped in @($false, $true)) {
+            $before = @(& $counts)
+            $node = Find-Target $name
+            if ($scoped) {
+                $anchor = if ($overlap) { $node } else { Find-Target 'AAD Secondary Window' }
+                $observation = Call-Control @{method='observe';resource_id=$script:resourceId;max_nodes=100;
+                    view=@{mode='nodes';scope_target=$anchor.target}}
+                $nodes = @($observation.data.nodes | Where-Object { $_.name -eq $name })
+                if ($observation.error -or $observation.data.truncated -or $nodes.Count -ne 1) { throw 'scoped key target missing' }
+                $node = $nodes[0]
+            }
+            $result = Call-Control @{method='act';target=$node.target;action=@{type='key';keys=@('f2')}}
+            $after = @(& $counts)
+            $events = @(for ($i = 0; $i -lt $before.Count; $i++) { $after[$i] - $before[$i] })
+            $effect = if ($overlap) { 'not_applied' } else { 'applied' }
+            $checks.Add(@{case="three_windows_overlap_${overlap}_scoped_${scoped}";effect=$result.effect;code=$result.error.code;
+                key_events=$events;passed=($result.effect -eq $effect -and ($events -join ',') -eq $expected)})
+        }
+    }
+}
+
 try {
     $fixtureInfo = [Diagnostics.ProcessStartInfo]::new()
     $fixtureInfo.FileName = $fixturePath
     $fixtureInfo.UseShellExecute = $false
     $fixtureInfo.RedirectStandardOutput = $true
+    if ($ThreeWindowsOnly) { $fixtureInfo.Arguments = '--three-windows' }
     $fixture = [Diagnostics.Process]::Start($fixtureInfo)
     $ready = $fixture.StandardOutput.ReadLineAsync()
     if (-not $ready.Wait(10000) -or $ready.Result -ne 'READY') { throw 'fixture failed to start' }
@@ -98,6 +300,24 @@ try {
     }
     if ($found.Count -ne 1) { throw 'fixture resource not found' }
     $script:resourceId = $found[0].resource_id
+
+    if ($ThreeWindowsOnly) {
+        Test-ThreeWindowGeometry
+        @{passed=(@($checks | Where-Object { $_.passed -eq $false }).Count -eq 0);checks=@($checks)} |
+            ConvertTo-Json -Depth 12 | Set-Content -Encoding UTF8 (Join-Path $BuildDirectory 'summary.json')
+        Assert-ScopedGeometry
+        Write-Output 'PASS: full and scoped observations deliver keys to the distinct target and reject overlapping same-title windows'
+        return
+    }
+
+    if ($ScopedGeometryOnly) {
+        Test-ScopedGeometry
+        @{passed=(@($checks | Where-Object { $_.passed -eq $false }).Count -eq 0);checks=@($checks)} |
+            ConvertTo-Json -Depth 12 | Set-Content -Encoding UTF8 (Join-Path $BuildDirectory 'summary.json')
+        Assert-ScopedGeometry
+        Write-Output 'PASS: scoped X11 geometry preserves the focused target and rejects drift and ambiguity'
+        return
+    }
 
     $stale = Find-Target 'Stale primary target'
     if (-not $stale.states.focused -or $stale.capabilities -notcontains 'key') { throw 'fixture did not expose its deliberate stale Focused bit' }
@@ -125,6 +345,8 @@ try {
     $timing = @(Read-Timing '^Stale primary target delivered (\d+) released (\d+)$')
     if ($timing[0] -ne 1 -or $timing[1] -ne 1) { throw 'primary actual press-release mismatch' }
     $checks.Add(@{case = 'activated_primary'; delivered = $timing[0]; released = $timing[1]})
+    Test-ScopedGeometry
+    Assert-ScopedGeometry
     @{passed = $true; helper_sha256 = (Get-FileHash $helperPath).Hash; checks = @($checks)} | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 (Join-Path $BuildDirectory 'summary.json')
     Write-Output 'PASS: stale AX focus cannot target a same-PID sibling; each correct window receives and releases its own input'
 

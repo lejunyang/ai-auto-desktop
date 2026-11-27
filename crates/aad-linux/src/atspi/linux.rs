@@ -1,6 +1,7 @@
 use super::{
     driver_error, remaining, AtspiBackend, AutomationError, BackendNode, BackendSnapshot, Bounds,
-    Gesture, Map, NativeRef, Value, WindowAnchor, MAX_FIELD_CHARS, MAX_NODES,
+    Gesture, Map, NativeRef, QtX11Window, Value, WindowAnchor, X11WindowBinding, MAX_FIELD_CHARS,
+    MAX_NODES,
 };
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::action::ActionProxy;
@@ -34,7 +35,7 @@ mod table;
 mod wayland_input;
 use focus_discovery::FocusDiscovery;
 mod window_focus;
-use window_focus::{append_window_args, AnchoredKeyboard};
+use window_focus::{append_window_args, AnchoredKeyboard, GEOMETRY_FEATURE};
 
 const REGISTRY_NAME: &str = "org.a11y.atspi.Registry";
 const REGISTRY_PATH: &str = "/org/a11y/atspi/accessible/root";
@@ -355,6 +356,30 @@ impl LinuxBackend {
         ))
     }
 
+    fn direct_windows(
+        &self,
+        app: &NativeRef,
+        deadline: Instant,
+    ) -> Result<Vec<NativeRef>, AutomationError> {
+        let children = self.child_references(app, deadline)?;
+        let count = zbus::block_on(self.accessible(app)?.child_count())
+            .map_err(|e| native_failure("application window count", app, e))?;
+        let mut paths = BTreeSet::new();
+        if usize::try_from(count).ok() != Some(children.returned_count)
+            || children.items.len() > 128
+            || children
+                .items
+                .iter()
+                .any(|child| child.bus_name != app.bus_name || !paths.insert(&child.object_path))
+        {
+            return Err(driver_error(
+                "DRIVER.COORDINATE_UNPROVEN",
+                "complete direct-window inventory unavailable",
+            ));
+        }
+        Ok(children.items)
+    }
+
     fn process_id(&self, bus_name: &str) -> Option<u32> {
         zbus::block_on(self.process_id_async(bus_name))
     }
@@ -499,10 +524,12 @@ impl LinuxBackend {
     }
 
     /// Pointer input is proven by live hit tests, with window focus for modifiers.
+    #[allow(clippy::too_many_arguments)]
     fn run_pointer_input(
         &self,
         target: &NativeRef,
         window: Option<&WindowAnchor>,
+        destination_window: Option<&WindowAnchor>,
         mut args: Vec<String>,
         minimum_events: u64,
         process_id: u32,
@@ -513,27 +540,53 @@ impl LinuxBackend {
         if self.cancellation.is_some() {
             support.require("cooperative-cancel")?;
         }
-        support.require(&args[0])?;
+        let bound_drag = args[0] == "drag";
+        if bound_drag {
+            DragKind::Straight.require(&support)?;
+        } else {
+            support.require(&args[0])?;
+        }
         if args.iter().any(|arg| arg == "--hold-ms") {
             support.require("bounded-hold")?;
         }
-        if args.iter().any(|arg| arg == "--modifiers") {
+        let modified = args.iter().any(|arg| arg == "--modifiers");
+        if modified {
             support.require("pointer-modifiers")?;
             support.require_keyboard_route()?;
+        }
+        if modified || bound_drag {
             let window = window.ok_or_else(|| {
                 driver_error(
                     "DRIVER.ACTION_UNSUPPORTED",
                     "input requires an observed top-level window",
                 )
             })?;
-            let window_id = self.verify_window_with_helper(
-                target,
-                window,
-                process_id,
-                deadline,
-                &support.path,
-            )?;
-            append_window_args(&mut args, window, Some(window_id));
+            let binding = if modified {
+                self.verify_window_with_helper(
+                    target,
+                    window,
+                    process_id,
+                    deadline,
+                    &support.path,
+                    true,
+                )?
+            } else {
+                window.input_binding()?
+            };
+            append_window_args(&mut args, window, Some(binding));
+        }
+        if bound_drag {
+            let destination = destination_window.ok_or_else(|| {
+                driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "drag requires an observed destination window",
+                )
+            })?;
+            let first = args.len();
+            append_window_args(&mut args, destination, Some(destination.input_binding()?));
+            for option in args[first..].iter_mut().step_by(2) {
+                option.insert_str(2, "destination-");
+            }
         }
         args.extend([
             "--deadline-monotonic-ns".into(),
@@ -628,6 +681,7 @@ impl LinuxBackend {
         parent_index: Option<usize>,
         application: &Map<String, Value>,
         input: Option<&InputSupport>,
+        qt_windows: Option<&[QtX11Window]>,
         deadline: Instant,
     ) -> Result<(BackendNode, usize), AutomationError> {
         remaining(deadline, false)?;
@@ -789,11 +843,11 @@ impl LinuxBackend {
             && interfaces.contains(Interface::Component)
             && bounds.is_some_and(|bounds| bounds.width > 0 && bounds.height > 0)
             && !protected
-            && process_id.is_some_and(|pid| {
-                self.verify_focused_with_helper(
+            && process_id.zip(qt_windows).is_some_and(|(pid, windows)| {
+                self.verify_qt_focus(
                     &target,
-                    None,
                     pid as u32,
+                    windows,
                     deadline,
                     &input.expect("feature checked").path,
                 )
@@ -826,11 +880,13 @@ impl LinuxBackend {
             for (action, feature) in [
                 ("pointer_click", "pointer-click"),
                 ("pointer_gesture", "pointer-gesture"),
-                ("drag", "drag"),
             ] {
                 if input.is_some_and(|support| support.has(feature)) {
                     actions.push(action.into());
                 }
+            }
+            if input.is_some_and(InputSupport::has_drag) {
+                actions.push("drag".into());
             }
             if fully_interactive
                 && input.is_some_and(|support| support.has_anchored_keyboard("key-chord"))
@@ -971,9 +1027,20 @@ impl AtspiBackend for LinuxBackend {
     }
     fn supports_cross_resource_drag(&self) -> bool {
         self.probe_input(Instant::now() + Duration::from_secs(1))
-            .is_ok_and(|support| support.require("anchored-drag-between").is_ok())
+            .is_ok_and(|support| DragKind::Between.available(&support))
     }
 
+    fn retains_resource_observations(&self) -> bool {
+        !crate::wayland_portal::is_wayland_session()
+    }
+
+    fn observe_x11_windows(
+        &self,
+        snapshot: &mut BackendSnapshot,
+        deadline: Instant,
+    ) -> BTreeMap<usize, X11WindowBinding> {
+        self.capture_x11_window_bindings(snapshot, deadline)
+    }
     fn drag_between(
         &self,
         request: super::DragBetweenRequest<'_>,
@@ -1048,21 +1115,34 @@ impl AtspiBackend for LinuxBackend {
                 "target has no qualified Wayland widget input binding",
             ));
         }
+        if action == "drag" {
+            // The trait receives only the action name. Dispatch checks the selected mode.
+            return if self.probe_input(deadline)?.has_drag() {
+                Ok(())
+            } else {
+                Err(incompatible_helper(
+                    "no anchored X11 drag mode is available",
+                ))
+            };
+        }
         let feature = match action {
             "type_text" => "type-text",
             "pointer_click" => "pointer-click",
             "pointer_gesture" => "pointer-gesture",
             "key_chord" => "key-chord",
-            "drag" | "paste" => action,
+            "paste" => "paste",
             "activate" | "minimize" | "maximize" | "restore" | "close_window" => "window-action",
             _ => return Ok(()),
         };
         let support = self.probe_input(deadline)?;
         if matches!(action, "type_text" | "key_chord" | "paste") {
-            support.require_anchored_keyboard(feature)
-        } else {
-            support.require(feature)
+            return support.require_anchored_keyboard(feature);
         }
+        support.require(feature)?;
+        if super::WINDOW_ACTIONS.contains(&action) {
+            support.require(GEOMETRY_FEATURE)?;
+        }
+        Ok(())
     }
 
     fn list_applications(
@@ -1524,6 +1604,7 @@ impl AtspiBackend for LinuxBackend {
         let input = self.run_pointer_input(
             target,
             window,
+            None,
             args,
             minimum + 2 * modifiers.len() as u64,
             process_id,
@@ -1546,6 +1627,7 @@ impl AtspiBackend for LinuxBackend {
         self.drag_modified(
             target,
             None,
+            None,
             from,
             to,
             button,
@@ -1560,6 +1642,7 @@ impl AtspiBackend for LinuxBackend {
         &self,
         target: &NativeRef,
         window: Option<&WindowAnchor>,
+        destination_window: Option<&WindowAnchor>,
         from: (i32, i32),
         to: (i32, i32),
         button: u8,
@@ -1612,6 +1695,7 @@ impl AtspiBackend for LinuxBackend {
         let input = self.run_pointer_input(
             target,
             window,
+            destination_window,
             args,
             3 + 2 * modifiers.len() as u64,
             process_id,
@@ -1771,27 +1855,29 @@ impl AtspiBackend for LinuxBackend {
     fn window_action(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
         action: &str,
         bounds: Bounds,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
         let path = self.input_helper("window-action", deadline)?;
-        if let Err(unproven) = self.verify_coordinate_target(target, deadline) {
-            // A minimized window is unmapped, so it can never be calibrated.
-            // EWMH actions need no pointer coordinates: accept it only when
-            // the helper binds exactly these bounds to this process's
-            // minimized client, as the snapshot did when offering restore.
-            let minimized = unproven.code == "DRIVER.COORDINATE_UNPROVEN"
-                && self
-                    .window_info(process_id, bounds, &path, deadline)
-                    .is_some_and(|info| info["minimized"] == true);
-            if !minimized {
-                return Err(unproven);
-            }
-        }
+        self.input_helper(GEOMETRY_FEATURE, deadline)?;
+        let binding = window
+            .filter(|window| window.native == *target && window.bounds == bounds)
+            .and_then(|window| window.x11.as_ref())
+            .ok_or_else(|| {
+                driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "observation has no proven window action target",
+                )
+            })?;
         let mut args = window_args("window-action", process_id, bounds);
         args.extend([
+            "--window-id".into(),
+            binding.client.to_string(),
+            "--window-proof".into(),
+            binding.input_proof().to_string(),
             "--action".into(),
             if action == "close_window" {
                 "close"
@@ -1811,10 +1897,13 @@ impl AtspiBackend for LinuxBackend {
             XTEST_OUTPUT_LIMIT,
         )?;
         let result = parse_input_helper(output, "window_dispatch", 1, process_id)?;
-        if result["reached"] != true {
+        if result["reached"] != true
+            || result["window"] != binding.client
+            || result["window_binding"] != "geometry"
+        {
             return Err(driver_error(
                 "DRIVER.UNKNOWN_EFFECT",
-                "the window manager did not report the requested window state in time",
+                "the window manager did not confirm the requested window state and binding",
             )
             .with_effect("unknown")
             .with_detail(
@@ -1823,7 +1912,7 @@ impl AtspiBackend for LinuxBackend {
             ));
         }
         Ok(
-            json!({"native_interface": "EWMH", "action": action, "window": result["window"], "verified": true, "observed_state": {"exists": result["exists"], "minimized": result["minimized"], "maximized": result["maximized"], "active": result["active"]}}),
+            json!({"native_interface": "EWMH", "action": action, "window": result["window"], "window_binding": result["window_binding"], "verified": true, "observed_state": {"exists": result["exists"], "minimized": result["minimized"], "maximized": result["maximized"], "active": result["active"]}}),
         )
     }
 
@@ -1951,7 +2040,7 @@ impl LinuxBackend {
     fn capture_tree(
         &self,
         root: NativeRef,
-        info: Map<String, Value>,
+        mut info: Map<String, Value>,
         ancestors: Vec<NativeRef>,
         max_depth: u32,
         max_nodes: usize,
@@ -1959,6 +2048,7 @@ impl LinuxBackend {
     ) -> Result<BackendSnapshot, AutomationError> {
         self.ensure_focus_discovery(&info, deadline);
         let input = self.probe_input(deadline).ok();
+        let qt_windows = self.read_qt_x11_windows(&mut info, deadline)?;
         let mut snapshot = self.capture_tree_nodes(
             root.clone(),
             info,
@@ -1966,8 +2056,10 @@ impl LinuxBackend {
             max_depth,
             max_nodes,
             input.as_ref(),
+            qt_windows.as_deref(),
             deadline,
         )?;
+        snapshot.qt_x11_windows = qt_windows;
         self.append_focused_branch(
             &root,
             &mut snapshot,
@@ -1977,13 +2069,6 @@ impl LinuxBackend {
             deadline,
         )?;
         self.normalize_coordinates(&mut snapshot, deadline)?;
-        let process_id = snapshot
-            .application
-            .get("process_id")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value > 0);
-        self.add_window_actions(&mut snapshot.nodes, process_id, input.as_ref(), deadline);
         Ok(snapshot)
     }
 
@@ -1996,6 +2081,7 @@ impl LinuxBackend {
         max_depth: u32,
         max_nodes: usize,
         input: Option<&InputSupport>,
+        qt_windows: Option<&[QtX11Window]>,
         deadline: Instant,
     ) -> Result<BackendSnapshot, AutomationError> {
         let mut nodes = Vec::new();
@@ -2007,7 +2093,10 @@ impl LinuxBackend {
         }
         for ancestor in ancestors {
             let parent = nodes.len().checked_sub(1);
-            nodes.push(self.read_node(ancestor, parent, &info, input, deadline)?.0);
+            nodes.push(
+                self.read_node(ancestor, parent, &info, input, qt_windows, deadline)?
+                    .0,
+            );
         }
         let parent = nodes.len().checked_sub(1);
         let mut queue = VecDeque::from([(root, parent, 0u32)]);
@@ -2025,7 +2114,7 @@ impl LinuxBackend {
                 break;
             }
             let (node, child_count) =
-                self.read_node(target.clone(), parent, &info, input, deadline)?;
+                self.read_node(target.clone(), parent, &info, input, qt_windows, deadline)?;
             let current = nodes.len();
             nodes.push(node);
             match self.child_references(&target, deadline) {
@@ -2079,19 +2168,23 @@ impl LinuxBackend {
             nodes,
             truncated,
             truncation_reasons,
+            qt_x11_windows: None,
         })
     }
 
-    /// The window manager's view of a top-level frame, when the X11 helper
-    /// and an EWMH window manager are there; `None` offers no window actions.
+    // A read-only view for window actions or exact client title conversion.
     fn window_info(
         &self,
         process_id: u32,
         bounds: Bounds,
         path: &Path,
         deadline: Instant,
+        request_proof: bool,
     ) -> Option<Value> {
         let mut args = window_args("window-info", process_id, bounds);
+        if request_proof {
+            args.extend(["--geometry-proof".into(), "1".into()]);
+        }
         args.extend([
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline).ok()?.to_string(),
@@ -2110,79 +2203,60 @@ impl LinuxBackend {
             return None;
         }
         let info = parse_one_json_object(&output.stdout, "window info").ok()?;
-        (info.get("ok") == Some(&Value::Bool(true)) && info.get("ewmh") == Some(&Value::Bool(true)))
+        (info.get("ok") == Some(&json!(true)) && !info.contains_key("dispatch_started"))
             .then_some(Value::Object(info))
-    }
-
-    /// Offer window actions on each top-level frame, by its current state.
-    fn add_window_actions(
-        &self,
-        nodes: &mut [BackendNode],
-        process_id: Option<u32>,
-        input: Option<&InputSupport>,
-        deadline: Instant,
-    ) {
-        let Some(input) =
-            input.filter(|input| input.has("window-info") && input.has("window-action"))
-        else {
-            return;
-        };
-        let Some(process_id) = process_id else {
-            return;
-        };
-        for node in nodes.iter_mut() {
-            // Uncalibrated bounds stay toolkit-logical, so a mapped window is
-            // skipped. A minimized one is unmapped and can never be calibrated;
-            // the helper below still binds it by these exact bounds.
-            let unproven =
-                node.provenance.get("coordinate_space") == Some(&json!("unproven_toolkit"));
-            // A direct child of the application is a top-level window: GTK and
-            // Qt main windows say frame/dialog, a bare QWidget window filler.
-            // The helper still proves an X11 client window of this process
-            // has exactly these bounds before anything is offered.
-            let top_level = node.parent_index == Some(0);
-            let Some(bounds) = node.bounds.filter(|b| b.width > 0 && b.height > 0) else {
-                continue;
-            };
-            if !top_level || remaining(deadline, false).is_err() {
-                continue;
-            }
-            let Some(info) = self.window_info(process_id, bounds, &input.path, deadline) else {
-                continue;
-            };
-            let supports = |name: &str| info["supports"][name] == true;
-            let minimized = info["minimized"] == true;
-            if unproven && !minimized {
-                continue;
-            }
-            let maximized = info["maximized"] == true;
-            let mut offered = Vec::new();
-            if !minimized {
-                offered.push("minimize");
-            }
-            if supports("maximize") && !maximized && !minimized {
-                offered.push("maximize");
-            }
-            if (minimized && supports("activate")) || (maximized && supports("maximize")) {
-                offered.push("restore");
-            }
-            if supports("close") {
-                offered.push("close_window");
-            }
-            if supports("activate") && !minimized && info["active"] != true {
-                offered.push("activate");
-            }
-            node.actions.extend(offered.into_iter().map(String::from));
-            node.provenance.insert(
-                "window".into(),
-                json!({"x11_window": info["window"], "minimized": minimized, "maximized": maximized, "active": info["active"]}),
-            );
-        }
     }
 }
 
 const INPUT_HELPER_PROTOCOL: u64 = 1;
-const KEYBOARD_ROUTE_FEATURES: [&str; 3] = ["focus-info", "window-focus", "atomic-key-dispatch"];
+const KEYBOARD_ROUTE_FEATURES: [&str; 4] = [
+    "focus-info",
+    "window-focus",
+    "atomic-key-dispatch",
+    GEOMETRY_FEATURE,
+];
+
+#[derive(Clone, Copy)]
+enum DragKind {
+    Straight,
+    Path,
+    Between,
+}
+
+impl DragKind {
+    const ALL: [Self; 3] = [Self::Straight, Self::Path, Self::Between];
+
+    fn required_features(self) -> &'static [&'static str] {
+        match self {
+            Self::Straight => &["drag", "anchored-straight-drag", GEOMETRY_FEATURE],
+            Self::Path => &[
+                "drag",
+                "anchored-drag-path",
+                "cooperative-cancel",
+                "window-focus",
+                GEOMETRY_FEATURE,
+            ],
+            Self::Between => &[
+                "anchored-drag-between",
+                "cooperative-cancel",
+                "window-focus",
+                GEOMETRY_FEATURE,
+            ],
+        }
+    }
+
+    fn available(self, support: &InputSupport) -> bool {
+        self.required_features()
+            .iter()
+            .all(|feature| support.has(feature))
+    }
+
+    fn require(self, support: &InputSupport) -> Result<(), AutomationError> {
+        self.required_features()
+            .iter()
+            .try_for_each(|feature| support.require(feature))
+    }
+}
 
 /// Capabilities describe the binary, not the user's display. Live display,
 /// focus, UID and hit checks still run for every actual operation.
@@ -2199,6 +2273,10 @@ fn anchored_keyboard_features(feature: &str) -> impl Iterator<Item = &str> {
 }
 
 impl InputSupport {
+    fn has_drag(&self) -> bool {
+        DragKind::ALL.into_iter().any(|kind| kind.available(self))
+    }
+
     fn has(&self, feature: &str) -> bool {
         self.features.contains(feature)
     }
@@ -2659,19 +2737,6 @@ fn terminate_with_grace(child: &mut Child, grace: Duration) -> bool {
     false
 }
 
-fn bound_window_focus(proof: &Map<String, Value>, process_id: u32) -> Option<(u64, bool)> {
-    if proof.get("ok") != Some(&Value::Bool(true))
-        || proof.get("expected_pid").and_then(Value::as_u64) != Some(u64::from(process_id))
-        || proof.get("window_bound") != Some(&Value::Bool(true))
-        || proof.contains_key("dispatch_started")
-    {
-        return None;
-    }
-    let id = proof.get("window")?.as_u64()?;
-    let focused = proof.get("focused")?.as_bool()?;
-    (id > 0 && id <= u64::from(u32::MAX)).then_some((id, focused))
-}
-
 fn parse_input_helper(
     output: HelperOutput,
     phase: &str,
@@ -2725,6 +2790,7 @@ fn parse_input_helper(
             "restored",
             "reached",
             "window",
+            "window_binding",
             "action",
             "exists",
             "minimized",
@@ -2764,6 +2830,19 @@ fn parse_input_helper(
     }
     let code = output.status.code();
     let helper_code = helper_error_code(&output.stdout);
+    if dispatched && helper_code.as_deref() == Some("drag_endpoint_changed") {
+        return Err(with_helper_receipt(
+            driver_error(
+                "DRIVER.POINT_NOT_PROVEN",
+                "a drag endpoint no longer matches its observed window after dispatch started",
+            )
+            .with_effect("unknown")
+            .with_detail("phase", json!(phase))
+            .with_detail("helper_code", json!(helper_code))
+            .with_detail("dispatch_started", json!(true)),
+            &output.stdout,
+        ));
+    }
     if !dispatched {
         if let Some(mapped) = helper_code.as_deref().and_then(map_helper_code) {
             return Err(with_helper_receipt(
@@ -2835,7 +2914,7 @@ fn map_helper_code(code: &str) -> Option<AutomationError> {
             "DRIVER.ACTION_UNSUPPORTED",
             "the window manager does not support this EWMH window request",
         ),
-        "window_not_found" | "window_ambiguous" => driver_error(
+        "window_not_found" | "window_ambiguous" | "target_window_changed" => driver_error(
             "DRIVER.STALE_SNAPSHOT",
             "no single top-level X11 window of the process matches the observed frame",
         ),
@@ -3175,7 +3254,7 @@ impl LinuxBackend {
     fn describe(&self, target: &NativeRef, info: &Map<String, Value>) -> Option<Value> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let (node, _) = self
-            .read_node(target.clone(), None, info, None, deadline)
+            .read_node(target.clone(), None, info, None, None, deadline)
             .ok()?;
         let protected = node.states.get("protected").copied().flatten() == Some(true);
         Some(json!({
@@ -3664,8 +3743,48 @@ mod capture_tests {
         assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
         assert_eq!(error.details["required_feature"], "atomic-key-dispatch");
         support.features.insert("atomic-key-dispatch".into());
+        let error = support.require_keyboard_route().unwrap_err();
+        assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+        assert_eq!(error.details["required_feature"], GEOMETRY_FEATURE);
+        support.features.insert(GEOMETRY_FEATURE.into());
         assert!(support.has_keyboard_route());
         assert!(support.require_keyboard_route().is_ok());
+    }
+
+    #[test]
+    fn partial_helpers_advertise_only_drag_modes_they_can_dispatch() {
+        let mut support = InputSupport {
+            path: "/unused".into(),
+            features: ["cooperative-cancel", "window-focus", GEOMETRY_FEATURE]
+                .map(str::to_owned)
+                .into(),
+        };
+        assert!(!support.has_drag());
+
+        support.features.insert("drag".into());
+        support.features.insert("anchored-drag-path".into());
+        assert!(support.has_drag());
+        assert!(DragKind::Path.require(&support).is_ok());
+        assert_eq!(
+            DragKind::Straight.require(&support).unwrap_err().details["required_feature"],
+            "anchored-straight-drag"
+        );
+        assert!(!DragKind::Between.available(&support));
+
+        support.features.remove("drag");
+        support.features.remove("anchored-drag-path");
+        support.features.insert("anchored-drag-between".into());
+        assert!(support.has_drag());
+        assert!(DragKind::Between.require(&support).is_ok());
+        assert!(!DragKind::Path.available(&support));
+        assert!(!DragKind::Straight.available(&support));
+
+        support.features.remove("cooperative-cancel");
+        assert!(!support.has_drag());
+        assert_eq!(
+            DragKind::Between.require(&support).unwrap_err().details["required_feature"],
+            "cooperative-cancel"
+        );
     }
 
     #[test]
@@ -4012,50 +4131,6 @@ mod capture_tests {
             .into_iter()
             .collect()
         )));
-    }
-
-    #[test]
-    fn focus_proof_requires_a_bound_window_and_expected_pid_without_input_dispatch() {
-        for (proof, expected) in [
-            (
-                json!({"ok": true, "focused": true, "expected_pid": 42}),
-                None,
-            ),
-            (
-                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": true, "window": 123}),
-                Some((123, true)),
-            ),
-            (
-                json!({"ok": true, "focused": false, "expected_pid": 42, "window_bound": true, "window": 123}),
-                Some((123, false)),
-            ),
-            (
-                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": true, "window": 0}),
-                None,
-            ),
-            (
-                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": false, "window": 123}),
-                None,
-            ),
-            (
-                json!({"ok": true, "focused": false, "expected_pid": 42}),
-                None,
-            ),
-            (
-                json!({"ok": true, "focused": true, "expected_pid": 43}),
-                None,
-            ),
-            (
-                json!({"ok": false, "focused": true, "expected_pid": 42}),
-                None,
-            ),
-            (
-                json!({"ok": true, "focused": true, "expected_pid": 42, "dispatch_started": false}),
-                None,
-            ),
-        ] {
-            assert_eq!(bound_window_focus(proof.as_object().unwrap(), 42), expected);
-        }
     }
 
     #[test]

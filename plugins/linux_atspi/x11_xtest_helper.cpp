@@ -6,8 +6,10 @@
 #include <X11/Xproto.h>
 #include <X11/extensions/XTest.h>
 #include <X11/extensions/record.h>
+#include <X11/extensions/shape.h>
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <cctype>
 #include <cerrno>
@@ -25,6 +27,7 @@
 #include <poll.h>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -259,6 +262,8 @@ struct Geometry {
 struct WindowBinding {
     Window id = None;
     Geometry bounds;
+    bool request_proof = false;
+    std::string proof{};
 };
 bool FocusMatchesWindow(Display *, unsigned long, Atom, const std::optional<WindowBinding> &);
 bool PointMatchesWindow(Display *, int, int, unsigned long, Atom, const std::optional<WindowBinding> &);
@@ -442,6 +447,41 @@ struct InputProgress {
                   << (released ? "true" : "false") << "}" << std::endl;
     }
 };
+
+struct WindowGeometryProof;
+enum class DragPhase { Source, Transit, Destination };
+
+struct DragHit {
+    std::vector<Window> path;
+    bool matches = false;
+    std::optional<unsigned long> client_pid;
+};
+
+class DragHitTest {
+public:
+    explicit DragHitTest(Display *display) : display_(display), root_(DefaultRootWindow(display)) {}
+    bool Watch(Window source);
+    void MarkPress() { press_serial_ = NextRequest(display_); }
+    std::optional<DragHit> At(int x, int y, const WindowGeometryProof &source,
+                              const WindowGeometryProof &destination, DragPhase phase);
+
+private:
+    bool UpdateWindows();
+    bool IsDragIcon(Window window, const XWindowAttributes &attributes) const;
+    std::optional<Window> UnderDragIcons(int x, int y) const;
+
+    Display *display_;
+    Window root_;
+    XID source_owner_ = 0, resource_mask_ = 0;
+    Atom window_type_ = None, dnd_type_ = None, dnd_selection_ = None;
+    unsigned long press_serial_ = 0;
+    bool shape_bounding_ = false;
+    bool shape_input_ = false;
+    std::unordered_set<Window> created_, mapped_;
+};
+
+bool StraightDragPointMatches(Display *, unsigned long, Atom, const WindowBinding &, const WindowBinding &,
+                              DragHitTest &, int, int, DragPhase);
 
 bool FocusBelongsToPid(Display *display, unsigned long expected_pid, Atom pid_atom) {
     Window focus = None;
@@ -916,7 +956,8 @@ void SleepUntilOrDeadline(unsigned milliseconds, std::uint64_t deadline_ns) {
 
 int RunGesture(Display *display, std::string_view command, const GestureRequest &request,
                std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom,
-               const std::optional<WindowBinding> &binding, InputProgress &progress,
+               const std::optional<WindowBinding> &binding,
+               const std::optional<WindowBinding> &destination_binding, InputProgress &progress,
                std::string_view anchor_token) {
     auto refuse = [&](std::string_view code, std::string_view phase, int exit_code) {
         progress.Emit(display);
@@ -929,6 +970,27 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
     std::vector<KeyCode> pressed_modifiers;
     std::vector<KeyCode> pressed_chord;
     bool button_pressed = false;
+    const bool requires_focus = command == "key-chord" || !request.modifiers.empty();
+    auto focus_matches = [&]() {
+        return !requires_focus || FocusMatchesWindow(display, expected_pid, pid_atom, binding);
+    };
+    const auto &end_binding = destination_binding ? destination_binding : binding;
+    DragHitTest drag_hit(display);
+    auto point_matches = [&](int x, int y, const std::optional<WindowBinding> &window) {
+        return WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom) &&
+            (!window || PointMatchesWindow(display, x, y, expected_pid, pid_atom, window));
+    };
+    auto endpoints_match = [&]() {
+        return point_matches(request.x, request.y, binding) &&
+            (command != "drag" || point_matches(request.to_x, request.to_y, end_binding));
+    };
+    auto pointer_at = [&](int x, int y) {
+        Window root = None, child = None;
+        int rx = 0, ry = 0, wx = 0, wy = 0;
+        unsigned mask = 0;
+        return XQueryPointer(display, DefaultRootWindow(display), &root, &child, &rx, &ry, &wx, &wy, &mask)
+            && rx == x && ry == y;
+    };
     char held_keys[32]{};
     XQueryKeymap(display, held_keys);
     for (const auto &name : request.modifiers) {
@@ -956,21 +1018,8 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             seen_main = last;
             chord.push_back(code);
         }
-    } else {
-        std::vector<std::pair<int, int>> points = {{request.x, request.y}};
-        if (command == "drag") {
-            points.emplace_back(request.to_x, request.to_y);
-            points.insert(points.end(), request.path.begin(), request.path.end());
-        }
-        for (const auto &point : points) {
-            if (!WindowAtPointBelongsToPid(display, point.first, point.second, expected_pid,
-                                           pid_atom) || (!request.path.empty() &&
-                !PointMatchesWindow(display, point.first, point.second, expected_pid, pid_atom, binding))) {
-                return refuse("target_point_mismatch", "target_preflight", kExitTargetMismatch);
-            }
-        }
     }
-    if (request.hold_ms != 0 || !request.path.empty()) {
+    if (request.hold_ms != 0 || !request.path.empty() || destination_binding) {
         Window root = None, child = None;
         int rx = 0, ry = 0, wx = 0, wy = 0;
         unsigned mask = 0;
@@ -1006,13 +1055,13 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
     if (DeadlineExpired(deadline_ns)) {
         return finish_failure("deadline_exceeded", "pre_dispatch", kExitTimeoutBeforeDispatch);
     }
-    if ((command == "key-chord" || !modifiers.empty()) && !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) {
+    if (!focus_matches()) {
         return finish_failure("focus_owner_changed", "target_preflight", kExitTargetMismatch);
     }
-    if (command != "key-chord" &&
-        (!WindowAtPointBelongsToPid(display, request.x, request.y, expected_pid, pid_atom) ||
-         (command == "drag" && !WindowAtPointBelongsToPid(display, request.to_x, request.to_y,
-                                                         expected_pid, pid_atom)))) {
+    if (command != "key-chord" && (!endpoints_match() ||
+        std::any_of(request.path.begin(), request.path.end(), [&](const auto &point) {
+            return !point_matches(point.first, point.second, binding);
+        }))) {
         return finish_failure("target_point_mismatch", "target_preflight", kExitTargetMismatch);
     }
     int path_x = request.x, path_y = request.y;
@@ -1021,17 +1070,16 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         if (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid))) return "untrusted_process";
         if (!modifiers.empty() && !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) return "focus_owner_changed";
         if (!PointMatchesWindow(display, path_x, path_y, expected_pid, pid_atom, binding)) return "target_point_mismatch";
-        if (button_pressed) {
-            Window root = None, child = None; int rx = 0, ry = 0, wx = 0, wy = 0; unsigned mask = 0;
-            if (!XQueryPointer(display, DefaultRootWindow(display), &root, &child, &rx, &ry, &wx, &wy, &mask)
-                || rx != path_x || ry != path_y) return "pointer_position_changed";
-        }
+        if (button_pressed && !pointer_at(path_x, path_y)) return "pointer_position_changed";
         if (g_x_error) return "x11_error";
         return {};
     };
     if (!request.path.empty()) {
         if (const auto problem = ValidateSegment(request.path_token, 0, deadline_ns, path_problem, 5); !problem.empty()) {
             return finish_failure(problem, "path_preflight", kExitTargetMismatch);
+        }
+        if (!endpoints_match()) {
+            return finish_failure("target_point_mismatch", "path_preflight", kExitTargetMismatch);
         }
     }
     if (const auto problem = ValidateKeyboardAnchor(anchor_token, 0, display, expected_pid,
@@ -1046,6 +1094,15 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         submitted = ok && submitted;
         ++event_count;
     };
+    auto straight_drag_problem = [&](int x, int y, DragPhase phase) -> std::string_view {
+        if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
+        if (!destination_binding) return {};
+        if (!submitted || g_x_error) return "x11_error";
+        if (!StraightDragPointMatches(display, expected_pid, pid_atom, *binding, *destination_binding,
+                                      drag_hit, x, y, phase)) return "drag_endpoint_changed";
+        if (!focus_matches()) return "focus_owner_changed";
+        return {};
+    };
     auto press_button = [&] {
         progress.attempted_buttons |= Button1Mask << (request.button - 1);
         submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
@@ -1058,20 +1115,16 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
         if (!submitted || g_x_error) return "x11_error";
         if (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid))) return "untrusted_process";
-        if ((command == "key-chord" || !modifiers.empty()) &&
-            !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) return "focus_owner_changed";
         if (command != "key-chord") {
-            Window root = None, child = None;
-            int rx = 0, ry = 0, wx = 0, wy = 0;
-            unsigned mask = 0;
-            if (!XQueryPointer(display, DefaultRootWindow(display), &root, &child, &rx, &ry,
-                               &wx, &wy, &mask) || rx != request.x || ry != request.y) {
-                return "pointer_position_changed";
+            if (destination_binding) {
+                const auto problem = straight_drag_problem(request.x, request.y, DragPhase::Source);
+                if (!problem.empty()) return problem;
+            } else if (!endpoints_match()) {
+                return "target_point_mismatch";
             }
-            if (!WindowAtPointBelongsToPid(display, request.x, request.y, expected_pid, pid_atom) ||
-                (command == "drag" && !WindowAtPointBelongsToPid(display, request.to_x,
-                    request.to_y, expected_pid, pid_atom))) return "target_point_mismatch";
+            if (!pointer_at(request.x, request.y)) return "pointer_position_changed";
         }
+        if (!focus_matches()) return "focus_owner_changed";
         if (!submitted || g_x_error) return "x11_error";
         return {};
     };
@@ -1091,6 +1144,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         const auto problem = AtomicBurst(display, [&]() -> std::string_view {
             if (const auto focus = KeyboardFocusProblem(display, expected_pid, pid_atom, binding, deadline_ns);
                 !focus.empty()) return focus;
+            if (command != "key-chord" && !endpoints_match()) return "target_point_mismatch";
             if (const auto keys = VerifyStrokeKeys(display, code); !keys.empty()) return keys;
             return DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "";
         }, [&] {
@@ -1126,16 +1180,32 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         XSync(display, False);
         if (submitted && !g_x_error) pressed_chord.clear();
     } else {
-        MarkDispatchStarted(dispatch_started);
         if (DeadlineExpired(deadline_ns)) {
-            return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+            return finish_failure("deadline_exceeded", "input_dispatch", kExitTimeoutBeforeDispatch);
         }
+        if (binding && !endpoints_match()) {
+            return finish_failure("target_point_mismatch", "pointer_dispatch", kExitTargetMismatch);
+        }
+        if (!focus_matches()) {
+            return finish_failure("focus_owner_changed", "pointer_dispatch", kExitTargetMismatch);
+        }
+        MarkDispatchStarted(dispatch_started);
         submit(XTestFakeMotionEvent(display, -1, request.x, request.y, 1) != 0);
         if (command == "drag") {
             XSync(display, False);
             if (DeadlineExpired(deadline_ns)) {
                 return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
             }
+            if (destination_binding && !drag_hit.Watch(binding->id)) {
+                return finish_failure("x11_error", "button_dispatch", kExitTargetMismatch);
+            }
+            if (binding && (!endpoints_match() || !pointer_at(request.x, request.y))) {
+                return finish_failure("target_point_mismatch", "button_dispatch", kExitTargetMismatch);
+            }
+            if (!focus_matches()) {
+                return finish_failure("focus_owner_changed", "button_dispatch", kExitTargetMismatch);
+            }
+            if (destination_binding) drag_hit.MarkPress();
             button_pressed = true;
             press_button();
             if (const auto problem = hold(); !problem.empty()) {
@@ -1163,33 +1233,48 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                     return finish_failure(problem, "path_release", kExitUnknownEffect);
                 }
             } else {
-            // Glide in steps: many toolkits only start a drag after the
-            // pointer has moved a few pixels with the button held.
-            constexpr int kSteps = 12;
-            for (int step = 1; step <= kSteps; ++step) {
-                if (DeadlineExpired(deadline_ns)) {
-                    return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+                // Glide in steps: many toolkits only start a drag after the
+                // pointer has moved a few pixels with the button held.
+                constexpr int kSteps = 12;
+                for (int step = 1; step <= kSteps; ++step) {
+                    const int x = request.x + (request.to_x - request.x) * step / kSteps;
+                    const int y = request.y + (request.to_y - request.y) * step / kSteps;
+                    const auto phase = step == kSteps ? DragPhase::Destination : DragPhase::Transit;
+                    if (const auto problem = straight_drag_problem(x, y, phase); !problem.empty()) {
+                        return finish_failure(problem, "input_dispatch", kExitUnknownEffect);
+                    }
+                    if (!destination_binding && request.hold_ms != 0 &&
+                        (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid)) ||
+                         !focus_matches() ||
+                         !WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom))) {
+                        return finish_failure("target_changed", "input_dispatch", kExitUnknownEffect);
+                    }
+                    submit(XTestFakeMotionEvent(display, -1, x, y, 1) != 0);
+                    XSync(display, False);
+                    SleepUntilOrDeadline(15, deadline_ns);
                 }
-                const int x = request.x + (request.to_x - request.x) * step / kSteps;
-                const int y = request.y + (request.to_y - request.y) * step / kSteps;
-                if (request.hold_ms != 0 &&
-                    (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid)) ||
-                     (!modifiers.empty() && !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) ||
-                     !WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom))) {
-                    return finish_failure("target_changed", "input_dispatch", kExitUnknownEffect);
+                if (destination_binding) {
+                    const auto problem = straight_drag_problem(request.to_x, request.to_y,
+                                                               DragPhase::Destination);
+                    if (!problem.empty()) {
+                        return finish_failure(problem, "drag_release", kExitUnknownEffect);
+                    }
+                    if (!pointer_at(request.to_x, request.to_y)) {
+                        return finish_failure("pointer_position_changed", "drag_release", kExitUnknownEffect);
+                    }
                 }
-                submit(XTestFakeMotionEvent(display, -1, x, y, 1) != 0);
-                XSync(display, False);
-                SleepUntilOrDeadline(15, deadline_ns);
-            }
             }
             submit(XTestFakeButtonEvent(display, request.button, False, 1) != 0);
             XSync(display, False);
             if (submitted && !g_x_error) button_pressed = false;
         } else if (request.mode == "click") {
+            if (binding) XSync(display, False);
             for (unsigned click = 0; click < request.count; ++click) {
                 if (DeadlineExpired(deadline_ns)) {
                     return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+                }
+                if (binding && (!endpoints_match() || !pointer_at(request.x, request.y))) {
+                    return finish_failure("target_point_mismatch", "button_dispatch", kExitTargetMismatch);
                 }
                 button_pressed = true;
                 press_button();
@@ -1747,29 +1832,6 @@ std::optional<long> IcccmState(const Ewmh &ewmh, Window window) {
     return result;
 }
 
-void CollectClients(Display *display, Window window, int depth, std::vector<Window> *out) {
-    Window root = None;
-    Window parent = None;
-    Window *children = nullptr;
-    unsigned int count = 0;
-    g_x_error = false;
-    const Status status = XQueryTree(display, window, &root, &parent, &children, &count);
-    XSync(display, False);
-    if (!status || g_x_error) {
-        return;
-    }
-    for (unsigned int index = 0; index < count && out->size() < 4096; ++index) {
-        out->push_back(children[index]);
-        if (depth < 3) {
-            CollectClients(display, children[index], depth + 1, out);
-        }
-    }
-    if (children != nullptr) {
-        XFree(children);
-    }
-}
-
-
 std::optional<Geometry> RootGeometry(Display *display, Window window) {
     XWindowAttributes attributes{};
     g_x_error = false;
@@ -1798,88 +1860,31 @@ bool Exists(Display *display, Window window) {
     return status && !g_x_error;
 }
 
-// The one top-level client window of `pid` at `want` (the AT-SPI frame's
-// screen extents). With a single client window of that process its geometry
-// may be stale (e.g. while minimized), so it is accepted alone.
-std::optional<Window> FindClientWindow(const Ewmh &ewmh, unsigned long pid, const Geometry &want,
-                                       std::string *problem, bool allow_single = true) {
-    std::vector<Window> all;
-    if (ewmh.present) {
-        Atom actual_type = None;
-        int actual_format = 0;
-        unsigned long count = 0;
-        unsigned long bytes_after = 0;
-        unsigned char *data = nullptr;
-        g_x_error = false;
-        if (XGetWindowProperty(ewmh.display, ewmh.root, ewmh.client_list, 0, 4096, False,
-                               XA_WINDOW, &actual_type, &actual_format, &count, &bytes_after,
-                               &data) == Success &&
-            actual_type == XA_WINDOW && actual_format == 32 && data != nullptr) {
-            const auto *windows = reinterpret_cast<Window *>(data);
-            all.assign(windows, windows + count);
-        }
-        if (data != nullptr) {
-            XFree(data);
-        }
-        XSync(ewmh.display, False);
-    }
-    if (all.empty()) {
-        CollectClients(ewmh.display, ewmh.root, 0, &all);
-    }
-    std::vector<Window> owned;
-    for (const Window window : all) {
-        if (OwnPid(ewmh.display, window, ewmh.pid) != pid) {
-            continue;
-        }
-        XWindowAttributes attributes{};
-        g_x_error = false;
-        if (!XGetWindowAttributes(ewmh.display, window, &attributes) || g_x_error ||
-            attributes.override_redirect || attributes.c_class != InputOutput) {
-            continue;
-        }
-        const bool managed = IcccmState(ewmh, window).has_value();
-        if (!managed && attributes.map_state != IsViewable) {
-            continue;
-        }
-        owned.push_back(window);
-    }
-    std::vector<Window> exact;
-    for (const Window window : owned) {
-        const auto geometry = RootGeometry(ewmh.display, window);
-        if (geometry.has_value() && std::abs(static_cast<long long>(geometry->x) - want.x) <= 2 &&
-            std::abs(static_cast<long long>(geometry->y) - want.y) <= 2 && geometry->width == want.width &&
-            geometry->height == want.height) {
-            exact.push_back(window);
-        }
-    }
-    if (exact.size() == 1) {
-        return exact[0];
-    }
-    if (allow_single && exact.empty() && owned.size() == 1) {
-        return owned[0];
-    }
-    *problem = owned.empty() ? "window_not_found" : "window_ambiguous";
-    return std::nullopt;
+#include "x11_window_geometry.hpp"
+
+bool BoundClientViewable(Display *display, unsigned long pid, Atom pid_atom, Window id) {
+    XWindowAttributes attributes{};
+    return ValidXid(id) && OwnPid(display, id, pid_atom) == pid &&
+        XGetWindowAttributes(display, id, &attributes) && !g_x_error &&
+        attributes.map_state == IsViewable && !attributes.override_redirect &&
+        attributes.c_class == InputOutput;
 }
 
-// Keyboard ownership requires the precise observed client window and live
-// geometry. A child focus window is allowed; a same-process sibling is not.
-bool FocusMatchesWindow(Display *display, unsigned long pid, Atom pid_atom,
-                        const std::optional<WindowBinding> &binding) {
-    if (!FocusBelongsToPid(display, pid, pid_atom)) return false;
-    if (!binding.has_value()) return true; // legacy helper protocol only
-    if (binding->id == None || OwnPid(display, binding->id, pid_atom) != pid) return false;
-    const auto bounds = RootGeometry(display, binding->id);
-    XWindowAttributes attributes{};
-    if (!bounds.has_value() || !XGetWindowAttributes(display, binding->id, &attributes) ||
-        attributes.map_state != IsViewable ||
-        std::abs(static_cast<long long>(bounds->x) - binding->bounds.x) > 2 ||
-        std::abs(static_cast<long long>(bounds->y) - binding->bounds.y) > 2 ||
-        bounds->width != binding->bounds.width || bounds->height != binding->bounds.height) return false;
+bool WindowBindingMatches(Display *display, unsigned long pid, Atom pid_atom,
+                          const WindowBinding &binding, int legacy_tolerance) {
+    if (!BoundClientViewable(display, pid, pid_atom, binding.id)) return false;
+    if (!binding.proof.empty()) return RecheckGeometryProof(LoadEwmh(display), pid, binding).has_value();
+    const auto bounds = RootGeometry(display, binding.id);
+    return bounds && GeometryMatches(*bounds, binding.bounds, legacy_tolerance);
+}
+
+bool FocusInClient(Display *display, Window client) {
     Window current = None; int revert = 0;
+    g_x_error = false;
     XGetInputFocus(display, &current, &revert); XSync(display, False);
+    if (g_x_error) return false;
     for (int depth = 0; depth < 64 && current != None && current != PointerRoot; ++depth) {
-        if (current == binding->id) return true;
+        if (current == client) return true;
         Window root = None, parent = None, *children = nullptr; unsigned count = 0;
         g_x_error = false;
         const Status found = XQueryTree(display, current, &root, &parent, &children, &count);
@@ -1891,36 +1896,211 @@ bool FocusMatchesWindow(Display *display, unsigned long pid, Atom pid_atom,
     return false;
 }
 
-bool PointMatchesWindow(Display *display, int x, int y, unsigned long pid, Atom pid_atom,
+// Keyboard focus must be in the observed client, including its children.
+bool FocusMatchesWindow(Display *display, unsigned long pid, Atom pid_atom,
                         const std::optional<WindowBinding> &binding) {
-    if (!binding.has_value() || binding->id == None || OwnPid(display, binding->id, pid_atom) != pid) return false;
-    const auto bounds = RootGeometry(display, binding->id);
-    XWindowAttributes attributes{};
-    if (!bounds.has_value() || !XGetWindowAttributes(display, binding->id, &attributes) ||
-        attributes.map_state != IsViewable || bounds->x != binding->bounds.x || bounds->y != binding->bounds.y ||
-        bounds->width != binding->bounds.width || bounds->height != binding->bounds.height) return false;
+    return FocusBelongsToPid(display, pid, pid_atom) &&
+        (!binding || (WindowBindingMatches(display, pid, pid_atom, *binding, 2) &&
+                      FocusInClient(display, binding->id)));
+}
+
+std::optional<Window> PointChild(Display *display, Window parent, int x, int y) {
+    Window child = None;
+    int local_x = 0, local_y = 0;
+    g_x_error = false;
+    const bool translated = XTranslateCoordinates(display, DefaultRootWindow(display), parent, x, y,
+                                                   &local_x, &local_y, &child) != 0;
+    XSync(display, False);
+    if (!translated || g_x_error) return std::nullopt;
+    return child;
+}
+
+bool PointInClient(Display *display, int x, int y, Window client) {
     Window current = DefaultRootWindow(display);
     for (int depth = 0; depth < 64; ++depth) {
-        Window child = None; int local_x = 0, local_y = 0;
-        g_x_error = false;
-        const bool ok = XTranslateCoordinates(display, DefaultRootWindow(display), current, x, y, &local_x, &local_y, &child) != 0;
-        XSync(display, False);
-        if (!ok || g_x_error || child == None) return false;
-        if (child == binding->id) return true;
-        current = child;
+        const auto child = PointChild(display, current, x, y);
+        if (!child || *child == None) return false;
+        if (*child == client) return true;
+        current = *child;
     }
     return false;
 }
 
-// Strip internal input anchors before the legacy command parsers.
+bool DragHitTest::Watch(Window source) {
+    resource_mask_ = ResourceMask(display_, XAllocID(display_)).value_or(0);
+    source_owner_ = source & ~resource_mask_;
+    window_type_ = XInternAtom(display_, "_NET_WM_WINDOW_TYPE", False);
+    dnd_type_ = XInternAtom(display_, "_NET_WM_WINDOW_TYPE_DND", False);
+    dnd_selection_ = XInternAtom(display_, "XdndSelection", False);
+    int major = 0, minor = 0;
+    shape_bounding_ = XShapeQueryVersion(display_, &major, &minor) != 0;
+    shape_input_ = shape_bounding_ && (major > 1 || (major == 1 && minor >= 1));
+    g_x_error = false;
+    XSelectInput(display_, root_, SubstructureNotifyMask);
+    XSync(display_, False);
+    return !g_x_error;
+}
+
+bool DragHitTest::UpdateWindows() {
+    if (!press_serial_) return true;
+    XEvent event{};
+    for (unsigned count = 0; XCheckWindowEvent(display_, root_, SubstructureNotifyMask, &event); ++count) {
+        if (count == 4096) return false;
+        if (event.xany.send_event || event.xany.serial < press_serial_) continue;
+        if (event.type == CreateNotify) created_.insert(event.xcreatewindow.window);
+        if (event.type == MapNotify) mapped_.insert(event.xmap.window);
+        if (event.type == UnmapNotify) mapped_.erase(event.xunmap.window);
+        if (event.type == DestroyNotify) {
+            created_.erase(event.xdestroywindow.window);
+            mapped_.erase(event.xdestroywindow.window);
+        }
+        if (created_.size() > 4096 || mapped_.size() > 4096) return false;
+    }
+    return true;
+}
+
+bool DragHitTest::IsDragIcon(Window window, const XWindowAttributes &attributes) const {
+    if (!resource_mask_ || (window & ~resource_mask_) != source_owner_ ||
+        !attributes.override_redirect || attributes.c_class != InputOutput ||
+        !created_.count(window) || !mapped_.count(window)) return false;
+    const auto type = ReadProperty32(display_, window, window_type_, XA_ATOM, 8);
+    if (!type) return false;
+    if (!type->values.empty() && type->values.front() == dnd_type_) {
+        // GTK's visual proxy can have a nonempty input shape. Tie it to
+        // the source X client's live XDND selection as well as its type.
+        const Window owner = XGetSelectionOwner(display_, dnd_selection_);
+        if (!g_x_error && owner != None && owner != window && (owner & ~resource_mask_) == source_owner_) {
+            return true;
+        }
+    }
+    if (!shape_input_) return false;
+    int count = -1, order = 0;
+    XRectangle *rects = XShapeGetRectangles(display_, window, ShapeInput, &count, &order);
+    if (rects) XFree(rects);
+    return !g_x_error && count == 0;
+}
+
+std::optional<Window> DragHitTest::UnderDragIcons(int x, int y) const {
+    Window root = None, parent = None, *children = nullptr;
+    unsigned count = 0;
+    if (!XQueryTree(display_, root_, &root, &parent, &children, &count) || g_x_error ||
+        root != root_ || count > 4096) {
+        if (children) XFree(children);
+        return std::nullopt;
+    }
+    std::optional<Window> hit = Window{None};
+    while (count > 0) {
+        const Window window = children[--count]; // XQueryTree lists bottom to top.
+        XWindowAttributes attributes{};
+        if (!XGetWindowAttributes(display_, window, &attributes) || g_x_error) {
+            hit.reset();
+            break;
+        }
+        if (attributes.map_state != IsViewable) continue;
+        const auto local_x = static_cast<long long>(x) - attributes.x - attributes.border_width;
+        const auto local_y = static_cast<long long>(y) - attributes.y - attributes.border_width;
+        if (local_x < -attributes.border_width || local_y < -attributes.border_width ||
+            local_x >= attributes.width + attributes.border_width ||
+            local_y >= attributes.height + attributes.border_width) continue;
+        if (shape_bounding_) {
+            int count_rects = -1, order = 0;
+            XRectangle *rects = XShapeGetRectangles(display_, window, ShapeBounding, &count_rects, &order);
+            const bool contains = count_rects > 0 && rects &&
+                std::any_of(rects, rects + count_rects, [&](const XRectangle &rect) {
+                    return local_x >= rect.x && local_y >= rect.y &&
+                        local_x < rect.x + rect.width && local_y < rect.y + rect.height;
+                });
+            if (rects) XFree(rects);
+            if (g_x_error || count_rects < 0) {
+                hit.reset();
+                break;
+            }
+            if (!contains) continue;
+        }
+        const bool icon = IsDragIcon(window, attributes);
+        if (g_x_error) {
+            hit.reset();
+            break;
+        }
+        if (icon) continue;
+        hit = window;
+        break;
+    }
+    if (children) XFree(children);
+    return hit;
+}
+
+bool MatchDragEndpoint(DragHit &hit, int x, int y, const WindowGeometryProof &proof, bool transit) {
+    const Window branch = hit.path.front();
+    if (branch != proof.client && (proof.frames.empty() || branch != proof.frames.back().id)) return false;
+    for (const Window window : hit.path) {
+        if (window == proof.client) {
+            hit.client_pid = proof.pid;
+            return true;
+        }
+        const auto &wm = *proof.wm;
+        if ((window & ~wm.mask) != (wm.identity & ~wm.mask)) return false;
+    }
+    // Only transit between distinct clients can cross a proven title bar or border.
+    const auto &client = proof.client_bounds;
+    return transit && (x < client.x || x >= client.x + client.width ||
+                       y < client.y || y >= client.y + client.height);
+}
+
+std::optional<DragHit> DragHitTest::At(int x, int y, const WindowGeometryProof &source,
+                                     const WindowGeometryProof &destination, DragPhase phase) {
+    auto branch = PointChild(display_, root_, x, y);
+    // The hit query drains map notifications for windows already on screen.
+    if (!branch || !UpdateWindows()) return std::nullopt;
+    if (created_.count(*branch)) {
+        XWindowAttributes attributes{};
+        if (!XGetWindowAttributes(display_, *branch, &attributes) || g_x_error) return std::nullopt;
+        if (IsDragIcon(*branch, attributes)) branch = UnderDragIcons(x, y);
+    }
+    if (!branch || g_x_error) return std::nullopt;
+    DragHit hit;
+    for (int depth = 0; *branch != None; ++depth) {
+        if (depth == 64) return std::nullopt;
+        hit.path.push_back(*branch);
+        branch = PointChild(display_, *branch, x, y);
+        if (!branch) return std::nullopt;
+    }
+    const bool transit = phase == DragPhase::Transit && source.client != destination.client;
+    if (hit.path.empty()) hit.matches = transit;
+    else if (phase == DragPhase::Source) hit.matches = MatchDragEndpoint(hit, x, y, source, false);
+    else hit.matches = MatchDragEndpoint(hit, x, y, destination, transit) ||
+        (transit && MatchDragEndpoint(hit, x, y, source, true));
+    return hit;
+}
+
+bool StraightDragPointMatches(Display *display, unsigned long pid, Atom pid_atom, const WindowBinding &source,
+                              const WindowBinding &destination, DragHitTest &hit, int x, int y, DragPhase phase) {
+    if (!BoundClientViewable(display, pid, pid_atom, source.id) ||
+        !BoundClientViewable(display, pid, pid_atom, destination.id)) return false;
+    const auto wm = LoadEwmh(display);
+    const auto source_proof = RecheckGeometryProof(wm, pid, source);
+    const auto destination_proof = RecheckGeometryProof(wm, pid, destination);
+    if (!source_proof || !destination_proof) return false;
+    const auto point = hit.At(x, y, *source_proof, *destination_proof, phase);
+    return point && point->matches;
+}
+
+bool PointMatchesWindow(Display *display, int x, int y, unsigned long pid, Atom pid_atom,
+                        const std::optional<WindowBinding> &binding) {
+    return binding && WindowBindingMatches(display, pid, pid_atom, *binding, 0) &&
+        PointInClient(display, x, y, binding->id);
+}
+
+// Strip internal window binding options before the legacy command parsers.
 // All four bounds are required together; actual dispatch additionally needs id.
-bool ExtractInputAnchors(int *argc, char ***argv, std::vector<char *> *filtered,
-                          std::optional<WindowBinding> *binding, std::string_view *anchor_token) {
+bool ExtractWindowBinding(int *argc, char ***argv, std::vector<char *> *filtered,
+                          std::optional<WindowBinding> *binding, std::string_view prefix = "--",
+                          std::string_view *anchor_token = nullptr) {
     filtered->assign(*argv, *argv + std::min(*argc, 2));
     WindowBinding parsed; unsigned seen = 0;
     for (int i = 2; i < *argc; ++i) {
-        const std::string_view option((*argv)[i]);
-        if (option == "--anchor-token") {
+        std::string_view option((*argv)[i]);
+        if (anchor_token && option == "--anchor-token") {
             if (!anchor_token->empty() || ++i >= *argc) return false;
             *anchor_token = (*argv)[i];
             if (anchor_token->size() != 32 ||
@@ -1930,25 +2110,41 @@ bool ExtractInputAnchors(int *argc, char ***argv, std::vector<char *> *filtered,
             }
             continue;
         }
+        if (option.substr(0, prefix.size()) != prefix) {
+            filtered->push_back((*argv)[i]);
+            continue;
+        }
+        option.remove_prefix(prefix.size());
         unsigned bit = 0; int *destination = nullptr;
-        if (option == "--window-x") { bit = 1; destination = &parsed.bounds.x; }
-        if (option == "--window-y") { bit = 2; destination = &parsed.bounds.y; }
-        if (option == "--window-width") { bit = 4; destination = &parsed.bounds.width; }
-        if (option == "--window-height") { bit = 8; destination = &parsed.bounds.height; }
-        if (option == "--window-id") bit = 16;
+        if (option == "window-x") { bit = 1; destination = &parsed.bounds.x; }
+        if (option == "window-y") { bit = 2; destination = &parsed.bounds.y; }
+        if (option == "window-width") { bit = 4; destination = &parsed.bounds.width; }
+        if (option == "window-height") { bit = 8; destination = &parsed.bounds.height; }
+        if (option == "window-id") bit = 16;
+        if (option == "geometry-proof") bit = 32;
+        if (option == "window-proof") bit = 64;
         if (bit == 0) { filtered->push_back((*argv)[i]); continue; }
         if ((seen & bit) != 0 || ++i >= *argc) return false;
         seen |= bit;
         if (destination) {
             if (!ParseInt((*argv)[i], destination)) return false;
-        } else {
+        } else if (bit == 16) {
             const auto id = ParseUnsigned((*argv)[i]);
             if (!id.has_value() || *id == 0 || *id > 0xffffffffUL) return false;
             parsed.id = static_cast<Window>(*id);
+        } else if (bit == 32) {
+            if (std::string_view((*argv)[i]) != "1") return false;
+            parsed.request_proof = true;
+        } else {
+            const std::string_view proof((*argv)[i]);
+            if (proof.empty() || proof.size() > kMaxGeometryProofBytes) return false;
+            parsed.proof = proof;
         }
     }
     if (seen) {
-        if ((seen & 15) != 15 || parsed.bounds.width <= 0 || parsed.bounds.height <= 0) return false;
+        if ((seen & 15) != 15 || !ValidGeometry(parsed.bounds) ||
+            (parsed.request_proof && parsed.id != None) ||
+            (!parsed.proof.empty() && parsed.id == None)) return false;
         *binding = parsed;
     }
     *argc = static_cast<int>(filtered->size());
@@ -2006,6 +2202,9 @@ struct WindowArgs {
     std::uint64_t deadline_ns = 0;
     Geometry geometry;
     std::string action;
+    bool request_proof = false;
+    Window expected_window = None;
+    std::string proof;
 };
 
 std::optional<WindowArgs> ParseWindowArgs(int argc, char **argv, bool action) {
@@ -2013,11 +2212,13 @@ std::optional<WindowArgs> ParseWindowArgs(int argc, char **argv, bool action) {
                                              "deadline-monotonic-ns"};
     if (action) {
         allowed.push_back("action");
+        allowed.push_back("window-id");
+        allowed.push_back("window-proof");
+    } else {
+        allowed.push_back("geometry-proof");
     }
     const auto pairs = ParsePairs(argc, argv, allowed);
-    if (!pairs.has_value() || pairs->size() != allowed.size()) {
-        return std::nullopt;
-    }
+    if (!pairs) return std::nullopt;
     WindowArgs parsed;
     const auto pid = ParseUnsigned(Pair(*pairs, "expected-pid").value_or(""));
     const auto deadline = ParseUnsigned(Pair(*pairs, "deadline-monotonic-ns").value_or(""));
@@ -2027,16 +2228,32 @@ std::optional<WindowArgs> ParseWindowArgs(int argc, char **argv, bool action) {
         !ParseInt(Pair(*pairs, "y").value_or(""), &parsed.geometry.y) ||
         !ParseInt(Pair(*pairs, "width").value_or(""), &parsed.geometry.width) ||
         !ParseInt(Pair(*pairs, "height").value_or(""), &parsed.geometry.height) ||
-        parsed.geometry.width <= 0 || parsed.geometry.height <= 0) {
+        !ValidGeometry(parsed.geometry)) {
         return std::nullopt;
     }
     parsed.pid = pid.value();
     parsed.deadline_ns = deadline.value();
+    if (const auto proof = Pair(*pairs, "geometry-proof")) {
+        if (*proof != "1") return std::nullopt;
+        parsed.request_proof = true;
+    }
     if (action) {
         parsed.action = Pair(*pairs, "action").value_or("");
         if (parsed.action != "minimize" && parsed.action != "maximize" &&
             parsed.action != "restore" && parsed.action != "close" &&
             parsed.action != "activate") {
+            return std::nullopt;
+        }
+        if (const auto id = Pair(*pairs, "window-id")) {
+            const auto parsed_id = ParseUnsigned(*id);
+            if (!parsed_id || *parsed_id == 0 || *parsed_id > UINT32_MAX) return std::nullopt;
+            parsed.expected_window = static_cast<Window>(*parsed_id);
+        }
+        if (const auto proof = Pair(*pairs, "window-proof")) {
+            if (proof->empty() || proof->size() > kMaxGeometryProofBytes) return std::nullopt;
+            parsed.proof = *proof;
+        }
+        if ((parsed.expected_window != None) != !parsed.proof.empty()) {
             return std::nullopt;
         }
     }
@@ -2080,29 +2297,40 @@ int RunWindow(std::string_view command, int argc, char **argv) {
         return exit_code;
     }
     const Ewmh ewmh = LoadEwmh(display);
-    std::string problem;
-    const auto window = FindClientWindow(ewmh, static_cast<unsigned long>(args->pid),
-                                         args->geometry, &problem);
-    if (!window.has_value()) {
+    const auto pid = static_cast<unsigned long>(args->pid);
+    const auto resolve = [&] {
+        const bool anchored = args->expected_window != None;
+        auto result = ResolveWindow(LoadEwmh(display), pid, args->geometry, args->request_proof || anchored);
+        if (anchored && (result.client != args->expected_window ||
+            !result.proof || GeometryProofJson(*result.proof) != args->proof)) {
+            return WindowResolution{None, {}, "target_window_changed"};
+        }
+        return result;
+    };
+    const auto window = resolve();
+    if (window.client == None) {
         XCloseDisplay(display);
-        EmitError(problem, "target_preflight", false);
+        EmitError(window.problem, "target_preflight", false);
         return kExitTargetMismatch;
     }
-    const WindowState before = ReadWindowState(ewmh, window.value());
+    const WindowState before = ReadWindowState(ewmh, window.client);
     const bool maximize = Contains(ewmh.supported, ewmh.net_wm_state) &&
                           Contains(ewmh.supported, ewmh.max_vert) &&
                           Contains(ewmh.supported, ewmh.max_horz);
     const bool activate = Contains(ewmh.supported, ewmh.active);
     const bool close = Contains(ewmh.supported, ewmh.close);
     if (!action) {
-        std::cout << "{\"ok\":true,\"window\":" << window.value()
+        std::cout << "{\"ok\":true,\"window\":" << window.client
+                  << ",\"window_binding\":\"geometry\""
                   << ",\"ewmh\":" << (ewmh.present ? "true" : "false")
                   << ",\"supports\":{\"minimize\":" << (ewmh.present ? "true" : "false")
                   << ",\"maximize\":" << (maximize ? "true" : "false")
+                  << ",\"restore\":" << ((before.minimized ? activate : maximize) ? "true" : "false")
                   << ",\"activate\":" << (activate ? "true" : "false")
                   << ",\"close\":" << (close ? "true" : "false") << "}," << StateJson(before)
-                  << WindowTitleJson(display,window.value())
-                  << "}" << std::endl;
+                  << WindowTitleJson(display, window.client);
+        if (window.proof) std::cout << ",\"geometry_proof\":" << GeometryProofJson(*window.proof);
+        std::cout << "}" << std::endl;
         XCloseDisplay(display);
         return 0;
     }
@@ -2118,6 +2346,12 @@ int RunWindow(std::string_view command, int argc, char **argv) {
         EmitError("window_manager_unsupported", "target_preflight", false);
         return kExitUnavailable;
     }
+    const auto current = resolve();
+    if (!before.exists || current.client != window.client) {
+        XCloseDisplay(display);
+        EmitError("target_window_changed", "target_preflight", false);
+        return kExitTargetMismatch;
+    }
     if (DeadlineExpired(args->deadline_ns)) {
         XCloseDisplay(display);
         EmitError("deadline_exceeded", "pre_dispatch", false);
@@ -2125,7 +2359,7 @@ int RunWindow(std::string_view command, int argc, char **argv) {
     }
     std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
     g_x_error = false;
-    const Window target = window.value();
+    const Window target = window.client;
     bool restoring_minimized = false;
     if (name == "minimize") {
         XIconifyWindow(display, target, DefaultScreen(display));
@@ -2170,7 +2404,7 @@ int RunWindow(std::string_view command, int argc, char **argv) {
             const bool alive = XGetWindowAttributes(display, target, &attributes) && !g_x_error;
             reached = !alive || (attributes.map_state == IsUnmapped && !after.minimized);
         } else {
-            reached = after.active;
+            reached = after.active && !after.minimized;
         }
         if (reached || DeadlineExpired(args->deadline_ns) ||
             std::chrono::steady_clock::now() >= until) {
@@ -2184,6 +2418,7 @@ int RunWindow(std::string_view command, int argc, char **argv) {
         return kExitUnknownEffect;
     }
     std::cout << "{\"ok\":true,\"dispatch_started\":true,\"events\":1,\"window\":" << target
+              << ",\"window_binding\":\"geometry\""
               << ",\"action\":\"" << name << "\",\"reached\":" << (reached ? "true" : "false")
               << "," << StateJson(after) << "}" << std::endl;
     return 0;
@@ -2350,11 +2585,24 @@ int RunFocusInfo(int argc, char **argv, std::optional<WindowBinding> binding) {
         return exit_code;
     }
     const Atom pid_atom = XInternAtom(display, "_NET_WM_PID", True);
+    std::optional<WindowGeometryProof> proof;
     if (binding.has_value()) {
         const auto ewmh = LoadEwmh(display);
-        std::string problem;
-        const auto window = FindClientWindow(ewmh, static_cast<unsigned long>(pid), binding->bounds, &problem, false);
-        binding->id = window.value_or(None);
+        if (!binding->proof.empty()) {
+            proof = RecheckGeometryProof(ewmh, static_cast<unsigned long>(pid), *binding);
+            if (!proof) {
+                binding->id = None;
+            } else {
+                binding->bounds = proof->client_bounds;
+                binding->proof.clear();
+            }
+        } else if (binding->request_proof) {
+            proof = FindGeometryProof(ewmh, static_cast<unsigned long>(pid), binding->bounds);
+            binding->id = proof ? proof->client : None;
+            if (proof) binding->bounds = proof->client_bounds;
+        } else {
+            binding->id = ResolveWindow(ewmh, static_cast<unsigned long>(pid), binding->bounds, false).client;
+        }
     }
     const bool focused = pid_atom != None &&
                          FocusMatchesWindow(display, static_cast<unsigned long>(pid), pid_atom, binding);
@@ -2366,7 +2614,9 @@ int RunFocusInfo(int argc, char **argv, std::optional<WindowBinding> binding) {
     std::cout << "{\"ok\":true,\"focused\":" << (focused ? "true" : "false")
               << ",\"expected_pid\":" << pid
               << ",\"window_bound\":" << (binding.has_value() ? "true" : "false")
-              << ",\"window\":" << (binding.has_value() ? binding->id : None) << "}" << std::endl;
+              << ",\"window\":" << (binding.has_value() ? binding->id : None);
+    if (proof) std::cout << ",\"geometry_proof\":" << GeometryProofJson(*proof);
+    std::cout << "}" << std::endl;
     return 0;
 }
 
@@ -3060,22 +3310,30 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
         // This protocol handshake does not open a display or touch input state.
-        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys","anchored-drag-between","anchored-type-text","atomic-key-dispatch","text-event-barrier"]})"
+        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys","anchored-drag-between","anchored-type-text","atomic-key-dispatch","text-event-barrier","window-geometry-proof-v1","anchored-straight-drag"]})"
                   << std::endl;
         return 0;
     }
     std::optional<WindowBinding> binding;
+    std::optional<WindowBinding> destination_binding;
     std::vector<char *> filtered;
+    std::vector<char *> filtered_destination;
     std::string_view anchor_token;
-    if (!ExtractInputAnchors(&argc, &argv, &filtered, &binding, &anchor_token) ||
+    if ((command != "window-info" && command != "window-action" &&
+         !ExtractWindowBinding(&argc, &argv, &filtered, &binding, "--", &anchor_token)) ||
         (!anchor_token.empty() &&
          (!binding || (command != "type-text" && command != "key-chord" && command != "paste"))) ||
-        (binding.has_value() && command != "focus-info" && binding->id == None)) {
+        (binding.has_value() && command != "focus-info" && (binding->id == None || binding->request_proof))) {
         EmitError("invalid_window_binding", "arguments", false);
         return kExitInvalid;
     }
     if (binding.has_value() && command != "focus-info" && command != "type-text" &&
         command != "key-chord" && command != "paste" && command != "pointer-gesture" && command != "drag") {
+        EmitError("invalid_window_binding", "arguments", false);
+        return kExitInvalid;
+    }
+    if (command == "drag" &&
+        !ExtractWindowBinding(&argc, &argv, &filtered_destination, &destination_binding, "--destination-")) {
         EmitError("invalid_window_binding", "arguments", false);
         return kExitInvalid;
     }
@@ -3109,6 +3367,13 @@ int main(int argc, char **argv) {
         gesture = ParseGesture(command, argc, argv, &expected_pid, &deadline_ns);
         if (!gesture.has_value()) {
             EmitError("invalid_arguments", "arguments", false);
+            return kExitInvalid;
+        }
+        const bool needs_destination_proof = command == "drag" && gesture->path.empty() &&
+            binding && !binding->proof.empty();
+        if (needs_destination_proof != destination_binding.has_value() ||
+            (destination_binding && destination_binding->proof.empty())) {
+            EmitError("invalid_window_binding", "arguments", false);
             return kExitInvalid;
         }
     } else if (command == "type-text") {
@@ -3227,7 +3492,7 @@ int main(int argc, char **argv) {
     }
     if (gesture.has_value()) {
         return RunGesture(display, command, gesture.value(), expected_pid.value(),
-                          deadline_ns.value(), pid_atom, binding, *progress, anchor_token);
+                          deadline_ns.value(), pid_atom, binding, destination_binding, *progress, anchor_token);
     }
     if (command == "pointer-click") {
         if (!click_x.has_value() || !click_y.has_value() ||

@@ -41,6 +41,9 @@ int main(int argc, char **argv) {
         QTextStream(stdout) << QJsonDocument(result).toJson(QJsonDocument::Compact) << '\n';
         return 0;
     }
+    // Keep the GTK platform theme from registering an extra AT-SPI application.
+    QApplication::setDesktopSettingsAware(false);
+    qunsetenv("QT_QPA_PLATFORMTHEME");
     QApplication app(argc, argv);
     QAccessible::setActive(true);
     app.setApplicationName("AAD Scoped Capture Fixture");

@@ -2,58 +2,9 @@
 //! never receives an exemption from its original PID/window ownership checks.
 use super::*;
 use crate::atspi::cross_resource::CROSS_DRAG_SEGMENTS;
-use crate::atspi::{DragBetweenEndpoint, DragBetweenRequest, DragPathValidation};
+use crate::atspi::{DragBetweenRequest, DragPathValidation};
 
 impl LinuxBackend {
-    fn cross_window_id(
-        &self,
-        end: &DragBetweenEndpoint<'_>,
-        path: &Path,
-        deadline: Instant,
-        require_focus: bool,
-    ) -> Result<u64, AutomationError> {
-        self.check_cancelled(false)?;
-        if end.target.bus_name != end.window.native.bus_name
-            || self.process_id(&end.target.bus_name) != Some(end.process_id)
-        {
-            return Err(super::super::stale(
-                "drag endpoint window process is unproven",
-            ));
-        }
-        let mut args = vec![
-            "focus-info".into(),
-            "--expected-pid".into(),
-            end.process_id.to_string(),
-            "--deadline-monotonic-ns".into(),
-            monotonic_deadline_ns(deadline)?.to_string(),
-        ];
-        append_window_args(&mut args, end.window, None);
-        let output = self.run_helper(
-            path,
-            &args,
-            None,
-            deadline,
-            XTEST_OUTPUT_LIMIT,
-            XTEST_OUTPUT_LIMIT,
-        )?;
-        let proof = parse_one_json_object(&output.stdout, "cross-resource window")?;
-        let id = proof["window"]
-            .as_u64()
-            .filter(|v| *v > 0 && *v <= u32::MAX as u64);
-        if !output.status.success()
-            || proof["ok"] != true
-            || proof["window_bound"] != true
-            || proof["expected_pid"] != end.process_id
-            || id.is_none()
-            || (require_focus && proof["focused"] != true)
-        {
-            return Err(super::super::stale(
-                "drag endpoint window or modifier focus is unproven",
-            ));
-        }
-        Ok(id.expect("validated id"))
-    }
-
     pub(super) fn run_drag_between(
         &self,
         request: DragBetweenRequest<'_>,
@@ -69,13 +20,7 @@ impl LinuxBackend {
         } = request;
         self.check_cancelled(false)?;
         let support = self.probe_input(deadline)?;
-        for feature in [
-            "anchored-drag-between",
-            "cooperative-cancel",
-            "window-focus",
-        ] {
-            support.require(feature)?;
-        }
+        DragKind::Between.require(&support)?;
         if !modifiers.is_empty() {
             support.require("pointer-modifiers")?;
             support.require_keyboard_route()?;
@@ -83,9 +28,22 @@ impl LinuxBackend {
         if hold_ms.is_some() {
             support.require("bounded-hold")?;
         }
-        let source_id =
-            self.cross_window_id(&source, &support.path, deadline, !modifiers.is_empty())?;
-        let destination_id = self.cross_window_id(&destination, &support.path, deadline, false)?;
+        let source_binding = self.verify_window_with_helper(
+            source.target,
+            source.window,
+            source.process_id,
+            deadline,
+            &support.path,
+            !modifiers.is_empty(),
+        )?;
+        let destination_binding = self.verify_window_with_helper(
+            destination.target,
+            destination.window,
+            destination.process_id,
+            deadline,
+            &support.path,
+            false,
+        )?;
         let dx = (i64::from(destination.point.0) - i64::from(source.point.0)).abs();
         let dy = (i64::from(destination.point.1) - i64::from(source.point.1)).abs();
         if dx.max(dy) > 4096 {
@@ -104,16 +62,17 @@ impl LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        for (prefix, end, id) in [
-            ("source", &source, source_id),
-            ("destination", &destination, destination_id),
+        for (prefix, end, binding) in [
+            ("source", &source, source_binding),
+            ("destination", &destination, destination_binding),
         ] {
             let bounds = end.window.bounds;
             for (name, value) in [
                 ("pid", end.process_id.to_string()),
                 ("x", end.point.0.to_string()),
                 ("y", end.point.1.to_string()),
-                ("window-id", id.to_string()),
+                ("window-id", binding.client.to_string()),
+                ("window-proof", binding.input_proof().to_string()),
                 ("window-x", bounds.x.to_string()),
                 ("window-y", bounds.y.to_string()),
                 ("window-width", bounds.width.to_string()),

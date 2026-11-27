@@ -5,7 +5,7 @@ if (-not $BuildDirectory) {
 }
 New-Item -ItemType Directory -Force -Path $BuildDirectory | Out-Null
 $binary = Join-Path (Resolve-Path $BuildDirectory).Path 'x11-window-title-test'
-$flags = ((& pkg-config --cflags --libs x11 xtst) -split '\s+') | Where-Object { $_ }
+$flags = ((& pkg-config --cflags --libs x11 xtst xext) -split '\s+') | Where-Object { $_ }
 if ($LASTEXITCODE -ne 0) { throw 'X11 development packages unavailable' }
 & g++ -std=c++17 -O2 -Wall -Wextra -Werror (Join-Path $PSScriptRoot 'x11_window_title_test.cpp') -o $binary @flags
 if ($LASTEXITCODE -ne 0) { throw 'Window title test compilation failed' }

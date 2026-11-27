@@ -17,11 +17,22 @@ use std::{
 struct Tree {
     distinct: bool,
     after_first: Option<usize>,
+    legacy_x11_helper: bool,
+    incompatible_handshake: bool,
+    two_apps: bool,
+    context_sibling: bool,
     captures: AtomicUsize,
 }
 impl Tree {
     fn app() -> Map<String, Value> {
         json!({"bus_name":":1.42","name":"Fixture","process_id":4242})
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    fn other_app() -> Map<String, Value> {
+        json!({"bus_name":":1.43","name":"Other Fixture","process_id":4243})
             .as_object()
             .unwrap()
             .clone()
@@ -32,14 +43,33 @@ impl AtspiBackend for Tree {
         "fixture"
     }
     fn session_info(&self) -> Map<String, Value> {
-        Map::new()
+        if self.incompatible_handshake {
+            Map::from_iter([(
+                "input_helper".into(),
+                json!({"ready":false,"code":"DRIVER.HELPER_INCOMPATIBLE","message":"fixture rejected describe"}),
+            )])
+        } else if self.legacy_x11_helper {
+            Map::from_iter([(
+                "input_helper".into(),
+                json!({"ready":true,"protocol":1,"features":["type-text","window-focus","anchored-drag-between"]}),
+            )])
+        } else {
+            Map::new()
+        }
     }
     fn list_applications(&self, _: Instant) -> Result<Vec<Map<String, Value>>> {
-        Ok(vec![Self::app()])
+        let mut applications = vec![Self::app()];
+        if self.two_apps {
+            applications.push(Self::other_app());
+        }
+        Ok(applications)
+    }
+    fn retains_resource_observations(&self) -> bool {
+        self.two_apps
     }
     fn capture(
         &self,
-        _: &Map<String, Value>,
+        application: &Map<String, Value>,
         _: u32,
         _: usize,
         _: Instant,
@@ -50,6 +80,7 @@ impl AtspiBackend for Tree {
         } else {
             2
         };
+        let bus_name = application["bus_name"].as_str().unwrap();
         let nodes = (0..count)
             .map(|i| {
                 let path = if self.distinct && i == 1 {
@@ -59,7 +90,7 @@ impl AtspiBackend for Tree {
                 };
                 BackendNode {
                     native: NativeRef {
-                        bus_name: ":1.42".into(),
+                        bus_name: bus_name.into(),
                         object_path: path.into(),
                     },
                     parent_index: None,
@@ -71,18 +102,20 @@ impl AtspiBackend for Tree {
                     states: Default::default(),
                     bounds: None,
                     actions: vec![],
-                    provenance: json!({"bus_name":":1.42","object_path":path})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
+                    provenance: json!({"bus_name":bus_name,"object_path":path,
+                        "focus_context": self.context_sibling && i == 1})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
                 }
             })
             .collect();
         Ok(BackendSnapshot {
-            application: Self::app(),
+            application: application.clone(),
             nodes,
             truncated: false,
             truncation_reasons: vec![],
+            qt_x11_windows: None,
         })
     }
     fn focus(
@@ -198,5 +231,186 @@ fn session_wait_reobserves_native_ambiguity_until_unique_or_absent() {
         let result = session.execute(&Request::new(Some(session.id().into()), op));
         assert!(result.error.is_none(), "{result:?}");
         assert!(tree.captures.load(Ordering::SeqCst) >= 2);
+    }
+}
+
+#[test]
+fn explicit_x11_actions_report_missing_geometry_feature_before_capability_rejection() {
+    assert_x11_helper_rejection(false);
+}
+
+#[test]
+fn explicit_x11_actions_report_incompatible_handshake_before_capability_rejection() {
+    assert_x11_helper_rejection(true);
+}
+
+fn assert_x11_helper_rejection(incompatible_handshake: bool) {
+    let tree = Arc::new(Tree {
+        distinct: true,
+        legacy_x11_helper: true,
+        incompatible_handshake,
+        context_sibling: true,
+        ..Default::default()
+    });
+    let provider = Arc::new(AtspiProvider::new(tree.clone()).unwrap());
+    let session = Session::new(
+        vec![Arc::new(NativeBackend::new(provider, Flavor::Linux))],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    );
+    let call = |operation| session.execute(&Request::new(Some(session.id().into()), operation));
+    let targets = call(Operation::Targets { provider: None }).data.unwrap();
+    let observed = call(Operation::Observe {
+        resource_id: targets["resources"][0]["resource_id"]
+            .as_str()
+            .unwrap()
+            .into(),
+        max_nodes: 10,
+        view: Default::default(),
+    })
+    .data
+    .unwrap();
+    let node = &observed["nodes"][0];
+    assert!(!node["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|name| name == "type_text"));
+    for (action, code) in [
+        (
+            json!({"type":"type_text","text":"seed"}),
+            "DRIVER.HELPER_INCOMPATIBLE",
+        ),
+        (json!({"type":"close_window"}), "DRIVER.HELPER_INCOMPATIBLE"),
+        (
+            json!({"type":"drag","to":node["target"]}),
+            "DRIVER.HELPER_INCOMPATIBLE",
+        ),
+        (
+            json!({"type":"click"}),
+            if incompatible_handshake {
+                "DRIVER.HELPER_INCOMPATIBLE"
+            } else {
+                "CONTROL.ACTION_UNSUPPORTED"
+            },
+        ),
+        (
+            json!({"type":"fill","value":"seed"}),
+            "CONTROL.ACTION_UNSUPPORTED",
+        ),
+    ] {
+        let straight_drag = action["type"] == "drag";
+        let op =
+            serde_json::from_value(json!({"method":"act","target":node["target"],"action":action}))
+                .unwrap();
+        let response = call(op);
+        assert_eq!(response.effect, "not_applied");
+        let failure = response.error.unwrap();
+        assert_eq!(failure["code"], code);
+        if incompatible_handshake && code == "DRIVER.HELPER_INCOMPATIBLE" {
+            assert_eq!(failure["message"], "fixture rejected describe");
+        } else if straight_drag {
+            assert_eq!(
+                failure["message"],
+                "Linux XTest helper is missing window-geometry-proof-v1. Upgrade aad and its helper together."
+            );
+        }
+    }
+    let context = &observed["nodes"][1];
+    assert_eq!(context["provenance"]["scope_context"], true);
+    for (target, action) in [
+        (&context["target"], json!({"type":"close_window"})),
+        (
+            &node["target"],
+            json!({"type":"drag","to":context["target"],"modifiers":["shift"]}),
+        ),
+    ] {
+        let op = serde_json::from_value(json!({"method":"act","target":target,"action":action}))
+            .unwrap();
+        let response = call(op);
+        assert_eq!(response.effect, "not_applied");
+        assert_eq!(response.error.unwrap()["code"], "CONTROL.STALE_TARGET");
+    }
+    assert_eq!(tree.captures.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn legacy_x11_helper_retains_both_drag_observations_for_authorization() {
+    for allow_input in [true, false] {
+        let tree = Arc::new(Tree {
+            distinct: true,
+            legacy_x11_helper: true,
+            two_apps: true,
+            context_sibling: true,
+            ..Default::default()
+        });
+        let provider = Arc::new(AtspiProvider::new(tree.clone()).unwrap());
+        let session = Session::new(
+            vec![Arc::new(NativeBackend::new(provider, Flavor::Linux))],
+            Policy {
+                allow_input,
+                ..Default::default()
+            },
+        );
+        let call = |op| session.execute(&Request::new(Some(session.id().into()), op));
+        let caps = call(Operation::Capabilities {}).data.unwrap();
+        assert_eq!(caps["providers"][0]["cross_resource_drag"], false);
+        assert_eq!(caps["providers"][0]["max_retained_observations"], 16);
+        let targets = call(Operation::Targets { provider: None }).data.unwrap();
+        let observe = |index: usize| {
+            call(Operation::Observe {
+                resource_id: targets["resources"][index]["resource_id"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                max_nodes: 10,
+                view: Default::default(),
+            })
+            .data
+            .unwrap()
+        };
+        let source = observe(0);
+        let destination = observe(1);
+        let drag = |source: &Value, destination: &Value, code: &str| {
+            let op = serde_json::from_value(json!({
+                "method":"act", "target":source["target"],
+                "action":{"type":"drag","to":destination["target"]}
+            }))
+            .unwrap();
+            let response = call(op);
+            assert_eq!(response.effect, "not_applied");
+            assert_eq!(response.error.unwrap()["code"], code);
+        };
+        if allow_input {
+            drag(
+                &source["nodes"][0],
+                &destination["nodes"][0],
+                "DRIVER.HELPER_INCOMPATIBLE",
+            );
+            drag(
+                &destination["nodes"][0],
+                &source["nodes"][0],
+                "DRIVER.HELPER_INCOMPATIBLE",
+            );
+            drag(
+                &source["nodes"][0],
+                &destination["nodes"][1],
+                "CONTROL.STALE_TARGET",
+            );
+            drag(
+                &source["nodes"][1],
+                &destination["nodes"][0],
+                "CONTROL.STALE_TARGET",
+            );
+        } else {
+            drag(
+                &source["nodes"][0],
+                &destination["nodes"][0],
+                "POLICY.DENIED",
+            );
+        }
+        assert_eq!(tree.captures.load(Ordering::SeqCst), 2);
     }
 }

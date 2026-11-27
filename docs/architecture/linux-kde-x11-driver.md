@@ -1,7 +1,7 @@
 # Linux KDE/X11 AT-SPI Rust 驱动
 
-> 当前实现：`crates/aad-linux`。已在本机 KDE/X11 验证下述应用流程；X11 helper 不再按
-> 桌面品牌拒绝，但 GNOME/XFCE 真机仍待验收。不能外推为 Wayland、XWayland 或所有 toolkit。
+> 当前实现位于 `crates/aad-linux`。本机 KDE/X11 的历史验收证据截至 `1733e58c`。
+> `window-geometry-proof-v1` 的验收环境和待验项见[平台能力验收矩阵](../testing/platform-capability-matrix.md)。
 
 ## 能力与实现
 
@@ -35,8 +35,11 @@ null 子引用会被过滤，深度、节点预算和真实读取失败仍产生
 
 Qt AT-SPI 可能返回逻辑坐标，XTest 和根窗口截图需要物理像素。`597656c` 对每个窗口分别
 校准，保留原始 AT-SPI bounds，并在观察中标记 `coordinate_space: screen_physical`。
-匹配要求同用户的实际进程、完整应用顶层窗口清单、准确标题及双向唯一性；缩小 scope
-不会缩小身份匹配清单。只接受 X11 会话和有界、近似均匀的比例；元素边缘向内取整，
+匹配要求同用户的实际进程、完整应用顶层窗口清单、准确标题及双向唯一性。每次捕获用本次采集的
+顶层 AT-SPI 和 X11 客户区几何建立候选清单。目标需要双向唯一的 client。其他顶层窗口的
+候选即使彼此难以区分，只要都有可读的几何且都与目标的证明无关，目标就能绑定。
+最小化窗口用其可证实的客户区几何参与排歧。合成输入坐标映射仅使用可见的 X11 client。
+公开节点和操作授权仍限定在请求的 scope。只接受 X11 会话和有界、近似均匀的比例；元素边缘向内取整，
 AT-SPI 命中查询将物理落点逆变换回相应窗口的逻辑坐标。
 
 KDE 的 `_NET_WM_NAME` 可含应用后缀，故同时允许准确 `WM_NAME`。STRING 按 ISO-8859-1、
@@ -74,15 +77,23 @@ selection 协议访问（见下文）。观察前通过无输入的 `describe` �
 明确发生在派发前的拒绝保留 `not_applied`；首次输入/指针事件后的不确定失败按 `DRIVER.UNKNOWN_EFFECT` 处理；
 成功仍须 fresh snapshot 验证。截图不会自动触发 OCR。
 
-锚定的键盘输入要求 helper 同时声明 `focus-info`、`window-focus` 和 `atomic-key-dispatch`。后端从同一 fresh snapshot 的结构父链取得顶层
-窗口，在派发前复核 AT-SPI bounds，并由 helper 找到同 PID、几何匹配的唯一 X11 client。
-`type_text`、`key_chord`、`paste` 和带修饰键的指针动作向 helper 传入内部窗口绑定；实际焦点
-必须属于该 client 或其子窗口。另一个同 PID 窗口、窗口移动或失焦都不能沿用原证明。
-这项证明使用精确窗口几何。Unicode 和 keys 模式按字符抓取 X 服务器，在同一段内复核焦点并提交按下和释放。
+锚定键盘输入要求 helper 声明 `focus-info`、`window-focus`、`atomic-key-dispatch` 和
+`window-geometry-proof-v1`。Linux 观察按结构父链
+记录顶层窗口。helper 将 AT-SPI 顶层范围与同 PID 的 X11 客户区和可信窗口管理器外框比较，
+在两类候选的并集中确认唯一 client。初次比较要求宽高相等，原点各轴最多相差 2 px。外框必须
+是 EWMH 窗口管理器实际拥有的客户窗口祖先，每边最多外扩 64 px。`_NET_FRAME_EXTENTS` 存在时
+须与实际外扩一致。Qt 坐标校准继续使用客户区。
+
+观察私有保存 client、实测客户区和外框链。键盘、粘贴、带修饰键的指针动作、直线与分段拖拽和
+跨资源拖拽在派发时传回证明。helper 重读并逐字段核实，窗口移动、父框替换、外扩变化或候选
+歧义都会拒绝旧证明。键盘焦点仍须位于 client 或其子窗口。指针命中仍按元素与 scope 检查，
+同窗路径以客户窗口为界。持键或拖拽过程中继续复核，条件失效时释放本动作已经按下的键钮。
+旧请求继续按客户区匹配。旧 helper 不提供依赖证明的合成动作，普通 AT-SPI 语义调用及原纯指针
+入口仍可用。
+
+Unicode 和 keys 模式按字符抓取 X 服务器，在同一段内复核焦点并提交按下和释放。
 组合键及指针修饰键每次按下都在抓取内复核和提交。Ctrl+V 在同一段内提交，剪贴板服务在段外进行。
 持键等待、字符间隔和临时键表恢复都在抓取外。失焦时停在下一次按下前，仍会释放本动作已按下的键。
-旧 helper 不提供相应键盘动作，普通 AT-SPI 语义调用及其已声明的纯指针功能仍可用。
-窗口绑定只确认 X11 client 及其子窗口，同窗控件焦点仍由 toolkit 管理。
 
 XTest 回执的 `input_progress` 包含 `unit`、`delivered`、`total`、`proven_window` 和 `released`。
 单位为字符、物理键、组合键、粘贴快捷键或按钮按下。`delivered` 记录已确认提交的笔数，控件实际内容仍以 fresh snapshot 为准。
@@ -129,7 +140,8 @@ space/enter 选择候选，不能把 `submitted` 当成候选已确认。
 私有 Xvfb 另验证已有键位、Caps、缺字拒绝、错误窗口、外部持键、取消与焦点/状态/键位变化。
 其他方案、候选翻页和复杂组合 **[待真机验收]**。
 
-非空 `drag.path` 还要求 `anchored-drag-path`，最多 32 个同一观察、同一元素内的归一化中间锚点；
+非空 `drag.path` 要求 `drag`、`anchored-drag-path`、`window-geometry-proof-v1`、
+`window-focus` 与 `cooperative-cancel`，最多 32 个同一观察、同一元素内的归一化中间锚点；
 起点和终点比例必须显式给出。按下前逐点检查，每段前完整 fresh AT-SPI 复核原生身份、
 fingerprint、状态、原始 bounds 及前后点，释放前再查终点。窄 scope 另以最多 5000 节点、
 128 层读取所属完整窗口，只用于遮挡校验，截断则拒绝；该私有读取不扩大授权成员或发布为
@@ -139,20 +151,37 @@ fingerprint、状态、原始 bounds 及前后点，释放前再查终点。窄 
 helper 每段先发带请求唯一 nonce 和顺序号的验证请求，收到对应 ACK 后才移动，并独立复核
 X11 窗口/PID/几何/命中。Rust 只读 worker 不占主循环；AX 调用阻塞时取消和截止时间仍可
 触发 helper 释放，迟到结果不再 ACK。每个 backend 同时只保留一个此类 worker，尚未退出的
-只读请求会阻止新路径。空路径行为不变。
+只读请求会阻止新路径。
 
-兼容 helper 声明 `anchored-drag-between` 后，Linux provider 启用双观察 `drag_between`。
-控制层继续使用 `drag`，分别保留起终点的 snapshot/revision/locator、scope 授权与输入租约。
-provider 每个已解析应用仅保留最新观察，最多 16 份且 300 秒过期，输入尝试使整组失效；
-所有入口共用可取消、有期限的调用门禁，防止并行观察在输入期间重新发布有效目标。
+普通 X11 直线拖拽要求 helper 同时声明 `drag`、`anchored-straight-drag` 和 `window-geometry-proof-v1`，
+并携带起终点冻结的窗口几何证明。helper 在首次派发、按下、停留、每段移动和释放时复核两端的身份和几何，
+按当前阶段核对鼠标落点的顶层命中。同应用双窗之间的中间段可以经过根窗口空白和两端已证明的 WM 外框，
+按下和释放分别要求命中源和目标客户区。只检查源 X 客户端在按下后新建并映射的 override-redirect 临时窗。
+可跳过的窗口须有空输入形状，或标为 `_NET_WM_WINDOW_TYPE_DND` 并有同源的活跃 `XdndSelection`。
+helper 跳过这些图标后仍检查下方的真实遮挡。
+修饰键额外要求源窗口焦点。派发后发现端点失效会停止移动，
+释放本次按下的按钮，并返回 `DRIVER.POINT_NOT_PROVEN` 和 `unknown`。缺少能力时直线拖拽在输入前
+返回 `DRIVER.HELPER_INCOMPATIBLE`，需同时升级 aad 和 helper。
+
+在 X11 会话中，Linux provider 为每个已解析应用保留最新一份观察，合计最多 16 份，每份在
+300 秒后过期。输入尝试使整组观察失效。使用旧 helper 的 X11 会话也适用这套保留规则。
+Wayland 会话仅保留该 provider 的最新一份观察。所有入口共用可取消、有期限的调用门禁，
+防止并行观察在输入期间重新发布有效目标。
+
+X11 helper 同时声明 `anchored-drag-between`、`window-geometry-proof-v1`、`window-focus` 和
+`cooperative-cancel` 时，Linux provider
+额外启用双观察 `drag_between`。控制层继续使用 `drag`，分别保留起终点的
+snapshot/revision/locator、scope 授权与输入租约。
 双端 fresh 校验使用独立只读状态，仍通过 nonce/序号 ACK 与 helper 连接；源点 hover 后、
 按下前，以及每段移动和释放前均复核两端身份、指纹、bounds、窗口与命中。
 等待期间只读系统调用即使阻塞，helper 仍独立执行 deadline/cancel 与自有键鼠释放。
 
 跨资源拖拽不接受非空 `path`；内部直线最大轴距离为 4096 屏幕像素，分 12 次移动。
 每段逐像素检查所经窗口，仅允许两端 client、X 根、已核实同用户桌面和两端可信 WM frame。
+与同应用直线拖拽共用 X11 命中检查，穿过源 X 客户端在本次按下后新建并映射的已核实拖拽图标，
+继续检查图标下方的窗口。AT-SPI 复核两端窗口内的覆盖分支，顶层窗口的叠放顺序由 X11 检查。
 frame 必须为端点的真实祖先、与 WM check 窗口属于同一 X 客户端，且每侧外扩不超过 64 像素；
-未知装饰、外部应用、弹窗和 override-redirect 覆盖均保守拒绝。down/up 只能发生在端点 client。
+未知装饰、外部应用和其余 override-redirect 覆盖均保守拒绝。down/up 只能发生在端点 client。
 带修饰键时保持源窗口键盘焦点要求；不隐式切换到目标窗口。已有或等待期间新按下的外部键鼠不接管。
 
 ## 截图、OCR、窗口、粘贴、剪贴板与全局快捷键
@@ -164,7 +193,7 @@ frame 必须为端点的真实祖先、与 WM check 窗口属于同一 X 客户�
 | --- | --- | --- |
 | `capture` | 上述 X11 root XGetImage，按 fresh bounds 裁剪 | protected 子树、被别的窗口或子树外可见节点覆盖、非 showing 均拒绝；最小化窗口不可截 |
 | `read_text` | 会话对 capture 的 PNG 运行 `aad-ocr`（Tesseract，`prlimit` 资源限制）；BCP-47 映射为 traineddata（en→eng、zh-Hans→chi_sim 等） | 没有 tesseract 或 prlimit 时 `reads` 不列 `read_text`，调用返回 `DRIVER.OCR_UNAVAILABLE`；缺语言数据时同码并列出 `available_languages` |
-| 窗口动作 | 顶层窗口节点（应用节点的直接子节点：Qt 主窗口是 frame，裸 QWidget 窗口是 filler）。helper 找到该进程 `_NET_WM_PID` 且根坐标几何等于该节点 bounds 的唯一 client 窗口，向窗口管理器发 `WM_CHANGE_STATE`（XIconifyWindow）、`_NET_WM_STATE` 最大化/还原、`_NET_ACTIVE_WINDOW`、`_NET_CLOSE_WINDOW`，再（最多 3 秒）读回 `_NET_WM_STATE` / `WM_STATE` / `_NET_ACTIVE_WINDOW` / 窗口是否消失 | 只在有 EWMH 窗口管理器（`_NET_SUPPORTING_WM_CHECK`）时按当前状态提供；状态没达到返回 `DRIVER.UNKNOWN_EFFECT`；找不到唯一窗口 `DRIVER.STALE_SNAPSHOT` |
+| 窗口动作 | EWMH 窗口管理器按顶层观察中冻结的 client 与外框证明执行最小化、最大化、恢复、激活或关闭，最多 3 秒读回 `WM_STATE`、`_NET_WM_STATE`、`_NET_ACTIVE_WINDOW` 或窗口是否消失 | 最小化窗口在几何仍能唯一对应时可恢复。几何失配时隐藏窗口动作，证明失效时拒绝派发。状态没达到时返回 `DRIVER.UNKNOWN_EFFECT` |
 | `paste` | helper 先只读保存 CLIPBOARD 的现有格式（单项不超过一次请求、合计 ≤32 MiB）。控件焦点证明通过后，在同一次 X server grab 内复核窗口焦点和原 owner、用服务器时间戳接管 CLIPBOARD 并派发 Ctrl+V。只向目标焦点窗口所属的 X client 提供文字（核对 `_NET_WM_PID` 或 X resource-id 基址）。 | 原剪贴板有 owner 但无可保存的格式、接管前 owner 变更或接管未获确认、取不到服务器时间戳时，均在派发前报 `DRIVER.CLIPBOARD_BUSY`。`error.details.helper_code` 分别为 `clipboard_unreadable`、`clipboard_owner_changed`（接管未获确认为 `clipboard_busy`）、`clipboard_timestamp_unavailable`。内容超限报 `DRIVER.CLIPBOARD_TOO_LARGE`。目标未取数报 `DRIVER.PASTE_NOT_CONSUMED`，effect 为 unknown。protected 元素不提供该动作。 |
 | `clipboard_read` | 读 CLIPBOARD 的 UTF8_STRING（否则 STRING），有界 | 带 `x-kde-passwordManagerHint`（KDE / KeePassXC 的密码标记）时 `DRIVER.CLIPBOARD_PROTECTED`；INCR 大选区 `DRIVER.CLIPBOARD_TOO_LARGE` |
 | `global_key` | XTest 组合键发给当前焦点，不锚定元素 | 拒绝 Ctrl+Alt+Backspace（X zap）、Ctrl+Alt+Delete、Ctrl+Alt+L、Super+L（`DRIVER.KEY_RESERVED`）；结果 `verified: false` |
@@ -195,8 +224,8 @@ plugins/linux_atspi/build_x11_capture_helper.sh
 尚未开始观察前就已打开、且之后没有发焦点事件的编辑框不保证发现。
 本机 Dolphin 已完成 F2→发现编辑框→中文重命名→磁盘回读；虚拟 table 的不完整父链仍拒绝 scope。
 
-`tests/linux/verify-window-focus.ps1` 在本机运行两个同 PID Qt 窗口，刻意模拟过期的 AX Focused
-位与无效果的 focus 动作；错误窗口的操作被拒绝，两个实际事件计数均为零。正确聚焦或激活后，
+几何绑定改动前（证据截至 `1733e58c`），`verify-window-focus.ps1` 在本机运行两个同 PID Qt 窗口，
+刻意模拟过期的 AX Focused 位与无效果的 focus 动作。错误窗口的操作被拒绝，两个实际事件计数均为零。正确聚焦或激活后，
 对应窗口独立回报一次按下、一次释放。`verify-x11-window-focus.ps1` 在私有 Xvfb 复现旧
 PID-only 判定的缺口，并验证新窗口绑定、子窗口焦点、长按途中同 PID 焦点切换和窗口移动后的释放。
 
@@ -242,17 +271,31 @@ foreach ($attempt in 1..3) {
 不能把私有三格式案例当成 Code 的实际请求序列。Code 原生指针命中仍需单独解决。
 
 `verify-x11-drag-path.ps1` 的私有 Xvfb 十项检查回读真实轨迹与键鼠释放；
-`verify-native-drag-path.ps1` 的本机 Qt 七项检查包含窄 surface scope 外的 sibling overlay，
-实际事件确认正向路径三次移动、坏锚点零 down、几何变化/遮挡/取消后 up。
+`verify-native-drag-path.ps1` 的本机 Qt 七项检查来自几何绑定改动前（证据截至 `1733e58c`）。
+窄 surface scope 外的 sibling overlay 也在覆盖范围内。实际事件确认正向路径三次移动、坏锚点零 down，
+几何变化、遮挡或取消后收到 up。
 小 fixture 的两中间点整窗口路径约 734 ms，窄 scope 加窗口复核约 1114 ms；取消后的 up
 约 3 ms，窄 scope 遮挡后的 up 约 189 ms。这些是本次测试耗时，不能外推复杂应用或 32 点性能。
 
-`verify-x11-cross-drag.ps1` 私有 Xvfb 15 项通过，独立双 PID 窗口回读 12 次持键移动，
+`verify-x11-cross-drag.ps1` 私有 Xvfb 17 项通过，独立双 PID 窗口回读 12 次持键移动，
 验证可信/伪造 frame、单像素外部窗口、悬停覆盖、期限/取消、几何改变与外部持键保护。
-`verify-native-cross-drag.ps1` 本机 Qt 四项通过：两个独立进程实际传递精确 MIME 数据，
-目标可见标签变化；取消后 45 ms、窗口变化后 77 ms 内返回并已释放，悬停覆盖零 button-down。
+`verify-native-cross-drag.ps1` 的本机 Qt 四项通过来自几何绑定改动前（证据截至 `1733e58c`）。
+两个独立进程实际传递精确 MIME 数据并改变目标可见标签。取消后 45 ms、窗口变化后 77 ms 内返回并已释放，
+悬停覆盖零 button-down。
 成功动作约 4840 ms；两端每阶段 fresh 带来的成本不能用私有 Xvfb 协议耗时代替。
-真实 Qt 用无装饰窗口；Xvfb 的可信 frame 是模拟 WM，其他 WM 装饰及文件管理器完整任务仍待验收。
+
+`window-geometry-proof-v1` 已在私有 Xvfb、D-Bus 和 bspwm 0.9.10 下复验。Qt 5.15.8 使用
+无边框浮动窗口，按键、激活与两类拖拽的 helper 证明中 `frames` 为空。焦点拒绝与按放事件、
+同窗逐段轨迹、双进程 MIME 与目标标签、1/1.5/2 倍点击和 F2 文本及 PNG 尺寸均通过。
+缩放的歧义和非 X11 拒绝以及局部截图 scope 的覆盖与保护检查也通过。
+这些 Qt 夹具禁用桌面平台主题，避免 Qt 在 XFCE 下加载 GTK3 主题并为同一进程注册一个没有控件的
+GTK AT-SPI 应用。各脚本的命令见[可以复现的本机检查](../testing/platform-capability-matrix.md#可以复现的本机检查)。
+
+私有 Xvfb、独立 D-Bus、GTK 3.24.38 和 xfwm4 4.18 实测中，带装饰和无装饰窗口的已观察
+文本框点击均命中控件。布局键及默认 Unicode 各组 3/3，GTK 按键、逐字变化和 AT-SPI 最终值
+一致。带装饰的直线拖放使用默认或自定义拖拽图标时均完成 12 段和一次放置，同进程双窗间也能通过
+源窗的标题栏。曲线拖放移开图标热点后，带装饰和无装饰各 5/5，每次 12 段和一次放置。
+显式曲线路径遇到遮挡客户窗口命中的默认图标、带装饰的 Qt、其他 WM 及文件管理器完整任务 **[待验证]**。
 
 取消由每次调用显式传入的 `CancellationToken` 贯穿到 Linux backend。调用副本共享当前观察、
 焦点订阅与录制状态，取消 token 不写回共享 backend；下一次调用不会继承取消状态。

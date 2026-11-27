@@ -39,12 +39,13 @@ int main() {
         const Window destination=destination_windows[0],trusted_frame=destination_windows[1];
         const Window fake_frame=XCreateSimpleWindow(display,root,15,15,210,210,0,0,0);
         const std::string nonce="0123456789abcdef0123456789abcdef";
-        for(const std::string mode:{"success","framed","fake_frame","override","foreign","desktop_forged","wrong_pid","hover_overlay","cancel","deadline","geometry","mid_overlay","preheld","late_preheld","late_button"}) {
+        for(const std::string mode:{"success","framed","proved_frame","proved_frame_change","fake_frame","override","foreign","desktop_forged","wrong_pid","hover_overlay","cancel","deadline","geometry","mid_overlay","preheld","late_preheld","late_button"}) {
+            const bool with_proof = mode == "proved_frame" || mode == "proved_frame_change";
             XReparentWindow(display,source,root,20,20);XMoveWindow(display,destination,500,20);
             XUnmapWindow(display,trusted_frame);XUnmapWindow(display,fake_frame);
             XDeleteProperty(display,root,check);XDeleteProperty(display,root,clients);
             Window obstacle=None;
-            if(mode=="framed"||mode=="fake_frame"||mode=="override") {
+            if(mode=="framed"||mode=="fake_frame"||mode=="override"||with_proof) {
                 const Window frame=mode=="fake_frame"?fake_frame:trusted_frame;
                 XChangeProperty(display,root,check,XA_WINDOW,32,PropModeReplace,reinterpret_cast<const unsigned char *>(&destination),1);
                 XChangeProperty(display,destination,check,XA_WINDOW,32,PropModeReplace,reinterpret_cast<const unsigned char *>(&destination),1);
@@ -71,9 +72,18 @@ int main() {
             std::vector<std::string> args={"helper","drag-between","--source-pid",std::to_string(source_pid),
                 "--destination-pid",std::to_string(mode=="wrong_pid"?2147483647L:destination_owner.pid),
                 "--source-x","70","--source-y","90","--destination-x","570","--destination-y","90",
-                "--source-window-id",std::to_string(source),"--source-window-x","20","--source-window-y","20","--source-window-width","200","--source-window-height","200",
+                "--source-window-id",std::to_string(source),"--source-window-x",with_proof?"15":"20","--source-window-y",with_proof?"15":"20",
+                "--source-window-width",with_proof?"210":"200","--source-window-height",with_proof?"210":"200",
                 "--destination-window-id",std::to_string(destination),"--destination-window-x","500","--destination-window-y","20","--destination-window-width","200","--destination-window-height","200",
                 "--button","1","--modifiers","ctrl","--path-token",nonce,"--deadline-monotonic-ns",std::to_string(until)};
+            if (with_proof) {
+                const Ewmh wm = LoadEwmh(display);
+                const auto start = FindGeometryProof(wm, source_pid, {15,15,210,210});
+                const auto end = FindGeometryProof(wm, destination_owner.pid, {500,20,200,200});
+                CrossRequire(start && end, "two endpoint proofs missing");
+                args.insert(args.end(), {"--source-window-proof", GeometryProofJson(*start),
+                                         "--destination-window-proof", GeometryProofJson(*end)});
+            }
             int input[2],output[2];CrossRequire(pipe(input)==0&&pipe(output)==0,"helper pipes failed");
             const pid_t worker=fork();CrossRequire(worker>=0,"helper fork failed");
             if(worker==0){close(ConnectionNumber(display));close(input[1]);dup2(input[0],0);close(input[0]);close(output[0]);dup2(output[1],1);close(output[1]);
@@ -97,6 +107,9 @@ int main() {
                     if(index==3&&mode=="cancel"){kill(worker,SIGTERM);continue;}
                     if(index==3&&mode=="deadline")continue;
                     if(index==3&&mode=="geometry"){XMoveWindow(display,destination,510,20);XSync(display,False);continue;}
+                    if(index==3&&mode=="proved_frame_change"){
+                        XResizeWindow(display,trusted_frame,211,210);XSync(display,False);
+                    }
                     if(index==6&&mode=="mid_overlay"){obstacle=XCreateSimpleWindow(display,root,250,20,4,200,0,0,0);XMapRaised(display,obstacle);XSync(display,False);}
                     const auto ack="ack "+nonce+" "+std::to_string(index)+"\n";
                     CrossRequire(write(input[1],ack.data(),ack.size())==static_cast<ssize_t>(ack.size()),"ACK failed");}
@@ -104,16 +117,17 @@ int main() {
                 if(std::chrono::steady_clock::now()-started>std::chrono::seconds(5)){kill(worker,SIGKILL);waitpid(worker,&status,0);throw std::runtime_error("helper cleanup timed out");}usleep(1000);}
             events();close(input[1]);close(output[0]);if(obstacle!=None)XDestroyWindow(display,obstacle);
             CrossRequire(WIFEXITED(status),"helper did not stop cooperatively");
-            if(mode=="success"||mode=="framed"){
+            if(mode=="success"||mode=="framed"||mode=="proved_frame"){
                 if(WEXITSTATUS(status)!=0)std::cerr<<transcript<<'\n';
                 CrossRequire(WEXITSTATUS(status)==0&&down==1&&up==1&&trace.size()==12&&validations==16,"cross drag event counts differ");
                 for(int i=1;i<=12;++i)CrossRequire(trace[static_cast<std::size_t>(i-1)]==std::pair<int,int>{70+500*i/12,90},"actual cross route differs");
             }else if(mode=="preheld"||mode=="late_preheld"||mode=="late_button"){
                 CrossRequire(up==0&&keys_down==(mode=="late_button"?1U:0U)&&validations==(mode=="preheld"?0U:mode=="late_preheld"?2U:3U),"external held input was released");XTestFakeButtonEvent(display,1,False,0);XSync(display,False);
-            }else if(mode=="cancel"||mode=="deadline"||mode=="geometry"||mode=="mid_overlay"){
+            }else if(mode=="cancel"||mode=="deadline"||mode=="geometry"||mode=="mid_overlay"||mode=="proved_frame_change"){
                 CrossRequire(down==1&&up==1&&trace.size()<12,"interrupted cross route left held input or continued");
             }else CrossRequire(down==0&&keys_down==0&&trace.empty(),"untrusted route dispatched input");
             CrossRequire(keys_down==keys_up,"modifier was not released");char held[32]{};XQueryKeymap(display,held);for(char key:held)CrossRequire(key==0,"modifier remains held");
+            if (mode=="proved_frame_change") XResizeWindow(display,trusted_frame,210,210);
             Window r=None,c=None;int rx=0,ry=0,wx=0,wy=0;unsigned mask=0;CrossRequire(XQueryPointer(display,root,&r,&c,&rx,&ry,&wx,&wy,&mask)&&!(mask&Button1Mask),"button remains held");
             std::cout<<"PASS "<<mode<<" down="<<down<<" up="<<up<<" moves="<<trace.size()<<" validations="<<validations<<'\n';
         }
