@@ -103,7 +103,8 @@ space/enter 选择候选，不能把 `submitted` 当成候选已确认。
 私有 Xvfb 另验证已有键位、Caps、缺字拒绝、错误窗口、外部持键、取消与焦点/状态/键位变化。
 其他方案、候选翻页和复杂组合 **[待真机验收]**。
 
-非空 `drag.path` 还要求 `anchored-drag-path`，最多 32 个同一观察、同一元素内的归一化中间锚点；
+非空 `drag.path` 要求 `drag`、`anchored-drag-path`、`window-geometry-proof-v1`、
+`window-focus` 与 `cooperative-cancel`，最多 32 个同一观察、同一元素内的归一化中间锚点；
 起点和终点比例必须显式给出。按下前逐点检查，每段前完整 fresh AT-SPI 复核原生身份、
 fingerprint、状态、原始 bounds 及前后点，释放前再查终点。窄 scope 另以最多 5000 节点、
 128 层读取所属完整窗口，只用于遮挡校验，截断则拒绝；该私有读取不扩大授权成员或发布为
@@ -115,7 +116,7 @@ X11 窗口/PID/几何/命中。Rust 只读 worker 不占主循环；AX 调用阻
 触发 helper 释放，迟到结果不再 ACK。每个 backend 同时只保留一个此类 worker，尚未退出的
 只读请求会阻止新路径。
 
-普通 X11 直线拖拽要求 helper 同时声明 `anchored-straight-drag` 和 `window-geometry-proof-v1`，
+普通 X11 直线拖拽要求 helper 同时声明 `drag`、`anchored-straight-drag` 和 `window-geometry-proof-v1`，
 并携带起终点冻结的窗口几何证明。helper 在首次派发、按下、停留、每段移动和释放时复核两端的身份和几何，
 按当前阶段核对鼠标落点的顶层命中。同应用双窗之间的中间段可以经过根窗口空白和两端已证明的 WM 外框，
 按下和释放分别要求命中源和目标客户区。只检查源 X 客户端在按下后新建并映射的 override-redirect 临时窗。
@@ -130,7 +131,8 @@ helper 跳过这些图标后仍检查下方的真实遮挡。
 Wayland 会话仅保留该 provider 的最新一份观察。所有入口共用可取消、有期限的调用门禁，
 防止并行观察在输入期间重新发布有效目标。
 
-X11 helper 同时声明 `anchored-drag-between` 和 `window-geometry-proof-v1` 时，Linux provider
+X11 helper 同时声明 `anchored-drag-between`、`window-geometry-proof-v1`、`window-focus` 和
+`cooperative-cancel` 时，Linux provider
 额外启用双观察 `drag_between`。控制层继续使用 `drag`，分别保留起终点的
 snapshot/revision/locator、scope 授权与输入租约。
 双端 fresh 校验使用独立只读状态，仍通过 nonce/序号 ACK 与 helper 连接；源点 hover 后、

@@ -20,14 +20,7 @@ impl LinuxBackend {
         } = request;
         self.check_cancelled(false)?;
         let support = self.probe_input(deadline)?;
-        for feature in [
-            "anchored-drag-between",
-            "cooperative-cancel",
-            "window-focus",
-            GEOMETRY_FEATURE,
-        ] {
-            support.require(feature)?;
-        }
+        DragKind::Between.require(&support)?;
         if !modifiers.is_empty() {
             support.require("pointer-modifiers")?;
         }

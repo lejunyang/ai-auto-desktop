@@ -34,15 +34,7 @@ impl LinuxBackend {
             ));
         }
         let support = self.probe_input(deadline)?;
-        for feature in [
-            "drag",
-            "anchored-drag-path",
-            "cooperative-cancel",
-            "window-focus",
-            GEOMETRY_FEATURE,
-        ] {
-            support.require(feature)?;
-        }
+        DragKind::Path.require(&support)?;
         if !modifiers.is_empty() {
             support.require("pointer-modifiers")?;
         }

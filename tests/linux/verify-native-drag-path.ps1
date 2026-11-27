@@ -1,5 +1,5 @@
 param([string]$Aad = '', [string]$InputHelper = '', [string]$BuildDirectory = '', [switch]$BuildOnly,
-      [switch]$StraightGeometryOnly, [switch]$ExpectIncompatibleStraightDrag)
+      [switch]$PathOnly, [switch]$StraightGeometryOnly, [switch]$ExpectIncompatibleStraightDrag)
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 if (-not $BuildDirectory) { $BuildDirectory = Join-Path ([IO.Path]::GetTempPath()) ('aad-qt-path-' + [guid]::NewGuid().ToString('N')) }
@@ -47,10 +47,10 @@ try {
     $info.EnvironmentVariables['AAD_LINUX_XTEST_HELPER']=(Resolve-Path $InputHelper).Path
     $script:server=[Diagnostics.Process]::Start($info)
     Call-Control @{method='capabilities'} | Out-Null
-    $cases = if ($StraightGeometryOnly -or $ExpectIncompatibleStraightDrag) { @('geometry-straight') } else {
-        @('invalid','success','success-scoped','geometry','overlay','overlay-scoped','cancel','geometry-straight',
-          'overlay-straight','transparent-straight')
-    }
+    $pathCases = @('invalid','success','success-scoped','geometry','overlay','overlay-scoped','cancel')
+    $cases = if ($StraightGeometryOnly -or $ExpectIncompatibleStraightDrag) { @('geometry-straight') }
+             elseif ($PathOnly) { $pathCases }
+             else { $pathCases + @('geometry-straight','overlay-straight','transparent-straight') }
     foreach ($caseName in $cases) {
         $script:caseName = $caseName
         $mode = $caseName.Replace('-scoped','')

@@ -36,8 +36,6 @@ use focus_discovery::FocusDiscovery;
 mod window_focus;
 use window_focus::{append_window_args, GEOMETRY_FEATURE};
 
-const STRAIGHT_DRAG_FEATURE: &str = "anchored-straight-drag";
-
 const REGISTRY_NAME: &str = "org.a11y.atspi.Registry";
 const REGISTRY_PATH: &str = "/org/a11y/atspi/accessible/root";
 const DBUS_NAME: &str = "org.freedesktop.DBus";
@@ -530,7 +528,13 @@ impl LinuxBackend {
         if self.cancellation.is_some() {
             support.require("cooperative-cancel")?;
         }
-        support.require(args.first().map(String::as_str).unwrap_or(""))?;
+        let command = args.first().map(String::as_str).unwrap_or("");
+        let bound_drag = command == "drag";
+        if bound_drag {
+            DragKind::Straight.require(&support)?;
+        } else {
+            support.require(command)?;
+        }
         let modified = args.iter().any(|arg| arg == "--modifiers");
         if modified {
             support.require("pointer-modifiers")?;
@@ -538,18 +542,16 @@ impl LinuxBackend {
         if args.iter().any(|arg| arg == "--hold-ms") {
             support.require("bounded-hold")?;
         }
-        let keyboard = args.first().is_some_and(|command| command == "key-chord");
+        let keyboard = command == "key-chord";
         let requires_focus = keyboard || modified;
-        let bound_drag = args[0] == "drag";
         if requires_focus {
             support.require("focus-info")?;
             support.require("window-focus")?;
-        }
-        if bound_drag {
-            support.require(STRAIGHT_DRAG_FEATURE)?;
+            if !bound_drag {
+                support.require(GEOMETRY_FEATURE)?;
+            }
         }
         let bound = if requires_focus || bound_drag {
-            support.require(GEOMETRY_FEATURE)?;
             let window = window.ok_or_else(|| {
                 driver_error(
                     "DRIVER.ACTION_UNSUPPORTED",
@@ -906,12 +908,7 @@ impl LinuxBackend {
                     actions.push(action.into());
                 }
             }
-            if input.is_some_and(|support| {
-                support.has(GEOMETRY_FEATURE)
-                    && ((support.has("drag") && support.has(STRAIGHT_DRAG_FEATURE))
-                        || support.has("anchored-drag-path")
-                        || support.has("anchored-drag-between"))
-            }) {
+            if input.is_some_and(InputSupport::has_drag) {
                 actions.push("drag".into());
             }
             if fully_interactive
@@ -1058,9 +1055,7 @@ impl AtspiBackend for LinuxBackend {
     }
     fn supports_cross_resource_drag(&self) -> bool {
         self.probe_input(Instant::now() + Duration::from_secs(1))
-            .is_ok_and(|support| {
-                support.has("anchored-drag-between") && support.has(GEOMETRY_FEATURE)
-            })
+            .is_ok_and(|support| DragKind::Between.available(&support))
     }
 
     fn retains_resource_observations(&self) -> bool {
@@ -1158,11 +1153,17 @@ impl AtspiBackend for LinuxBackend {
             _ => return Ok(()),
         };
         let support = self.probe_input(deadline)?;
-        support.require(feature)?;
         if action == "drag" {
-            support.require(STRAIGHT_DRAG_FEATURE)?;
-            support.require(GEOMETRY_FEATURE)?;
+            // The trait receives only the action name. Dispatch checks the selected mode.
+            return if support.has_drag() {
+                Ok(())
+            } else {
+                Err(incompatible_helper(
+                    "no anchored X11 drag mode is available",
+                ))
+            };
         }
+        support.require(feature)?;
         if super::WINDOW_ACTIONS.contains(&action) {
             support.require(GEOMETRY_FEATURE)?;
         }
@@ -2230,6 +2231,48 @@ impl LinuxBackend {
 
 const INPUT_HELPER_PROTOCOL: u64 = 1;
 
+#[derive(Clone, Copy)]
+enum DragKind {
+    Straight,
+    Path,
+    Between,
+}
+
+impl DragKind {
+    const ALL: [Self; 3] = [Self::Straight, Self::Path, Self::Between];
+
+    fn required_features(self) -> &'static [&'static str] {
+        match self {
+            Self::Straight => &["drag", "anchored-straight-drag", GEOMETRY_FEATURE],
+            Self::Path => &[
+                "drag",
+                "anchored-drag-path",
+                "cooperative-cancel",
+                "window-focus",
+                GEOMETRY_FEATURE,
+            ],
+            Self::Between => &[
+                "anchored-drag-between",
+                "cooperative-cancel",
+                "window-focus",
+                GEOMETRY_FEATURE,
+            ],
+        }
+    }
+
+    fn available(self, support: &InputSupport) -> bool {
+        self.required_features()
+            .iter()
+            .all(|feature| support.has(feature))
+    }
+
+    fn require(self, support: &InputSupport) -> Result<(), AutomationError> {
+        self.required_features()
+            .iter()
+            .try_for_each(|feature| support.require(feature))
+    }
+}
+
 /// Capabilities describe the binary, not the user's display. Live display,
 /// focus, UID and hit checks still run for every actual operation.
 struct InputSupport {
@@ -2238,6 +2281,10 @@ struct InputSupport {
 }
 
 impl InputSupport {
+    fn has_drag(&self) -> bool {
+        DragKind::ALL.into_iter().any(|kind| kind.available(self))
+    }
+
     fn has(&self, feature: &str) -> bool {
         self.features.contains(feature)
     }
@@ -3527,6 +3574,42 @@ mod capture_tests {
         assert_eq!(error.details["required_feature"], "bounded-hold");
         assert!(!support.has("focus-info"));
         assert!(!support.has("window-focus"));
+    }
+
+    #[test]
+    fn partial_helpers_advertise_only_drag_modes_they_can_dispatch() {
+        let mut support = InputSupport {
+            path: "/unused".into(),
+            features: ["cooperative-cancel", "window-focus", GEOMETRY_FEATURE]
+                .map(str::to_owned)
+                .into(),
+        };
+        assert!(!support.has_drag());
+
+        support.features.insert("drag".into());
+        support.features.insert("anchored-drag-path".into());
+        assert!(support.has_drag());
+        assert!(DragKind::Path.require(&support).is_ok());
+        assert_eq!(
+            DragKind::Straight.require(&support).unwrap_err().details["required_feature"],
+            "anchored-straight-drag"
+        );
+        assert!(!DragKind::Between.available(&support));
+
+        support.features.remove("drag");
+        support.features.remove("anchored-drag-path");
+        support.features.insert("anchored-drag-between".into());
+        assert!(support.has_drag());
+        assert!(DragKind::Between.require(&support).is_ok());
+        assert!(!DragKind::Path.available(&support));
+        assert!(!DragKind::Straight.available(&support));
+
+        support.features.remove("cooperative-cancel");
+        assert!(!support.has_drag());
+        assert_eq!(
+            DragKind::Between.require(&support).unwrap_err().details["required_feature"],
+            "cooperative-cancel"
+        );
     }
 
     #[test]
