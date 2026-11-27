@@ -665,6 +665,30 @@ pub struct Response {
     pub error: Option<Value>,
 }
 
+/// Where a `DRIVER.POINT_NOT_PROVEN` failure occurred relative to input dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointFailureStage {
+    BeforeDispatch,
+    AfterDispatch,
+}
+
+impl Response {
+    pub fn point_failure_stage(&self) -> Option<PointFailureStage> {
+        let error = self.error.as_ref()?;
+        if error["code"] != "DRIVER.POINT_NOT_PROVEN" {
+            return None;
+        }
+        match (
+            self.effect.as_str(),
+            error["details"]["dispatch_started"] == true,
+        ) {
+            ("not_applied", false) => Some(PointFailureStage::BeforeDispatch),
+            ("unknown", true) => Some(PointFailureStage::AfterDispatch),
+            _ => None,
+        }
+    }
+}
+
 /// Shared with mobile control. Native effect details remain in `effect` and
 /// the structured error; this coarse state must never enable unknown retries.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

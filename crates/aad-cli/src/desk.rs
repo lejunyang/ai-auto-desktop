@@ -5,7 +5,10 @@
 //! lives for one command, so `do` observes, finds and acts within that one
 //! process rather than taking a reference from an earlier `find`: a reference
 //! into a session that has exited would point at nothing.
-use aad_control::{Action, Expect, Locator, Operation, Policy, Request, Session, View, ViewMode};
+use aad_control::{
+    Action, Expect, Locator, Operation, PointFailureStage, Policy, Request, Response, Session,
+    View, ViewMode,
+};
 use clap::{Args, Subcommand};
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
@@ -305,17 +308,7 @@ impl Desk {
     fn call(&self, operation: Operation) -> Outcome {
         let mut request = Request::new(Some(self.session.id().to_string()), operation);
         request.timeout_ms = TIMEOUT_MS;
-        let response = self.session.execute(&request);
-        match (response.data, response.error) {
-            (Some(data), _) => Ok(data),
-            (None, error) => {
-                let mut error = error.unwrap_or_else(|| json!({"code": "CONTROL.UNKNOWN"}));
-                if let Some(hint) = error["code"].as_str().and_then(hint) {
-                    error["hint"] = json!(hint);
-                }
-                Err((json!({"status": "error", "error": error}), EXIT_FAILED))
-            }
-        }
+        control_outcome(self.session.execute(&request))
     }
 
     fn targets(&self) -> Outcome {
@@ -396,6 +389,34 @@ impl Desk {
     }
 }
 
+fn control_outcome(response: Response) -> Outcome {
+    let point_failure_stage = response.point_failure_stage();
+    match (response.data, response.error) {
+        (Some(data), _) => Ok(data),
+        (None, error) => {
+            let mut error = error.unwrap_or_else(|| json!({"code": "CONTROL.UNKNOWN"}));
+            let guidance = match point_failure_stage {
+                Some(PointFailureStage::BeforeDispatch) => Some(
+                    "The center-point hit could not be confirmed inside the target; no input was sent. \
+Run `aad describe` again and narrow the locator to a specific leaf, or scroll and retry. \
+Use a keyboard action only if the target offers it.",
+                ),
+                Some(PointFailureStage::AfterDispatch) => Some(
+                    "The drag stopped after input dispatch started because an endpoint could no \
+longer be confirmed. Check details.input_progress.delivered and details.input_progress.released \
+when present. Run `aad describe` to observe the drag source and target again and verify the \
+result before deciding whether to retry.",
+                ),
+                None => error["code"].as_str().and_then(hint),
+            };
+            if let Some(guidance) = guidance {
+                error["hint"] = json!(guidance);
+            }
+            Err((json!({"status": "error", "error": error}), EXIT_FAILED))
+        }
+    }
+}
+
 /// What the CLI user can do about a failure, in this command line's terms.
 fn hint(code: &str) -> Option<&'static str> {
     Some(match code {
@@ -420,11 +441,6 @@ each command takes a new observation."
         "CONTROL.NOT_FOUND" | "DRIVER.NOT_FOUND" => {
             "Nothing matched. `aad describe` shows what is there; `aad find --optional` asks \
 whether something is gone."
-        }
-        "DRIVER.POINT_NOT_PROVEN" => {
-            "The center-point hit could not be confirmed inside the target; no input was sent. \
-Run `aad describe` again and narrow the locator to a specific leaf, or scroll and retry. \
-Use a keyboard action only if the target offers it."
         }
         "CONTROL.ACTION_UNSUPPORTED" | "DRIVER.ACTION_UNSUPPORTED" => {
             "The element does not offer that action; `aad find` lists its capabilities."
@@ -1164,7 +1180,30 @@ mod tests {
             }
         }
         assert!(hint("CONTROL.TARGET_UNKNOWN").unwrap().contains("aad apps"));
-        let point = hint("DRIVER.POINT_NOT_PROVEN").unwrap();
+        assert!(hint("CONTROL.SOMETHING_ELSE").is_none());
+    }
+
+    #[test]
+    fn point_not_proven_reply_matches_dispatch_stage() {
+        let code = "DRIVER.POINT_NOT_PROVEN";
+        let response = Response {
+            protocol_version: aad_control::PROTOCOL_VERSION.into(),
+            request_id: "r".into(),
+            session_id: "s".into(),
+            effect: "not_applied".into(),
+            commit_state: aad_control::CommitState::NotCommitted,
+            data: None,
+            error: Some(json!({"code": code, "effect": "not_applied", "details": {
+                "dispatch_started": false,
+            }})),
+        };
+        let (reply, exit) = finish(control_outcome(response.clone()));
+        assert_eq!(exit, EXIT_FAILED);
+        assert_eq!(reply["status"], "error");
+        assert_eq!(reply["error"]["code"], code);
+        assert_eq!(reply["error"]["effect"], "not_applied");
+        assert_eq!(reply["error"]["details"]["dispatch_started"], false);
+        let guidance = reply["error"]["hint"].as_str().unwrap();
         for way in [
             "no input was sent",
             "aad describe",
@@ -1172,8 +1211,37 @@ mod tests {
             "scroll",
             "keyboard",
         ] {
-            assert!(point.contains(way), "{way}");
+            assert!(guidance.contains(way), "{way}");
         }
-        assert!(hint("CONTROL.SOMETHING_ELSE").is_none());
+
+        let progress = json!({"unit": "button", "delivered": 1, "total": 1, "released": true});
+        let (reply, exit) = finish(control_outcome(Response {
+            effect: "unknown".into(),
+            commit_state: aad_control::CommitState::Unknown,
+            error: Some(json!({"code": code, "effect": "unknown", "details": {
+                "dispatch_started": true,
+                "input_progress": progress,
+            }})),
+            ..response
+        }));
+        assert_eq!(exit, EXIT_FAILED);
+        assert_eq!(reply["status"], "error");
+        assert_eq!(reply["error"]["code"], code);
+        assert_eq!(reply["error"]["effect"], "unknown");
+        assert_eq!(reply["error"]["details"]["dispatch_started"], true);
+        assert_eq!(reply["error"]["details"]["input_progress"], progress);
+        let guidance = reply["error"]["hint"].as_str().unwrap();
+        for way in [
+            "input dispatch started",
+            "details.input_progress.delivered",
+            "details.input_progress.released",
+            "aad describe",
+            "drag source and target",
+            "verify the result before deciding whether to retry",
+        ] {
+            assert!(guidance.contains(way), "{way}");
+        }
+        assert!(!guidance.contains("no input was sent"));
+        assert!(!guidance.contains("scroll and retry"));
     }
 }

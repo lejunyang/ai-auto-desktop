@@ -9,6 +9,7 @@ parser.add_argument('--helper', required=True)
 parser.add_argument('--code', required=True)
 parser.add_argument('--node', required=True)
 parser.add_argument('--output', required=True)
+parser.add_argument('--expected-clipboard-text')
 args=parser.parse_args()
 common=types.SimpleNamespace(OUT=pathlib.Path(args.output).resolve())
 common.OUT.mkdir(parents=True, exist_ok=True)
@@ -48,8 +49,18 @@ class ControlClient:
             self.log.close()
 common.Client=ControlClient
 profile=common.OUT/('profile-'+uuid.uuid4().hex);settings=profile/'User/settings.json';settings.parent.mkdir(parents=True,exist_ok=True)
-settings.write_text(json.dumps({'window.restoreWindows':'none','workbench.startupEditor':'none','editor.accessibilitySupport':'on','workbench.enableExperiments':False,'telemetry.telemetryLevel':'off','update.mode':'none'}))
-fixture=common.OUT/'aad-electron-native-effect.txt';fixture.write_text('Initial isolated Electron verification\n')
+settings.write_text(json.dumps({
+    'window.restoreWindows': 'none',
+    'workbench.startupEditor': 'none',
+    'workbench.welcome.enabled': False,
+    'chat.disableAIFeatures': True,
+    'editor.accessibilitySupport': 'on',
+    'workbench.enableExperiments': False,
+    'telemetry.telemetryLevel': 'off',
+    'update.mode': 'none',
+}))
+initial_text = 'Initial isolated Electron verification\n'
+fixture=common.OUT/'aad-electron-native-effect.txt';fixture.write_text(initial_text)
 sock=socket.socket();sock.bind(('127.0.0.1',0));port=sock.getsockname()[1];sock.close()
 p=subprocess.Popen([args.code,'--user-data-dir',str(profile),'--extensions-dir',str(common.OUT/'extensions'),'--disable-extensions','--force-renderer-accessibility','--new-window',f'--remote-debugging-port={port}',str(fixture)],stdout=open(common.OUT/'code-stdout.log','w'),stderr=open(common.OUT/'code-stderr.log','w'))
 c=None;rows=[];ws=None;sequence=0;browser_ws=None;passed=False
@@ -77,6 +88,14 @@ def diagnostic(label):
     rec('independent_'+label,state=value)
     if label in ('paste','save'):
         assert expected.strip() in '\n'.join(value['lines']).replace('\u00a0',' '), 'displayed editor content differs from requested paste'
+def clipboard_readback(label):
+    if args.expected_clipboard_text is None:
+        return
+    probe = subprocess.run(['xclip', '-selection', 'clipboard', '-target', 'UTF8_STRING', '-out'],
+                           capture_output=True, timeout=5, check=False)
+    matches = probe.returncode == 0 and probe.stdout == args.expected_clipboard_text.encode('utf-8')
+    rec('clipboard_readback', after=label, matches=matches, exit_code=probe.returncode)
+    assert matches, f'clipboard differs from expected value after {label}'
 try:
     class Client(common.Client):
         def call(self,method,**kw):
@@ -98,6 +117,15 @@ try:
     page=next(t for t in pages if t['type']=='page' and 'workbench' in t['url'])
     ws=page['webSocketDebuggerUrl']
     with urllib.request.urlopen(f'http://127.0.0.1:{port}/json/version', timeout=5) as response:browser_ws=json.load(response)['webSocketDebuggerUrl']
+    # Chromium replaces accessibility objects while the workbench is loading.
+    # Wait for the rendered fixture before using AT-SPI to resolve input targets.
+    rendered = ('document.querySelector(".view-lines")?.innerText.replaceAll("\\u00a0", " ").includes('
+                + json.dumps(initial_text.strip()) + ') ?? false')
+    ready_until = time.monotonic() + 40
+    while not cdp('Runtime.evaluate', {'expression': rendered, 'returnByValue': True})['result'].get('value'):
+        assert time.monotonic() < ready_until, 'Code did not render the fixture'
+        time.sleep(.25)
+    rec('startup_editor_rendered')
     ready_until=time.monotonic()+40
     while True:
         response=c.call('observe',resource_id=rid,max_nodes=2000,view={'mode':'nodes'})
@@ -136,9 +164,12 @@ try:
         now=c.observe(rid,mode='nodes',scope_id=scopeid);assert not now['truncated']
         return next(n for n in now['nodes'] if n['provenance']['object_path']==editorpath)
     expected='AAD Electron 原生编辑与剪贴板验收 2026-11-07\n'
+    clipboard_readback('startup')
     for label,action in [('focus',{'type':'focus'}),('select_all',{'type':'key','keys':['ctrl','a']}),('refocus_after_select',{'type':'focus'}),('paste',{'type':'paste','text':expected}),('save',{'type':'key','keys':['ctrl','s']})]:
         rec(label,result=c.data('act',target=fresh()['target'],action=action))
         time.sleep(.15);diagnostic(label)
+        if label in ('paste', 'save'):
+            clipboard_readback(label)
     for _ in range(30):
         actual=fixture.read_text()
         if actual==expected:break

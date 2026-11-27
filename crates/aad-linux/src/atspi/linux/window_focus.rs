@@ -1,31 +1,489 @@
-//! Bind keyboard delivery to a freshly observed top-level window, not just PID.
+//! Bind X11 input to the exact client and frame geometry from observation.
 use super::*;
 
-pub(super) fn append_window_args(args: &mut Vec<String>, window: &WindowAnchor, id: Option<u64>) {
-    let bounds = window.bounds;
-    args.extend([
-        "--window-x".into(),
-        bounds.x.to_string(),
-        "--window-y".into(),
-        bounds.y.to_string(),
-        "--window-width".into(),
-        bounds.width.to_string(),
-        "--window-height".into(),
-        bounds.height.to_string(),
-    ]);
-    if let Some(id) = id {
-        args.extend(["--window-id".into(), id.to_string()]);
+pub(super) const GEOMETRY_FEATURE: &str = "window-geometry-proof-v1";
+
+impl WindowAnchor {
+    pub(super) fn input_binding(&self) -> Result<&X11WindowBinding, AutomationError> {
+        self.x11.as_ref().ok_or_else(|| {
+            driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "observation has no proven X11 window",
+            )
+        })
     }
 }
 
+pub(super) fn append_window_args(
+    args: &mut Vec<String>,
+    prefix: &str,
+    window: &WindowAnchor,
+    binding: Option<&X11WindowBinding>,
+) {
+    let bounds = window.bounds;
+    args.extend([
+        format!("{prefix}x"),
+        bounds.x.to_string(),
+        format!("{prefix}y"),
+        bounds.y.to_string(),
+        format!("{prefix}width"),
+        bounds.width.to_string(),
+        format!("{prefix}height"),
+        bounds.height.to_string(),
+    ]);
+    if let Some(binding) = binding {
+        append_window_proof_args(args, prefix, binding);
+    }
+}
+
+pub(super) fn append_window_proof_args(
+    args: &mut Vec<String>,
+    prefix: &str,
+    binding: &X11WindowBinding,
+) {
+    args.extend([
+        format!("{prefix}id"),
+        binding.client.to_string(),
+        format!("{prefix}proof"),
+        binding.input_proof().to_string(),
+    ]);
+}
+
+pub(super) struct AnchoredKeyboard<'a> {
+    pub path: &'a Path,
+    pub args: Vec<String>,
+    pub payload: Option<&'a [u8]>,
+    pub strokes: usize,
+    pub target: &'a NativeRef,
+    pub process_id: u32,
+    pub deadline: Instant,
+    pub phase: &'a str,
+    pub minimum_events: u64,
+}
+
+const ANCHOR_POLL: Duration = Duration::from_millis(1);
+
+fn focus_ready(states: atspi::StateSet) -> bool {
+    [State::Focused, State::Enabled, State::Sensitive]
+        .into_iter()
+        .all(|state| states.contains(state))
+}
+
+fn keyboard_anchor_error(mut error: AutomationError) -> AutomationError {
+    if error.code == "DRIVER.FOCUS_LOST" {
+        if error.details.get("helper_code").and_then(Value::as_str) == Some("focus_owner_changed") {
+            error.message = "keyboard focus moved outside the observed X11 window".into();
+            error.details.remove("cause");
+        }
+        if error.effect == "unknown" {
+            error.code = "DRIVER.UNKNOWN_EFFECT".into();
+        }
+    }
+    if error.effect == "unknown" {
+        error.retryable = false;
+        if error.code == "DRIVER.TIMEOUT" {
+            error.details.insert("phase".into(), json!("post_dispatch"));
+        }
+    }
+    error
+}
+
 impl LinuxBackend {
-    // Observation-time visibility recovery has no normalized Record yet.
-    // This path requires a real same-application native Parent chain.
+    pub(super) fn prepare_anchored_keyboard(
+        &self,
+        feature: &str,
+        target: &NativeRef,
+        window: Option<&WindowAnchor>,
+        process_id: u32,
+        deadline: Instant,
+        args: &mut Vec<String>,
+    ) -> Result<(PathBuf, Value), AutomationError> {
+        self.check_cancelled(false)?;
+        let support = self.probe_input(deadline)?;
+        support.require_anchored_keyboard(feature)?;
+        if self.cancellation.is_some() {
+            support.require("cooperative-cancel")?;
+        }
+        if args.iter().any(|arg| arg == "--hold-ms") {
+            support.require("bounded-hold")?;
+        }
+        let window = window.ok_or_else(|| {
+            driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "input requires an observed top-level window",
+            )
+        })?;
+        window.input_binding()?;
+        let focus = self.focus(target, Some(window), deadline)?;
+        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
+        // Prove native window focus here. The first handshake rechecks the
+        // element before authorizing any stroke.
+        let binding = self
+            .verify_window_with_helper(target, window, process_id, deadline, &support.path, true)
+            .map_err(|error| {
+                if error.code == "DRIVER.FOCUS_LOST" {
+                    error
+                } else {
+                    after_focus(error)
+                }
+            })?;
+        append_window_args(args, "--window-", window, Some(binding));
+        Ok((support.path, focus))
+    }
+
+    pub(super) fn run_anchored_keyboard(
+        &self,
+        request: AnchoredKeyboard<'_>,
+    ) -> Result<Value, AutomationError> {
+        let AnchoredKeyboard {
+            path,
+            mut args,
+            payload,
+            strokes,
+            target,
+            process_id,
+            deadline,
+            phase,
+            minimum_events,
+        } = request;
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        args.extend([
+            "--anchor-token".into(),
+            nonce.clone(),
+            "--deadline-monotonic-ns".into(),
+            monotonic_deadline_ns(deadline)?.to_string(),
+        ]);
+        let validate = |_| self.verify_keyboard_anchor(target, process_id, deadline);
+        // Clipboard handoff is allowed to finish on its own two-second
+        // deadline, even if the request was cancelled or timed out.
+        let cleanup_grace = if args[0] == "paste" {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_millis(500)
+        };
+        let output = anchored_helper::run(anchored_helper::Request {
+            path,
+            args: &args,
+            nonce: &nonce,
+            payload,
+            handshakes: strokes,
+            poll: ANCHOR_POLL,
+            cleanup_grace,
+            deadline,
+            token: self.cancellation.as_ref(),
+            validation: anchored_helper::Validation::Inline(&validate),
+        })
+        .map_err(keyboard_anchor_error)?;
+        if !output.status.success()
+            && helper_error_code(&output.stdout).as_deref() == Some("deadline_exceeded")
+        {
+            let dispatched = helper_dispatched(&output.stdout);
+            return Err(with_helper_receipt(
+                super::super::timeout_error(dispatched)
+                    .with_detail("dispatch_started", json!(dispatched)),
+                &output.stdout,
+            ));
+        }
+        parse_input_helper(output, phase, minimum_events, process_id)
+    }
+
+    async fn input_states(&self, target: &NativeRef) -> Result<atspi::StateSet, AutomationError> {
+        self.accessible_async(target)
+            .await?
+            .get_state()
+            .await
+            .map_err(|error| native_failure("Accessible.GetState", target, error))
+    }
+
+    fn verify_keyboard_anchor(
+        &self,
+        target: &NativeRef,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<(), AutomationError> {
+        let proof = async {
+            if self.process_id_async(&target.bus_name).await != Some(process_id) {
+                return Err(super::super::stale(
+                    "observed accessibility process changed",
+                ));
+            }
+            // GetState is a method call on the observed bus and object path.
+            // There is no properties cache or tree capture in this proof.
+            let states = self.input_states(target).await.map_err(|_| {
+                super::super::stale("observed accessibility element could not be rechecked")
+            })?;
+            if states.contains(State::Defunct) {
+                return Err(super::super::stale(
+                    "observed accessibility element was removed",
+                ));
+            }
+            if !focus_ready(states) {
+                return Err(driver_error(
+                    "DRIVER.FOCUS_LOST",
+                    "the observed control lost keyboard focus",
+                )
+                .with_detail("cause", json!("focused_element_changed")));
+            }
+            Ok(())
+        };
+        // The bus connection's method timeout may be longer than the time
+        // left for this request. Keep both deadline and cancellation bounded.
+        let interrupted = async {
+            loop {
+                self.check_cancelled(false)?;
+                let left = remaining(deadline, false)?;
+                let delay = if self.cancellation.is_some() {
+                    left.min(ANCHOR_POLL)
+                } else {
+                    left
+                };
+                async_io::Timer::after(delay).await;
+            }
+        };
+        zbus::block_on(futures_lite::future::race(proof, interrupted))
+    }
+}
+
+fn matches_bounds(value: &Value, observed: Bounds) -> bool {
+    super::super::parse_bounds(Some(value)).is_ok_and(|actual| {
+        actual.width == observed.width
+            && actual.height == observed.height
+            && actual.x.abs_diff(observed.x) <= 2
+            && actual.y.abs_diff(observed.y) <= 2
+    })
+}
+
+fn proof_payload(proof: &Value, client: u32, process_id: u32, bounds: Bounds) -> Option<Value> {
+    (proof["version"] == 1
+        && proof["expected_pid"] == process_id
+        && proof["client"] == client
+        && proof["observed_bounds"] == bounds.to_json())
+    .then(|| proof.clone())
+}
+
+fn reply_client(value: &Value) -> Option<u32> {
+    u32::try_from(value.as_u64()?).ok().filter(|id| *id > 0)
+}
+
+fn valid_focus_proof(proof: &Map<String, Value>, process_id: u32) -> Option<(u32, bool)> {
+    if proof.get("ok") != Some(&Value::Bool(true))
+        || proof.get("expected_pid").and_then(Value::as_u64) != Some(u64::from(process_id))
+        || proof.get("window_bound") != Some(&Value::Bool(true))
+        || proof.contains_key("dispatch_started")
+    {
+        return None;
+    }
+    let client = reply_client(proof.get("window")?)?;
+    let focused = proof.get("focused")?.as_bool()?;
+    Some((client, focused))
+}
+
+impl X11WindowBinding {
+    pub(super) fn input_proof(&self) -> &Value {
+        &self.proof
+    }
+
+    fn matches(&self, observed: Bounds) -> bool {
+        matches_bounds(&self.proof["client_bounds"], observed)
+            || self.proof["frames"].as_array().is_some_and(|frames| {
+                frames
+                    .iter()
+                    .any(|f| matches_bounds(&f["bounds"], observed))
+            })
+    }
+}
+
+fn add_window_actions(node: &mut BackendNode, info: &Value, binding: &X11WindowBinding) {
+    let supports = |name: &str| info["supports"][name] == true;
+    let minimized = info["minimized"] == true;
+    let maximized = info["maximized"] == true;
+    let active = info["active"] == true;
+    let actions = [
+        ("minimize", !minimized && supports("minimize")),
+        ("maximize", !minimized && !maximized && supports("maximize")),
+        ("restore", (minimized || maximized) && supports("restore")),
+        ("close_window", supports("close")),
+        ("activate", !active && supports("activate")),
+    ];
+    node.actions.extend(
+        actions
+            .into_iter()
+            .filter(|(_, allowed)| *allowed)
+            .map(|(action, _)| action.to_string()),
+    );
+    node.provenance.insert(
+        "window".into(),
+        json!({
+            "x11_window": binding.client,
+            "window_binding": "geometry",
+            "minimized": minimized,
+            "maximized": maximized,
+            "active": active,
+        }),
+    );
+}
+
+impl LinuxBackend {
+    pub(super) fn window_bounds(
+        &self,
+        native: &NativeRef,
+        deadline: Instant,
+    ) -> Result<Bounds, AutomationError> {
+        remaining(deadline, false)?;
+        let (x, y, width, height) =
+            zbus::block_on(self.component_proxy(native)?.get_extents(CoordType::Screen))
+                .map_err(|error| native_failure("window bounds", native, error))?;
+        Ok(Bounds {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    fn direct_window_bounds(
+        &self,
+        app: &NativeRef,
+        nodes: &[BackendNode],
+        deadline: Instant,
+    ) -> Result<Vec<(NativeRef, Bounds)>, AutomationError> {
+        self.direct_windows(app, deadline)?
+            .into_iter()
+            .map(|native| {
+                let bounds = nodes
+                    .iter()
+                    .find(|node| node.parent_index == Some(0) && node.native == native)
+                    .and_then(|node| node.bounds)
+                    .map_or_else(|| self.window_bounds(&native, deadline), Ok)?;
+                Ok((native, bounds))
+            })
+            .collect()
+    }
+
+    fn window_proof(
+        &self,
+        window: &WindowAnchor,
+        process_id: u32,
+        path: &Path,
+        deadline: Instant,
+    ) -> Result<(X11WindowBinding, bool), AutomationError> {
+        let mut args = vec![
+            "focus-info".into(),
+            "--expected-pid".into(),
+            process_id.to_string(),
+            "--deadline-monotonic-ns".into(),
+            monotonic_deadline_ns(deadline)?.to_string(),
+        ];
+        append_window_args(&mut args, "--window-", window, window.x11.as_ref());
+        if window.x11.is_none() {
+            args.extend(["--geometry-proof".into(), "1".into()]);
+        }
+        let output = self.run_helper(
+            path,
+            &args,
+            None,
+            deadline,
+            XTEST_OUTPUT_LIMIT,
+            XTEST_OUTPUT_LIMIT,
+        )?;
+        let response = parse_one_json_object(&output.stdout, "window geometry proof")?;
+        let invalid_proof = || {
+            driver_error(
+                "DRIVER.ACTION_UNSUPPORTED",
+                "native window identity or geometry is not proven",
+            )
+        };
+        let (client, focused) = valid_focus_proof(&response, process_id)
+            .filter(|_| output.status.success())
+            .ok_or_else(invalid_proof)?;
+        let proof = response
+            .get("geometry_proof")
+            .and_then(|proof| proof_payload(proof, client, process_id, window.bounds))
+            .ok_or_else(invalid_proof)?;
+        let binding = X11WindowBinding { client, proof };
+        if window
+            .x11
+            .as_ref()
+            .is_some_and(|expected| expected != &binding)
+        {
+            return Err(super::super::stale("native window proof changed"));
+        }
+        Ok((binding, focused))
+    }
+
+    pub(super) fn capture_x11_window_bindings(
+        &self,
+        snapshot: &mut BackendSnapshot,
+        deadline: Instant,
+    ) -> BTreeMap<usize, X11WindowBinding> {
+        let Some(app) = snapshot.nodes.first() else {
+            return BTreeMap::new();
+        };
+        let Some(process_id) = snapshot
+            .application
+            .get("process_id")
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+        else {
+            return BTreeMap::new();
+        };
+        let Ok(support) = self.probe_input(deadline) else {
+            return BTreeMap::new();
+        };
+        if !support.has(GEOMETRY_FEATURE) || !support.has("window-info") {
+            return BTreeMap::new();
+        }
+        let native_windows = if snapshot.qt_x11_windows.is_none() {
+            let Ok(windows) = self.direct_window_bounds(&app.native, &snapshot.nodes, deadline)
+            else {
+                return BTreeMap::new();
+            };
+            windows
+        } else {
+            Vec::new()
+        };
+        snapshot
+            .nodes
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, node)| node.parent_index == Some(0))
+            .filter_map(|(index, node)| {
+                let bounds = node.bounds.filter(|b| b.width > 0 && b.height > 0)?;
+                let info = self.window_info(process_id, bounds, &support.path, deadline, true)?;
+                let client = reply_client(&info["window"])?;
+                if info["window_binding"] != "geometry" {
+                    return None;
+                }
+                let proof = proof_payload(&info["geometry_proof"], client, process_id, bounds)?;
+                let binding = X11WindowBinding { client, proof };
+                let unique = if let Some(windows) = &snapshot.qt_x11_windows {
+                    qt_binding_matches(windows, &node.native, bounds, &binding)
+                } else {
+                    unique_native_bounds(&native_windows, &node.native, &binding)
+                };
+                if !unique {
+                    return None;
+                }
+                let unproven =
+                    node.provenance.get("coordinate_space") == Some(&json!("unproven_toolkit"));
+                if unproven && info["minimized"] != true {
+                    return None;
+                }
+                if support.has("window-action") && info["ewmh"] == true {
+                    add_window_actions(node, &info, &binding);
+                }
+                Some((index, binding))
+            })
+            .collect()
+    }
+
+    // Visibility recovery uses the raw ancestry and bounds to select the
+    // matching entry from the current calibration inventory.
     fn native_window(
         &self,
         target: &NativeRef,
         deadline: Instant,
-    ) -> Result<WindowAnchor, AutomationError> {
+    ) -> Result<(NativeRef, WindowAnchor), AutomationError> {
         let mut current = target.clone();
         let mut visited = BTreeSet::new();
         for _ in 0..super::super::MAX_DEPTH {
@@ -38,27 +496,17 @@ impl LinuxBackend {
             };
             let role = zbus::block_on(self.accessible(&parent)?.get_role())
                 .map_err(|error| native_failure("window role", &parent, error))?;
-            if role == atspi::Role::Application {
-                let (x, y, width, height) = zbus::block_on(
-                    self.component_proxy(&current)?
-                        .get_extents(CoordType::Screen),
-                )
-                .map_err(|error| native_failure("window bounds", &current, error))?;
-                if width > 0 && height > 0 {
-                    let bounds = self.physical_window_bounds(
-                        &current,
-                        Bounds {
-                            x,
-                            y,
-                            width,
-                            height,
+            if role == atspi::Role::Application && parent.bus_name == target.bus_name {
+                let bounds = self.window_bounds(&current, deadline)?;
+                if bounds.width > 0 && bounds.height > 0 {
+                    return Ok((
+                        parent,
+                        WindowAnchor {
+                            native: current,
+                            bounds,
+                            x11: None,
                         },
-                        deadline,
-                    )?;
-                    return Ok(WindowAnchor {
-                        native: current,
-                        bounds,
-                    });
+                    ));
                 }
                 break;
             }
@@ -70,14 +518,15 @@ impl LinuxBackend {
         ))
     }
 
-    pub(super) fn verify_window_with_helper(
+    pub(super) fn verify_window_with_helper<'a>(
         &self,
         target: &NativeRef,
-        window: &WindowAnchor,
+        window: &'a WindowAnchor,
         process_id: u32,
         deadline: Instant,
         path: &Path,
-    ) -> Result<u64, AutomationError> {
+        require_focus: bool,
+    ) -> Result<&'a X11WindowBinding, AutomationError> {
         remaining(deadline, false)?;
         if window.native.bus_name != target.bus_name
             || self.process_id(&target.bus_name) != Some(process_id)
@@ -87,48 +536,22 @@ impl LinuxBackend {
                 "target window process differs from observed target",
             ));
         }
-        let (x, y, width, height) = zbus::block_on(
-            self.component_proxy(&window.native)?
-                .get_extents(CoordType::Screen),
-        )
-        .map_err(|error| native_failure("window bounds", &window.native, error))?;
-        let current_bounds = self.physical_window_bounds(
-            &window.native,
-            Bounds {
-                x,
-                y,
-                width,
-                height,
-            },
-            deadline,
-        )?;
-        if current_bounds != window.bounds {
+        let binding = window.input_binding()?;
+        let raw = self.window_bounds(&window.native, deadline)?;
+        if self.physical_window_bounds(&window.native, raw, deadline)? != window.bounds {
             return Err(super::super::stale("target window geometry changed"));
         }
-        let mut args = vec![
-            "focus-info".into(),
-            "--expected-pid".into(),
-            process_id.to_string(),
-            "--deadline-monotonic-ns".into(),
-            monotonic_deadline_ns(deadline)?.to_string(),
-        ];
-        append_window_args(&mut args, window, None);
-        let output = self.run_helper(
-            path,
-            &args,
-            None,
-            deadline,
-            XTEST_OUTPUT_LIMIT,
-            XTEST_OUTPUT_LIMIT,
-        )?;
-        let proof = parse_one_json_object(&output.stdout, "focus info")?;
-        if !output.status.success() || !valid_focus_proof(&proof, process_id) {
+        let (_, focused) = self.window_proof(window, process_id, path, deadline)?;
+        if require_focus && !focused {
             return Err(driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                "native input focus is not proven for the observed window",
-            ));
+                "DRIVER.FOCUS_LOST",
+                "keyboard focus moved outside the observed X11 window",
+            )
+            .with_detail("helper_code", json!("focus_owner_changed"))
+            .with_detail("proven_window", json!(binding.client))
+            .with_detail("dispatch_started", json!(false)));
         }
-        Ok(proof["window"].as_u64().expect("validated window proof"))
+        Ok(binding)
     }
 
     pub(super) fn verify_focused(
@@ -137,8 +560,8 @@ impl LinuxBackend {
         window: Option<&WindowAnchor>,
         process_id: u32,
         deadline: Instant,
-    ) -> Result<u64, AutomationError> {
-        let path = self.input_helper("window-focus", deadline)?;
+    ) -> Result<(), AutomationError> {
+        let path = self.input_helper(GEOMETRY_FEATURE, deadline)?;
         self.verify_focused_with_helper(target, window, process_id, deadline, &path)
     }
 
@@ -149,19 +572,84 @@ impl LinuxBackend {
         process_id: u32,
         deadline: Instant,
         path: &Path,
-    ) -> Result<u64, AutomationError> {
+    ) -> Result<(), AutomationError> {
+        self.with_accessible_focus(target, process_id, deadline, || {
+            if let Some(window) = window {
+                self.verify_window_with_helper(target, window, process_id, deadline, path, true)?;
+                return Ok(());
+            }
+            let (app, mut window) = self.native_window(target, deadline)?;
+            let mut application = self.application_info(&app, deadline)?;
+            if let Some(windows) = self.read_qt_x11_windows(&mut application, deadline)? {
+                return self.verify_calibrated_focus(
+                    &mut window,
+                    process_id,
+                    &windows,
+                    deadline,
+                    path,
+                );
+            }
+            let (binding, focused) = self.window_proof(&window, process_id, path, deadline)?;
+            let windows = self.direct_window_bounds(&app, &[], deadline)?;
+            if focused && unique_native_bounds(&windows, &window.native, &binding) {
+                Ok(())
+            } else {
+                Err(unproven_focus_window())
+            }
+        })
+    }
+
+    pub(super) fn verify_qt_focus(
+        &self,
+        target: &NativeRef,
+        process_id: u32,
+        windows: &[QtX11Window],
+        deadline: Instant,
+        path: &Path,
+    ) -> Result<(), AutomationError> {
+        self.with_accessible_focus(target, process_id, deadline, || {
+            let (_, mut window) = self.native_window(target, deadline)?;
+            self.verify_calibrated_focus(&mut window, process_id, windows, deadline, path)
+        })
+    }
+
+    fn verify_calibrated_focus(
+        &self,
+        window: &mut WindowAnchor,
+        process_id: u32,
+        windows: &[QtX11Window],
+        deadline: Instant,
+        path: &Path,
+    ) -> Result<(), AutomationError> {
+        let client = windows
+            .iter()
+            .find(|entry| entry.native == window.native && entry.raw == window.bounds)
+            .and_then(|entry| entry.unique_client)
+            .filter(|client| client.viewable)
+            .ok_or_else(unproven_focus_window)?;
+        window.bounds = client.bounds;
+        let (binding, focused) = self.window_proof(window, process_id, path, deadline)?;
+        if focused
+            && client.xid == binding.client
+            && qt_others_do_not_match(windows, &window.native, &binding)
+        {
+            Ok(())
+        } else {
+            Err(unproven_focus_window())
+        }
+    }
+
+    fn with_accessible_focus(
+        &self,
+        target: &NativeRef,
+        process_id: u32,
+        deadline: Instant,
+        verify: impl FnOnce() -> Result<(), AutomationError>,
+    ) -> Result<(), AutomationError> {
         let focused = || -> Result<bool, AutomationError> {
             remaining(deadline, false)?;
-            let states = zbus::block_on(self.accessible(target)?.get_state())
-                .map_err(|error| native_failure("Accessible.GetState", target, error))?;
-            Ok([
-                State::Focused,
-                State::Focusable,
-                State::Enabled,
-                State::Sensitive,
-            ]
-            .into_iter()
-            .all(|state| states.contains(state)))
+            let states = zbus::block_on(self.input_states(target))?;
+            Ok(focus_ready(states) && states.contains(State::Focusable))
         };
         if !focused()? {
             return Err(driver_error(
@@ -169,21 +657,128 @@ impl LinuxBackend {
                 "accessible focus is not proven",
             ));
         }
-        let recovered;
-        let window = match window {
-            Some(window) => window,
-            None => {
-                recovered = self.native_window(target, deadline)?;
-                &recovered
-            }
-        };
-        let id = self.verify_window_with_helper(target, window, process_id, deadline, path)?;
+        verify()?;
         if !focused()? || self.process_id(&target.bus_name) != Some(process_id) {
             return Err(driver_error(
                 "DRIVER.ACTION_UNSUPPORTED",
                 "accessible focus changed during native window verification",
             ));
         }
-        Ok(id)
+        Ok(())
+    }
+}
+
+fn unproven_focus_window() -> AutomationError {
+    driver_error(
+        "DRIVER.ACTION_UNSUPPORTED",
+        "native focus window is unproven",
+    )
+}
+
+fn unique_native_bounds(
+    windows: &[(NativeRef, Bounds)],
+    target: &NativeRef,
+    binding: &X11WindowBinding,
+) -> bool {
+    windows.iter().any(|(native, _)| native == target)
+        && others_do_not_match(
+            windows
+                .iter()
+                .filter(|(native, _)| native != target)
+                .map(|(_, bounds)| std::iter::once(*bounds)),
+            binding,
+        )
+}
+
+fn others_do_not_match(
+    mut windows: impl Iterator<Item = impl ExactSizeIterator<Item = Bounds>>,
+    binding: &X11WindowBinding,
+) -> bool {
+    windows.all(|mut candidates| candidates.len() != 0 && !candidates.any(|b| binding.matches(b)))
+}
+
+fn qt_others_do_not_match(
+    windows: &[QtX11Window],
+    target: &NativeRef,
+    binding: &X11WindowBinding,
+) -> bool {
+    others_do_not_match(
+        windows
+            .iter()
+            .filter(|entry| entry.native != *target)
+            .map(|entry| entry.candidates.iter().map(|client| client.bounds)),
+        binding,
+    )
+}
+
+fn qt_binding_matches(
+    windows: &[QtX11Window],
+    target: &NativeRef,
+    observed: Bounds,
+    binding: &X11WindowBinding,
+) -> bool {
+    let Some(entry) = windows.iter().find(|entry| entry.native == *target) else {
+        return false;
+    };
+    let Some(client) = entry.unique_client else {
+        return false;
+    };
+    // A minimized target still needs a native proof for its raw observation.
+    let expected = if client.viewable {
+        client.bounds
+    } else {
+        entry.raw
+    };
+    client.xid == binding.client
+        && observed == expected
+        && qt_others_do_not_match(windows, target, binding)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_proof_requires_a_bound_window_and_expected_pid_without_input_dispatch() {
+        for (proof, expected) in [
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42}),
+                None,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": true, "window": 123}),
+                Some((123, true)),
+            ),
+            (
+                json!({"ok": true, "focused": false, "expected_pid": 42, "window_bound": true, "window": 123}),
+                Some((123, false)),
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": true, "window": 0}),
+                None,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": false, "window": 123}),
+                None,
+            ),
+            (
+                json!({"ok": true, "focused": false, "expected_pid": 42}),
+                None,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 43}),
+                None,
+            ),
+            (
+                json!({"ok": false, "focused": true, "expected_pid": 42}),
+                None,
+            ),
+            (
+                json!({"ok": true, "focused": true, "expected_pid": 42, "dispatch_started": false}),
+                None,
+            ),
+        ] {
+            assert_eq!(valid_focus_proof(proof.as_object().unwrap(), 42), expected);
+        }
     }
 }

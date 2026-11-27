@@ -67,7 +67,10 @@ Chromium/CDP drag：在可拖起的元素（`draggable`、列表/网格项、gra
 省略 path 保持原来的两端拖动。Chromium 已用公开截图 PNG 独立核对 Canvas/closed-shadow 内的折线，
 并回读可信事件顺序及超时、取消、遮挡和几何变化后的释放；不代表跨页面或跨资源拖拽已支持。
 
-Linux/X11 后端在 helper 声明 `anchored-drag-between` 时支持两个资源之间的普通 `drag`：
+Linux/X11 的跨资源 `drag` 要求 helper 同时声明 `anchored-drag-between` 和 `window-geometry-proof-v1`。
+支持情况见 `capabilities` 回包的 `data.providers[]` 对应条目中的 `cross_resource_drag`。
+使用缺少对应能力的旧 helper 提交跨资源拖拽时，aad 返回 `DRIVER.HELPER_INCOMPATIBLE` 并提示升级 helper。
+
 先分别观察两端，再将源 target 与目标 `to` 提交；需要两端各自的授权、有效观察与输入租约。
 第一版仅接受不含自定义路径的直线，窗口须同时可见，途中其他应用/弹窗会使动作拒绝或停止并释放。
 两端在每阶段重新校验；本机 Qt 两进程的实际数据传递已验收，约需 4.8 秒。
@@ -515,7 +518,9 @@ MCP 的 `run_steps` 和全部由 `control.session` 步骤组成的非持久化 `
 ```
 
 `target` 绑定会话、资源、观察及节点。跨会话引用、篡改资源、重复 ID、未知字段和裸坐标均拒绝。
-每个 provider 仅保留最新一次观察，最长 5 分钟；新的观察尝试或派发的输入尝试会撤销旧引用。
+默认每个 provider 仅保留最新一次观察，最长 5 分钟，遇到新的观察尝试或派发的输入尝试即撤销旧引用。
+个别 provider 可声明按资源保留最新观察，实际保留规则与份数上限见 `capabilities` 回包中该 provider 的
+`observation_retention` 和 `max_retained_observations` 字段。
 截断观察不能证明唯一性，不能用于 find/act。动作前还要实时校验原生元素，或浏览器的
 page/frame/loader/document、节点连接状态及语义指纹。导航、frame 替换和节点替换使引用失效。
 动作成功后应重新 observe，并验证实际效果；成功派发不能证明业务目标已达成。

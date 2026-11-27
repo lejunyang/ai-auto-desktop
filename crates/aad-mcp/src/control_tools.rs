@@ -5,7 +5,7 @@
 //! observation returned. Every position is a fraction of an observed element's
 //! box, never a screen coordinate.
 use crate::tools::Tool;
-use aad_control::{transport::Endpoint, Operation, Request, Response};
+use aad_control::{transport::Endpoint, Operation, PointFailureStage, Request, Response};
 use serde_json::{json, Map, Value};
 
 fn target_schema() -> Value {
@@ -117,7 +117,7 @@ fn action_schema() -> Value {
             "secret_ref": {"type":"string", "minLength":1, "maxLength":64, "pattern":"^[A-Za-z][A-Za-z0-9_-]*$", "description":"An exact binding name listed by control_capabilities; never a secret value or an environment-variable expression."}
         }), &["secret_ref"]),
         variant("type_text", "Type text as keystrokes after focusing the element. Use \
-    only when fill is unsupported, since keystrokes go wherever focus lands.", json!({
+    fill for direct text replacement. For long text on X11, increase timeout_ms up to 30000 if needed.", json!({
             "text": {"type": "string", "maxLength": 1024},
             "mode": {
                 "enum": ["unicode", "keys"],
@@ -725,11 +725,6 @@ Use node_id only with the observation that supplied the candidates."
 present, or observe again if it may still be appearing. To ask whether something is \
 gone, pass expect: optional."
         }
-        "DRIVER.POINT_NOT_PROVEN" => {
-            "The center-point hit could not be confirmed inside the target; no input was sent. \
-Call control_observe again and select a specific leaf node, or scroll and retry. \
-Use a keyboard action only if the target's capabilities offer it."
-        }
         "CONTROL.ACTION_UNSUPPORTED" | "DRIVER.ACTION_UNSUPPORTED" => {
             "This node does not offer that action; its `capabilities` in the observation \
 list what it does."
@@ -779,9 +774,9 @@ paste plain text (or used the shortcut for something else). Observe to see what 
 then use fill or type_text. The clipboard was put back."
         }
         "DRIVER.FOCUS_LOST" => {
-            "The element's window could not be brought to the keyboard, so no key was sent \
-(it would have gone to another application). Use activate on the window's node, observe \
-again and retry, or prefer fill, which needs no focus."
+            "The observed element lost keyboard focus, possibly to another control in the same \
+window. Observe the field again before retrying, or use fill. When present, \
+details.input_progress.delivered gives the number of strokes sent."
         }
         "DRIVER.ACTIVATION_REFUSED" => {
             "Windows' foreground lock kept this window from coming forward. Actions that do \
@@ -858,10 +853,49 @@ files; check the name, or ask the person where the file is."
 }
 
 pub fn payload(response: Response) -> Value {
+    let point_failure_stage = response.point_failure_stage();
     let mut value = serde_json::to_value(response).unwrap();
-    let code = value["error"]["code"].as_str().map(str::to_string);
-    if let Some(hint) = code.as_deref().and_then(hint) {
-        value["error"]["hint"] = json!(hint);
+    let error = &value["error"];
+    let details = &error["details"];
+    let guidance = match (point_failure_stage, error["code"].as_str()) {
+        (Some(PointFailureStage::AfterDispatch), _) => Some(
+            "The drag stopped after input dispatch started because an endpoint could no \
+longer be confirmed. Check details.input_progress.delivered and details.input_progress.released \
+when present. Call control_observe again for the drag source and target and verify the result \
+before retrying.",
+        ),
+        (Some(PointFailureStage::BeforeDispatch), _) => Some(
+            "The center-point hit could not be confirmed inside the target; no input was sent. \
+Call control_observe again and select a specific leaf node, or scroll and retry. \
+Use a keyboard action only if the target's capabilities offer it.",
+        ),
+        (_, Some("DRIVER.UNKNOWN_EFFECT")) if details["cause"] == "focused_element_changed" => {
+            Some(
+                "Keyboard focus moved to another control. Check details.input_progress.delivered \
+and observe the field's current value before continuing with fill or type_text.",
+            )
+        }
+        (_, Some("DRIVER.TIMEOUT")) if details["input_progress"]["unit"] == "codepoint" => Some(
+            "The deadline elapsed while typing. Check details.input_progress.delivered \
+and observe the field before continuing. On X11, increase timeout_ms up to 30000 or use fill.",
+        ),
+        (_, Some("DRIVER.CLIPBOARD_BUSY"))
+            if matches!(
+                details["helper_code"].as_str(),
+                Some(
+                    "clipboard_unreadable"
+                        | "clipboard_owner_changed"
+                        | "clipboard_timestamp_unavailable"
+                        | "clipboard_busy"
+                )
+            ) =>
+        {
+            Some("Use fill or type_text to enter the text without replacing the clipboard.")
+        }
+        (_, code) => code.and_then(hint),
+    };
+    if let Some(guidance) = guidance {
+        value["error"]["hint"] = json!(guidance);
     }
     value
 }
@@ -1188,9 +1222,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failures_carry_the_recovery_that_works() {
-        let response = |code: &str| Response {
+    fn failure_response(code: &str) -> Response {
+        Response {
             protocol_version: "aad-control/1".into(),
             request_id: "r".into(),
             session_id: "s".into(),
@@ -1198,8 +1231,12 @@ mod tests {
             commit_state: aad_control::CommitState::NotCommitted,
             data: None,
             error: Some(json!({"code": code})),
-        };
-        let stale = payload(response("CONTROL.STALE_TARGET"));
+        }
+    }
+
+    #[test]
+    fn failures_carry_the_recovery_that_works() {
+        let stale = payload(failure_response("CONTROL.STALE_TARGET"));
         assert!(stale["error"]["hint"]
             .as_str()
             .unwrap()
@@ -1209,7 +1246,7 @@ mod tests {
             "DRIVER.AMBIGUOUS_MATCH",
             "DRIVER.AMBIGUOUS",
         ] {
-            let ambiguous = payload(response(code));
+            let ambiguous = payload(failure_response(code));
             let hint = ambiguous["error"]["hint"].as_str().unwrap();
             for way in ["node_id", "candidates"] {
                 assert!(hint.contains(way), "{code}: {way}");
@@ -1225,7 +1262,21 @@ mod tests {
                 }
             }
         }
-        let point = payload(response("DRIVER.POINT_NOT_PROVEN"));
+        assert!(payload(failure_response("CONTROL.SOMETHING_ELSE"))["error"]
+            .get("hint")
+            .is_none());
+    }
+
+    #[test]
+    fn point_not_proven_guidance_matches_dispatch_state() {
+        let code = "DRIVER.POINT_NOT_PROVEN";
+        let mut response = failure_response(code);
+        response.error.as_mut().unwrap()["details"] = json!({"dispatch_started": false});
+        let point = payload(response.clone());
+        assert_eq!(point["error"]["code"], code);
+        assert_eq!(point["effect"], "not_applied");
+        assert_eq!(point["commit_state"], "not_committed");
+        assert_eq!(point["error"]["details"]["dispatch_started"], false);
         let hint = point["error"]["hint"].as_str().unwrap();
         for way in [
             "no input was sent",
@@ -1236,10 +1287,34 @@ mod tests {
         ] {
             assert!(hint.contains(way), "{way}");
         }
-        assert_eq!(point["effect"], "not_applied");
-        assert_eq!(point["commit_state"], "not_committed");
-        assert!(payload(response("CONTROL.SOMETHING_ELSE"))["error"]
-            .get("hint")
-            .is_none());
+
+        let progress = json!({"unit": "button", "delivered": 1, "total": 1,
+                              "proven_window": 42, "released": true});
+        let point = payload(Response {
+            effect: "unknown".into(),
+            commit_state: aad_control::CommitState::Unknown,
+            error: Some(json!({"code": code, "details": {
+                "dispatch_started": true,
+                "input_progress": progress,
+            }})),
+            ..response
+        });
+        assert_eq!(point["error"]["code"], code);
+        assert_eq!(point["effect"], "unknown");
+        assert_eq!(point["commit_state"], "unknown");
+        assert_eq!(point["error"]["details"]["dispatch_started"], true);
+        assert_eq!(point["error"]["details"]["input_progress"], progress);
+        let hint = point["error"]["hint"].as_str().unwrap();
+        for way in [
+            "input dispatch started",
+            "details.input_progress.delivered",
+            "details.input_progress.released",
+            "control_observe",
+            "drag source and target",
+            "before retrying",
+        ] {
+            assert!(hint.contains(way), "{way}");
+        }
+        assert!(!hint.contains("no input was sent"));
     }
 }

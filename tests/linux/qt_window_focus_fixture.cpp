@@ -47,6 +47,9 @@ public:
 };
 
 int main(int argc, char **argv) {
+    // Keep the GTK platform theme from registering an extra AT-SPI application.
+    QApplication::setDesktopSettingsAware(false);
+    qunsetenv("QT_QPA_PLATFORMTHEME");
     QApplication app(argc, argv);
     app.setApplicationName("AAD Window Focus Fixture");
     QAccessible::installFactory([](const QString &, QObject *object) -> QAccessibleInterface * {
@@ -55,7 +58,7 @@ int main(int argc, char **argv) {
         return nullptr;
     });
     QAccessible::setActive(true);
-    QWidget primary, secondary;
+    QWidget primary, secondary, duplicate;
     primary.setWindowTitle("AAD Primary Window"); primary.setAccessibleName("AAD Primary Window");
     secondary.setWindowTitle("AAD Secondary Window"); secondary.setAccessibleName("AAD Secondary Window");
     primary.resize(360, 160); primary.move(200, 300);
@@ -70,9 +73,24 @@ int main(int argc, char **argv) {
     auto *live = new KeyCounter("Live secondary target", secondaryStatus, &secondary);
     secondaryLayout->addWidget(live); secondaryLayout->addWidget(secondaryStatus);
     primary.show(); secondary.show();
+    const bool threeWindows = app.arguments().contains("--three-windows");
+    if (threeWindows) {
+        duplicate.setWindowTitle(primary.windowTitle());
+        duplicate.setAccessibleName(primary.accessibleName());
+        duplicate.resize(primary.size()); duplicate.move(200, 50);
+        auto *layout = new QVBoxLayout(&duplicate);
+        auto *status = new QLabel(&duplicate);
+        layout->addWidget(new KeyCounter("Duplicate primary target", status, &duplicate));
+        layout->addWidget(status);
+        duplicate.show();
+    }
     QTimer::singleShot(250, [&] {
         secondary.raise(); secondary.activateWindow(); live->setFocus();
         QTextStream(stdout) << "READY\n" << Qt::flush;
+        if (threeWindows) {
+            QTextStream(stdout) << primary.winId() << ' ' << duplicate.winId() << ' '
+                                << secondary.winId() << '\n' << Qt::flush;
+        }
     });
     return app.exec();
 }

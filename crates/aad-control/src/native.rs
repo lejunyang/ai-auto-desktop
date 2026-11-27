@@ -353,6 +353,91 @@ impl Backend for NativeBackend {
             .map(|name| name.to_string())
             .collect()
     }
+    fn check_action_support(
+        &self,
+        snapshot: &Value,
+        action: &Action,
+        cross_resource: bool,
+    ) -> Result<()> {
+        let helper = &snapshot["metadata"]["input_helper"];
+        if !matches!(self.flavor, Flavor::Linux) {
+            return Ok(());
+        }
+        let requires_geometry = match action {
+            Action::TypeText { .. }
+            | Action::Key { .. }
+            | Action::Paste { .. }
+            | Action::Activate {}
+            | Action::Minimize {}
+            | Action::Maximize {}
+            | Action::Restore {}
+            | Action::CloseWindow {} => true,
+            Action::Click { modifiers, .. } => !modifiers.is_empty(),
+            Action::Drag { .. } => true,
+            _ => false,
+        };
+        let uses_x11_helper = requires_geometry
+            || matches!(
+                action,
+                Action::Click { .. }
+                    | Action::Drag { .. }
+                    | Action::Scroll { .. }
+                    | Action::Hover { .. }
+            );
+        if uses_x11_helper
+            && helper["ready"] == false
+            && helper["code"] == "DRIVER.HELPER_INCOMPATIBLE"
+        {
+            return Err(error(
+                "DRIVER.HELPER_INCOMPATIBLE",
+                helper["message"]
+                    .as_str()
+                    .unwrap_or("Linux XTest helper handshake is incompatible"),
+            ));
+        }
+        if helper["ready"] != true {
+            return Ok(());
+        }
+        let straight_drag =
+            matches!(action, Action::Drag { path, .. } if path.is_empty() && !cross_resource);
+        let features = helper["features"].as_array();
+        let has_feature =
+            |name: &str| features.is_some_and(|list| list.iter().any(|feature| feature == name));
+        #[cfg(target_os = "linux")]
+        match action {
+            Action::TypeText { mode, .. } => {
+                let command = if *mode == Some(crate::model::TypeMode::Keys) {
+                    "type-text-keys"
+                } else {
+                    "type-text"
+                };
+                return aad_linux::atspi::require_x11_keyboard_features(command, has_feature);
+            }
+            Action::Key { .. } => {
+                return aad_linux::atspi::require_x11_keyboard_features("key-chord", has_feature);
+            }
+            Action::Paste { .. } => {
+                return aad_linux::atspi::require_x11_keyboard_features("paste", has_feature);
+            }
+            _ => {}
+        }
+        let missing = if requires_geometry && !has_feature("window-geometry-proof-v1") {
+            "window-geometry-proof-v1"
+        } else if straight_drag && !has_feature("anchored-straight-drag") {
+            "anchored-straight-drag"
+        } else {
+            return Ok(());
+        };
+        let upgrade_hint = if straight_drag {
+            ". Upgrade aad and its helper together."
+        } else {
+            ""
+        };
+        Err(error(
+            "DRIVER.HELPER_INCOMPATIBLE",
+            format!("Linux XTest helper is missing {missing}{upgrade_hint}"),
+        ))
+    }
     fn lease_key(&self, _snapshot: &Value) -> Option<String> {
         Some("desktop-input".into())
     }
@@ -372,10 +457,11 @@ impl Backend for NativeBackend {
             .collect()
     }
     fn supports_cross_resource_drag(&self) -> bool {
-        // Advertising this private operation promises independent snapshot
-        // retention and fresh validation of both native endpoints. Ordinary
-        // single-snapshot `drag` does not make that promise.
         self.offers("drag_between")
+    }
+    fn retains_resource_observations(&self) -> bool {
+        self.supports_cross_resource_drag()
+            || self.provider.manifest().raw["retains_resource_observations"] == true
     }
     fn drag_between(
         &self,

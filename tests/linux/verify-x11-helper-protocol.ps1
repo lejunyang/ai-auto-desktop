@@ -9,7 +9,7 @@ if (-not $BuildDirectory) {
 New-Item -ItemType Directory -Path $BuildDirectory -Force | Out-Null
 $BuildDirectory = (Resolve-Path $BuildDirectory).Path
 $binary = Join-Path $BuildDirectory 'x11_xtest_helper'
-$flags = ((& pkg-config --cflags --libs x11 xtst) -split '\s+') | Where-Object { $_ }
+$flags = ((& pkg-config --cflags --libs x11 xtst xext) -split '\s+') | Where-Object { $_ }
 if ($LASTEXITCODE -ne 0) { throw 'X11/XTest development packages unavailable' }
 & g++ -std=c++17 -O2 -Wall -Wextra -Werror `
     (Join-Path $root 'plugins/linux_atspi/x11_xtest_helper.cpp') -o $binary @flags
@@ -20,7 +20,9 @@ if ($LASTEXITCODE -ne 0 -or $description.helper -ne 'aad-linux-xtest' -or $descr
 }
 $required = @('focus-info', 'type-text', 'pointer-click', 'pointer-gesture', 'drag', 'key-chord',
     'window-info', 'window-action', 'paste', 'clipboard-read', 'global-key', 'record-input', 'pointer-modifiers',
-    'anchored-drag-path', 'anchored-drag-between')
+    'x11-desktop-independent', 'bounded-hold', 'window-focus', 'cooperative-cancel',
+    'anchored-drag-path', 'type-text-keys', 'anchored-drag-between', 'atomic-key-dispatch',
+    'anchored-type-text', 'text-event-barrier', 'window-geometry-proof-v1', 'anchored-straight-drag')
 foreach ($feature in $required) {
     if ($description.features -notcontains $feature) { throw "missing helper feature: $feature" }
 }

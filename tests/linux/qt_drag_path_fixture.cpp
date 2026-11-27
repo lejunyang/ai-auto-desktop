@@ -9,6 +9,23 @@
 #include <QTextStream>
 #include <QTimer>
 
+class GeometryCover : public QWidget {
+public:
+    explicit GeometryCover(QWidget *parent)
+        : QWidget(parent, Qt::Window | Qt::X11BypassWindowManagerHint | Qt::WindowDoesNotAcceptFocus) {
+        setAttribute(Qt::WA_ShowWithoutActivating);
+    }
+protected:
+    void mousePressEvent(QMouseEvent *event) override {
+        QTextStream(stdout) << "PATH {\"event\":\"cover_down\"}\n" << Qt::flush;
+        event->accept();
+    }
+    void mouseReleaseEvent(QMouseEvent *event) override {
+        QTextStream(stdout) << "PATH {\"event\":\"cover_up\"}\n" << Qt::flush;
+        event->accept();
+    }
+};
+
 class PathSurface : public QPushButton {
 public:
     PathSurface(QWidget *parent, QLabel *status, const QString &mode)
@@ -22,6 +39,22 @@ protected:
         status_->setText("Path down"); status_->setAccessibleName("Path down");
         emitEvent("down", event->pos());
         if (mode_ == "geometry") QTimer::singleShot(1, this, [this] { window()->move(window()->pos() + QPoint(20,0)); });
+        if (mode_ == "geometry-straight") QTimer::singleShot(1, this, [this] {
+            const QPoint oldDestination = mapToGlobal(QPoint(width() * 7 / 10, height() * 7 / 10));
+            window()->move(window()->pos() + QPoint(20, 0));
+            auto *cover = new GeometryCover(window());
+            cover->setGeometry(QRect(oldDestination - QPoint(10, 10), QSize(20, 20)));
+            cover->show();
+            cover->raise();
+        });
+        if (mode_ == "overlay-straight" || mode_ == "transparent-straight") QTimer::singleShot(1, this, [this] {
+            const QPoint midpoint = mapToGlobal(rect().center());
+            auto *cover = new GeometryCover(window());
+            if (mode_ == "transparent-straight") cover->setWindowFlag(Qt::WindowTransparentForInput);
+            cover->setGeometry(QRect(midpoint - QPoint(10, 10), QSize(20, 20)));
+            cover->show();
+            cover->raise();
+        });
         if (mode_ == "overlay") QTimer::singleShot(1, this, [this] {
             auto *overlay = new QPushButton("Path obstacle", parentWidget());
             overlay->setAccessibleName("Path obstacle"); overlay->setGeometry(geometry()); overlay->show(); overlay->raise();
@@ -54,6 +87,9 @@ private:
 };
 
 int main(int argc, char **argv) {
+    // Keep the GTK platform theme from registering an extra AT-SPI application.
+    QApplication::setDesktopSettingsAware(false);
+    qunsetenv("QT_QPA_PLATFORMTHEME");
     QApplication app(argc, argv); QAccessible::setActive(true);
     app.setApplicationName("AAD Path Fixture"); app.setOrganizationName("ai-auto-desktop");
     const QString mode = app.arguments().value(1, "success");

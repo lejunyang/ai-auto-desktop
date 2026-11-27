@@ -63,6 +63,9 @@ private:
 };
 
 int main(int argc,char **argv) {
+    // Keep the GTK platform theme from registering an extra AT-SPI application.
+    QApplication::setDesktopSettingsAware(false);
+    qunsetenv("QT_QPA_PLATFORMTHEME");
     QApplication::setAttribute(Qt::AA_DisableHighDpiScaling);
     QApplication app(argc,argv);QAccessible::setActive(true);
     const bool source=app.arguments().value(1)=="source";const QString mode=app.arguments().value(2,"success");

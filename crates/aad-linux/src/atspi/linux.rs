@@ -1,6 +1,7 @@
 use super::{
     driver_error, remaining, AtspiBackend, AutomationError, BackendNode, BackendSnapshot, Bounds,
-    Gesture, Map, NativeRef, Value, WindowAnchor, MAX_FIELD_CHARS, MAX_NODES,
+    Gesture, Map, NativeRef, QtX11Window, Value, WindowAnchor, X11WindowBinding, MAX_FIELD_CHARS,
+    MAX_NODES,
 };
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::action::ActionProxy;
@@ -21,6 +22,7 @@ use std::time::{Duration, Instant};
 use zbus::blocking::{connection, Connection, Proxy};
 
 mod actions;
+mod anchored_helper;
 mod coordinates;
 mod drag_between;
 mod drag_path;
@@ -33,13 +35,17 @@ mod table;
 mod wayland_input;
 use focus_discovery::FocusDiscovery;
 mod window_focus;
-use window_focus::append_window_args;
+use window_focus::{
+    append_window_args, append_window_proof_args, AnchoredKeyboard, GEOMETRY_FEATURE,
+};
 
 const REGISTRY_NAME: &str = "org.a11y.atspi.Registry";
 const REGISTRY_PATH: &str = "/org/a11y/atspi/accessible/root";
 const DBUS_NAME: &str = "org.freedesktop.DBus";
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
+const ANCHORED_KEYBOARD: &str = "anchored-type-text";
+const TEXT_EVENT_BARRIER: &str = "text-event-barrier";
 const XTEST_OUTPUT_LIMIT: usize = 64 * 1024;
 const CAPTURE_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 const CAPTURE_METADATA_LIMIT: usize = 64 * 1024;
@@ -254,49 +260,41 @@ impl LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path =
-            self.input_helper(if keys { "type-text-keys" } else { "type-text" }, deadline)?;
-        let window = window.ok_or_else(|| {
-            driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                "input requires an observed top-level window",
-            )
-        })?;
-        self.input_helper("window-focus", deadline)?;
-        let focus = self.focus(target, Some(window), deadline)?;
-        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-        let window_id = self
-            .verify_focused(target, Some(window), process_id, deadline)
-            .map_err(after_focus)?;
+        let mut args = vec![
+            "type-text".to_string(),
+            "--expected-pid".into(),
+            process_id.to_string(),
+            "--text-event-barrier".into(),
+            "required".into(),
+        ];
+        if keys {
+            args.extend(["--mode".into(), "keys".into()]);
+        }
+        let (path, focus) = self.prepare_anchored_keyboard(
+            if keys { "type-text-keys" } else { "type-text" },
+            target,
+            window,
+            process_id,
+            deadline,
+            &mut args,
+        )?;
         // Unicode insertion cannot silently become IME composition. Explicit
         // keys mode intentionally participates in the current input method.
         if !keys {
             self.check_text_input_method(deadline)
                 .map_err(after_focus)?;
         }
-        let mut args = vec![
-            "type-text".to_string(),
-            "--expected-pid".into(),
-            process_id.to_string(),
-            "--deadline-monotonic-ns".into(),
-            monotonic_deadline_ns(deadline)?.to_string(),
-        ];
-        if keys {
-            args.extend(["--mode".into(), "keys".into()]);
-        }
-        append_window_args(&mut args, window, Some(window_id));
-        let output = self
-            .run_helper(
-                &path,
-                &args,
-                Some(text.as_bytes()),
-                deadline,
-                XTEST_OUTPUT_LIMIT,
-                XTEST_OUTPUT_LIMIT,
-            )
-            .map_err(after_focus)?;
-        let input =
-            parse_input_helper(output, "keyboard_dispatch", 2, process_id).map_err(after_focus)?;
+        let input = self.run_anchored_keyboard(AnchoredKeyboard {
+            path: &path,
+            args,
+            payload: Some(text.as_bytes()),
+            strokes: text.chars().count(),
+            target,
+            process_id,
+            deadline,
+            phase: "keyboard_dispatch",
+            minimum_events: 2,
+        })?;
         Ok(
             json!({"native_interface": "Component.grab_focus -> XTEST", "focus": focus,
             "input": input, "synthetic_input": true, "mode": if keys { "keys" } else { "unicode" }}),
@@ -314,16 +312,22 @@ impl LinuxBackend {
         &'a self,
         target: &'a NativeRef,
     ) -> Result<AccessibleProxy<'a>, AutomationError> {
+        zbus::block_on(self.accessible_async(target))
+    }
+
+    async fn accessible_async<'a>(
+        &'a self,
+        target: &'a NativeRef,
+    ) -> Result<AccessibleProxy<'a>, AutomationError> {
         let builder = AccessibleProxy::builder(self.connection.inner())
             .destination(target.bus_name.as_str())
             .and_then(|builder| builder.path(target.object_path.as_str()))
             .map_err(|error| native_failure("Accessible proxy", target, error))?;
-        zbus::block_on(
-            builder
-                .cache_properties(zbus::proxy::CacheProperties::No)
-                .build(),
-        )
-        .map_err(|error| native_failure("Accessible proxy", target, error))
+        builder
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .map_err(|error| native_failure("Accessible proxy", target, error))
     }
 
     fn children(
@@ -354,10 +358,46 @@ impl LinuxBackend {
         ))
     }
 
+    fn direct_windows(
+        &self,
+        app: &NativeRef,
+        deadline: Instant,
+    ) -> Result<Vec<NativeRef>, AutomationError> {
+        let children = self.child_references(app, deadline)?;
+        let count = zbus::block_on(self.accessible(app)?.child_count())
+            .map_err(|e| native_failure("application window count", app, e))?;
+        let mut paths = BTreeSet::new();
+        if usize::try_from(count).ok() != Some(children.returned_count)
+            || children.items.len() > 128
+            || children
+                .items
+                .iter()
+                .any(|child| child.bus_name != app.bus_name || !paths.insert(&child.object_path))
+        {
+            return Err(driver_error(
+                "DRIVER.COORDINATE_UNPROVEN",
+                "complete direct-window inventory unavailable",
+            ));
+        }
+        Ok(children.items)
+    }
+
     fn process_id(&self, bus_name: &str) -> Option<u32> {
-        Proxy::new(&self.connection, DBUS_NAME, DBUS_PATH, DBUS_INTERFACE)
-            .and_then(|proxy| proxy.call::<_, _, u32>("GetConnectionUnixProcessID", &(bus_name,)))
-            .ok()
+        zbus::block_on(self.process_id_async(bus_name))
+    }
+
+    async fn process_id_async(&self, bus_name: &str) -> Option<u32> {
+        zbus::Proxy::new(
+            self.connection.inner(),
+            DBUS_NAME,
+            DBUS_PATH,
+            DBUS_INTERFACE,
+        )
+        .await
+        .ok()?
+        .call("GetConnectionUnixProcessID", &(bus_name,))
+        .await
+        .ok()
     }
 
     fn application_info(
@@ -485,11 +525,13 @@ impl LinuxBackend {
         .map_err(|error| native_failure("Component proxy", target, error))
     }
 
-    /// Keyboard input needs focus; pointer input is proven by live hit tests.
-    fn run_input(
+    /// Pointer input is proven by live hit tests, with window focus for modifiers.
+    #[allow(clippy::too_many_arguments)]
+    fn run_pointer_input(
         &self,
         target: &NativeRef,
         window: Option<&WindowAnchor>,
+        destination_window: Option<&WindowAnchor>,
         mut args: Vec<String>,
         minimum_events: u64,
         process_id: u32,
@@ -500,70 +542,68 @@ impl LinuxBackend {
         if self.cancellation.is_some() {
             support.require("cooperative-cancel")?;
         }
-        support.require(args.first().map(String::as_str).unwrap_or(""))?;
-        if args.iter().any(|arg| arg == "--modifiers") {
-            support.require("pointer-modifiers")?;
+        let bound_drag = args[0] == "drag";
+        if bound_drag {
+            DragKind::Straight.require(&support)?;
+        } else {
+            support.require(&args[0])?;
         }
         if args.iter().any(|arg| arg == "--hold-ms") {
             support.require("bounded-hold")?;
         }
-        if args.first().is_some_and(|command| command == "key-chord")
-            || args.iter().any(|arg| arg == "--modifiers")
-        {
-            support.require("focus-info")?;
-            support.require("window-focus")?;
+        let modified = args.iter().any(|arg| arg == "--modifiers");
+        if modified {
+            support.require("pointer-modifiers")?;
+            support.require_keyboard_route()?;
         }
-        let path = support.path;
-        let focus = if args.first().is_some_and(|command| command == "key-chord") {
-            let proof = self.focus(target, window, deadline)?;
-            std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-            self.verify_focused(target, window, process_id, deadline)
-                .map_err(after_focus)?;
-            Some(proof)
-        } else {
-            None
-        };
-        if args.first().is_some_and(|command| command == "key-chord")
-            || args.iter().any(|arg| arg == "--modifiers")
-        {
+        if modified || bound_drag {
             let window = window.ok_or_else(|| {
                 driver_error(
                     "DRIVER.ACTION_UNSUPPORTED",
                     "input requires an observed top-level window",
                 )
             })?;
-            // Feature checked before any focus request or keyboard dispatch.
-            let window_id =
-                self.verify_window_with_helper(target, window, process_id, deadline, &path)?;
-            append_window_args(&mut args, window, Some(window_id));
-        }
-        let input_error = |error| {
-            if focus.is_some() {
-                after_focus(error)
+            let binding = if modified {
+                self.verify_window_with_helper(
+                    target,
+                    window,
+                    process_id,
+                    deadline,
+                    &support.path,
+                    true,
+                )?
             } else {
-                error
-            }
-        };
+                window.input_binding()?
+            };
+            append_window_args(&mut args, "--window-", window, Some(binding));
+        }
+        if bound_drag {
+            let destination = destination_window.ok_or_else(|| {
+                driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "drag requires an observed destination window",
+                )
+            })?;
+            append_window_args(
+                &mut args,
+                "--destination-window-",
+                destination,
+                Some(destination.input_binding()?),
+            );
+        }
         args.extend([
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ]);
-        let output = self
-            .run_helper(
-                &path,
-                &args,
-                None,
-                deadline,
-                XTEST_OUTPUT_LIMIT,
-                XTEST_OUTPUT_LIMIT,
-            )
-            .map_err(input_error)?;
-        let mut input = parse_input_helper(output, "input_dispatch", minimum_events, process_id)
-            .map_err(input_error)?;
-        if let Some(focus) = focus {
-            input["focus"] = focus;
-        }
-        Ok(input)
+        let output = self.run_helper(
+            &support.path,
+            &args,
+            None,
+            deadline,
+            XTEST_OUTPUT_LIMIT,
+            XTEST_OUTPUT_LIMIT,
+        )?;
+        parse_input_helper(output, "input_dispatch", minimum_events, process_id)
     }
 
     fn helper(&self, kind: HelperKind) -> Result<PathBuf, AutomationError> {
@@ -631,10 +671,7 @@ impl LinuxBackend {
         let support = self.probe_input(deadline)?;
         support.require(feature)?;
         if self.cancellation.is_some()
-            && matches!(
-                feature,
-                "type-text" | "paste" | "pointer-click" | "window-action" | "global-key"
-            )
+            && matches!(feature, "pointer-click" | "window-action" | "global-key")
         {
             support.require("cooperative-cancel")?;
         }
@@ -647,6 +684,7 @@ impl LinuxBackend {
         parent_index: Option<usize>,
         application: &Map<String, Value>,
         input: Option<&InputSupport>,
+        qt_windows: Option<&[QtX11Window]>,
         deadline: Instant,
     ) -> Result<(BackendNode, usize), AutomationError> {
         remaining(deadline, false)?;
@@ -790,8 +828,7 @@ impl LinuxBackend {
         // Qt Quick can report hidden states for its actual focused text input.
         // Recover only keyboard actions, with independent live focus ownership;
         // input paths repeat the focus check after GrabFocus before dispatch.
-        let visibility_recovery = input
-            .is_some_and(|support| support.has("focus-info") && support.has("window-focus"))
+        let visibility_recovery = input.is_some_and(InputSupport::has_keyboard_route)
             && !fully_interactive
             && toolkit == Some("Qt")
             && states.is_some_and(|states| {
@@ -809,11 +846,11 @@ impl LinuxBackend {
             && interfaces.contains(Interface::Component)
             && bounds.is_some_and(|bounds| bounds.width > 0 && bounds.height > 0)
             && !protected
-            && process_id.is_some_and(|pid| {
-                self.verify_focused_with_helper(
+            && process_id.zip(qt_windows).is_some_and(|(pid, windows)| {
+                self.verify_qt_focus(
                     &target,
-                    None,
                     pid as u32,
+                    windows,
                     deadline,
                     &input.expect("feature checked").path,
                 )
@@ -827,14 +864,14 @@ impl LinuxBackend {
             && !protected
         {
             for (action, feature) in [("type_text", "type-text"), ("paste", "paste")] {
-                if input.is_some_and(|support| {
-                    support.has(feature) && support.has("focus-info") && support.has("window-focus")
-                }) {
+                if input.is_some_and(|support| support.has_anchored_keyboard(feature)) {
                     actions.push(action.into());
                 }
             }
         }
-        if visibility_recovery && input.is_some_and(|support| support.has("key-chord")) {
+        if visibility_recovery
+            && input.is_some_and(|support| support.has_anchored_keyboard("key-chord"))
+        {
             actions.push("key_chord".into());
         }
         if pointer_interactive
@@ -846,18 +883,16 @@ impl LinuxBackend {
             for (action, feature) in [
                 ("pointer_click", "pointer-click"),
                 ("pointer_gesture", "pointer-gesture"),
-                ("drag", "drag"),
             ] {
                 if input.is_some_and(|support| support.has(feature)) {
                     actions.push(action.into());
                 }
             }
+            if input.is_some_and(InputSupport::has_drag) {
+                actions.push("drag".into());
+            }
             if fully_interactive
-                && input.is_some_and(|support| {
-                    support.has("key-chord")
-                        && support.has("focus-info")
-                        && support.has("window-focus")
-                })
+                && input.is_some_and(|support| support.has_anchored_keyboard("key-chord"))
             {
                 actions.push("key_chord".into());
             }
@@ -995,9 +1030,20 @@ impl AtspiBackend for LinuxBackend {
     }
     fn supports_cross_resource_drag(&self) -> bool {
         self.probe_input(Instant::now() + Duration::from_secs(1))
-            .is_ok_and(|support| support.require("anchored-drag-between").is_ok())
+            .is_ok_and(|support| DragKind::Between.available(&support))
     }
 
+    fn retains_resource_observations(&self) -> bool {
+        !crate::wayland_portal::is_wayland_session()
+    }
+
+    fn observe_x11_windows(
+        &self,
+        snapshot: &mut BackendSnapshot,
+        deadline: Instant,
+    ) -> BTreeMap<usize, X11WindowBinding> {
+        self.capture_x11_window_bindings(snapshot, deadline)
+    }
     fn drag_between(
         &self,
         request: super::DragBetweenRequest<'_>,
@@ -1072,20 +1118,32 @@ impl AtspiBackend for LinuxBackend {
                 "target has no qualified Wayland widget input binding",
             ));
         }
+        if action == "drag" {
+            // The trait receives only the action name. Dispatch checks the selected mode.
+            return if self.probe_input(deadline)?.has_drag() {
+                Ok(())
+            } else {
+                Err(incompatible_helper(
+                    "no anchored X11 drag mode is available",
+                ))
+            };
+        }
         let feature = match action {
             "type_text" => "type-text",
             "pointer_click" => "pointer-click",
             "pointer_gesture" => "pointer-gesture",
             "key_chord" => "key-chord",
-            "drag" | "paste" => action,
+            "paste" => "paste",
             "activate" | "minimize" | "maximize" | "restore" | "close_window" => "window-action",
             _ => return Ok(()),
         };
         let support = self.probe_input(deadline)?;
-        support.require(feature)?;
         if matches!(action, "type_text" | "key_chord" | "paste") {
-            support.require("focus-info")?;
-            support.require("window-focus")?;
+            return support.require_anchored_keyboard(feature);
+        }
+        support.require(feature)?;
+        if super::WINDOW_ACTIONS.contains(&action) {
+            support.require(GEOMETRY_FEATURE)?;
         }
         Ok(())
     }
@@ -1546,9 +1604,10 @@ impl AtspiBackend for LinuxBackend {
         if let Some(ms) = hold_ms {
             args.extend(["--hold-ms".into(), ms.to_string()]);
         }
-        let input = self.run_input(
+        let input = self.run_pointer_input(
             target,
             window,
+            None,
             args,
             minimum + 2 * modifiers.len() as u64,
             process_id,
@@ -1571,6 +1630,7 @@ impl AtspiBackend for LinuxBackend {
         self.drag_modified(
             target,
             None,
+            None,
             from,
             to,
             button,
@@ -1585,6 +1645,7 @@ impl AtspiBackend for LinuxBackend {
         &self,
         target: &NativeRef,
         window: Option<&WindowAnchor>,
+        destination_window: Option<&WindowAnchor>,
         from: (i32, i32),
         to: (i32, i32),
         button: u8,
@@ -1634,9 +1695,10 @@ impl AtspiBackend for LinuxBackend {
         if let Some(ms) = hold_ms {
             args.extend(["--hold-ms".into(), ms.to_string()]);
         }
-        let input = self.run_input(
+        let input = self.run_pointer_input(
             target,
             window,
+            destination_window,
             args,
             3 + 2 * modifiers.len() as u64,
             process_id,
@@ -1698,8 +1760,26 @@ impl AtspiBackend for LinuxBackend {
         if let Some(ms) = hold_ms {
             args.extend(["--hold-ms".into(), ms.to_string()]);
         }
-        let minimum = 2 * keys.len() as u64;
-        let input = self.run_input(target, window, args, minimum, process_id, deadline)?;
+        let (path, focus) = self.prepare_anchored_keyboard(
+            "key-chord",
+            target,
+            window,
+            process_id,
+            deadline,
+            &mut args,
+        )?;
+        let mut input = self.run_anchored_keyboard(AnchoredKeyboard {
+            path: &path,
+            args,
+            payload: None,
+            strokes: 1,
+            target,
+            process_id,
+            deadline,
+            phase: "input_dispatch",
+            minimum_events: 2 * keys.len() as u64,
+        })?;
+        input["focus"] = focus;
         Ok(
             json!({"native_interface": "Component.grab_focus -> XTEST", "input": input, "synthetic_input": true, "keys": keys}),
         )
@@ -1778,26 +1858,25 @@ impl AtspiBackend for LinuxBackend {
     fn window_action(
         &self,
         target: &NativeRef,
+        window: Option<&WindowAnchor>,
         action: &str,
         bounds: Bounds,
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
         let path = self.input_helper("window-action", deadline)?;
-        if let Err(unproven) = self.verify_coordinate_target(target, deadline) {
-            // A minimized window is unmapped, so it can never be calibrated.
-            // EWMH actions need no pointer coordinates: accept it only when
-            // the helper binds exactly these bounds to this process's
-            // minimized client, as the snapshot did when offering restore.
-            let minimized = unproven.code == "DRIVER.COORDINATE_UNPROVEN"
-                && self
-                    .window_info(process_id, bounds, &path, deadline)
-                    .is_some_and(|info| info["minimized"] == true);
-            if !minimized {
-                return Err(unproven);
-            }
-        }
+        self.input_helper(GEOMETRY_FEATURE, deadline)?;
+        let binding = window
+            .filter(|window| window.native == *target && window.bounds == bounds)
+            .and_then(|window| window.x11.as_ref())
+            .ok_or_else(|| {
+                driver_error(
+                    "DRIVER.ACTION_UNSUPPORTED",
+                    "observation has no proven window action target",
+                )
+            })?;
         let mut args = window_args("window-action", process_id, bounds);
+        append_window_proof_args(&mut args, "--window-", binding);
         args.extend([
             "--action".into(),
             if action == "close_window" {
@@ -1818,10 +1897,13 @@ impl AtspiBackend for LinuxBackend {
             XTEST_OUTPUT_LIMIT,
         )?;
         let result = parse_input_helper(output, "window_dispatch", 1, process_id)?;
-        if result["reached"] != true {
+        if result["reached"] != true
+            || result["window"] != binding.client
+            || result["window_binding"] != "geometry"
+        {
             return Err(driver_error(
                 "DRIVER.UNKNOWN_EFFECT",
-                "the window manager did not report the requested window state in time",
+                "the window manager did not confirm the requested window state and binding",
             )
             .with_effect("unknown")
             .with_detail(
@@ -1830,7 +1912,7 @@ impl AtspiBackend for LinuxBackend {
             ));
         }
         Ok(
-            json!({"native_interface": "EWMH", "action": action, "window": result["window"], "verified": true, "observed_state": {"exists": result["exists"], "minimized": result["minimized"], "maximized": result["maximized"], "active": result["active"]}}),
+            json!({"native_interface": "EWMH", "action": action, "window": result["window"], "window_binding": result["window_binding"], "verified": true, "observed_state": {"exists": result["exists"], "minimized": result["minimized"], "maximized": result["maximized"], "active": result["active"]}}),
         )
     }
 
@@ -1842,44 +1924,36 @@ impl AtspiBackend for LinuxBackend {
         process_id: u32,
         deadline: Instant,
     ) -> Result<Value, AutomationError> {
-        let path = self.input_helper("paste", deadline)?;
-        let window = window.ok_or_else(|| {
-            driver_error(
-                "DRIVER.ACTION_UNSUPPORTED",
-                "input requires an observed top-level window",
-            )
-        })?;
-        self.input_helper("window-focus", deadline)?;
-        let focus = self.focus(target, Some(window), deadline)?;
-        std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
-        let window_id = self
-            .verify_focused(target, Some(window), process_id, deadline)
-            .map_err(after_focus)?;
         let mut args = vec![
             "paste".to_string(),
             "--expected-pid".into(),
             process_id.to_string(),
-            "--deadline-monotonic-ns".into(),
-            monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        append_window_args(&mut args, window, Some(window_id));
-        let output = self.run_helper(
-            &path,
-            &args,
-            Some(text.as_bytes()),
+        let (path, focus) = self
+            .prepare_anchored_keyboard("paste", target, window, process_id, deadline, &mut args)?;
+        let input = self.run_anchored_keyboard(AnchoredKeyboard {
+            path: &path,
+            args,
+            payload: Some(text.as_bytes()),
+            strokes: 1,
+            target,
+            process_id,
             deadline,
-            XTEST_OUTPUT_LIMIT,
-            XTEST_OUTPUT_LIMIT,
-        )?;
-        let input = parse_input_helper(output, "keyboard_dispatch", 4, process_id)?;
+            phase: "keyboard_dispatch",
+            minimum_events: 4,
+        })?;
         if input["consumed"] != true {
-            return Err(driver_error(
+            let mut error = driver_error(
                 "DRIVER.PASTE_NOT_CONSUMED",
                 "paste text was not served to the target; inspect paste diagnostics",
             )
             .with_effect("unknown")
             .with_detail("clipboard_restored", input["restored"].clone())
-            .with_detail("paste_diagnostics", input["paste_diagnostics"].clone()));
+            .with_detail("paste_diagnostics", input["paste_diagnostics"].clone());
+            if let Some(progress) = input.get("input_progress") {
+                error = error.with_detail("input_progress", progress.clone());
+            }
+            return Err(error);
         }
         Ok(
             json!({"native_interface": "Component.grab_focus -> X11 CLIPBOARD + XTEST Ctrl+V", "focus": focus, "input": input, "synthetic_input": true, "clipboard_restored": input["restored"]}),
@@ -1966,7 +2040,7 @@ impl LinuxBackend {
     fn capture_tree(
         &self,
         root: NativeRef,
-        info: Map<String, Value>,
+        mut info: Map<String, Value>,
         ancestors: Vec<NativeRef>,
         max_depth: u32,
         max_nodes: usize,
@@ -1974,6 +2048,7 @@ impl LinuxBackend {
     ) -> Result<BackendSnapshot, AutomationError> {
         self.ensure_focus_discovery(&info, deadline);
         let input = self.probe_input(deadline).ok();
+        let qt_windows = self.read_qt_x11_windows(&mut info, deadline)?;
         let mut snapshot = self.capture_tree_nodes(
             root.clone(),
             info,
@@ -1981,8 +2056,10 @@ impl LinuxBackend {
             max_depth,
             max_nodes,
             input.as_ref(),
+            qt_windows.as_deref(),
             deadline,
         )?;
+        snapshot.qt_x11_windows = qt_windows;
         self.append_focused_branch(
             &root,
             &mut snapshot,
@@ -1992,13 +2069,6 @@ impl LinuxBackend {
             deadline,
         )?;
         self.normalize_coordinates(&mut snapshot, deadline)?;
-        let process_id = snapshot
-            .application
-            .get("process_id")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value > 0);
-        self.add_window_actions(&mut snapshot.nodes, process_id, input.as_ref(), deadline);
         Ok(snapshot)
     }
 
@@ -2011,6 +2081,7 @@ impl LinuxBackend {
         max_depth: u32,
         max_nodes: usize,
         input: Option<&InputSupport>,
+        qt_windows: Option<&[QtX11Window]>,
         deadline: Instant,
     ) -> Result<BackendSnapshot, AutomationError> {
         let mut nodes = Vec::new();
@@ -2022,7 +2093,10 @@ impl LinuxBackend {
         }
         for ancestor in ancestors {
             let parent = nodes.len().checked_sub(1);
-            nodes.push(self.read_node(ancestor, parent, &info, input, deadline)?.0);
+            nodes.push(
+                self.read_node(ancestor, parent, &info, input, qt_windows, deadline)?
+                    .0,
+            );
         }
         let parent = nodes.len().checked_sub(1);
         let mut queue = VecDeque::from([(root, parent, 0u32)]);
@@ -2040,7 +2114,7 @@ impl LinuxBackend {
                 break;
             }
             let (node, child_count) =
-                self.read_node(target.clone(), parent, &info, input, deadline)?;
+                self.read_node(target.clone(), parent, &info, input, qt_windows, deadline)?;
             let current = nodes.len();
             nodes.push(node);
             match self.child_references(&target, deadline) {
@@ -2094,19 +2168,23 @@ impl LinuxBackend {
             nodes,
             truncated,
             truncation_reasons,
+            qt_x11_windows: None,
         })
     }
 
-    /// The window manager's view of a top-level frame, when the X11 helper
-    /// and an EWMH window manager are there; `None` offers no window actions.
+    // A read-only view for window actions or exact client title conversion.
     fn window_info(
         &self,
         process_id: u32,
         bounds: Bounds,
         path: &Path,
         deadline: Instant,
+        request_proof: bool,
     ) -> Option<Value> {
         let mut args = window_args("window-info", process_id, bounds);
+        if request_proof {
+            args.extend(["--geometry-proof".into(), "1".into()]);
+        }
         args.extend([
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline).ok()?.to_string(),
@@ -2125,78 +2203,60 @@ impl LinuxBackend {
             return None;
         }
         let info = parse_one_json_object(&output.stdout, "window info").ok()?;
-        (info.get("ok") == Some(&Value::Bool(true)) && info.get("ewmh") == Some(&Value::Bool(true)))
+        (info.get("ok") == Some(&json!(true)) && !info.contains_key("dispatch_started"))
             .then_some(Value::Object(info))
-    }
-
-    /// Offer window actions on each top-level frame, by its current state.
-    fn add_window_actions(
-        &self,
-        nodes: &mut [BackendNode],
-        process_id: Option<u32>,
-        input: Option<&InputSupport>,
-        deadline: Instant,
-    ) {
-        let Some(input) =
-            input.filter(|input| input.has("window-info") && input.has("window-action"))
-        else {
-            return;
-        };
-        let Some(process_id) = process_id else {
-            return;
-        };
-        for node in nodes.iter_mut() {
-            // Uncalibrated bounds stay toolkit-logical, so a mapped window is
-            // skipped. A minimized one is unmapped and can never be calibrated;
-            // the helper below still binds it by these exact bounds.
-            let unproven =
-                node.provenance.get("coordinate_space") == Some(&json!("unproven_toolkit"));
-            // A direct child of the application is a top-level window: GTK and
-            // Qt main windows say frame/dialog, a bare QWidget window filler.
-            // The helper still proves an X11 client window of this process
-            // has exactly these bounds before anything is offered.
-            let top_level = node.parent_index == Some(0);
-            let Some(bounds) = node.bounds.filter(|b| b.width > 0 && b.height > 0) else {
-                continue;
-            };
-            if !top_level || remaining(deadline, false).is_err() {
-                continue;
-            }
-            let Some(info) = self.window_info(process_id, bounds, &input.path, deadline) else {
-                continue;
-            };
-            let supports = |name: &str| info["supports"][name] == true;
-            let minimized = info["minimized"] == true;
-            if unproven && !minimized {
-                continue;
-            }
-            let maximized = info["maximized"] == true;
-            let mut offered = Vec::new();
-            if !minimized {
-                offered.push("minimize");
-            }
-            if supports("maximize") && !maximized && !minimized {
-                offered.push("maximize");
-            }
-            if (minimized && supports("activate")) || (maximized && supports("maximize")) {
-                offered.push("restore");
-            }
-            if supports("close") {
-                offered.push("close_window");
-            }
-            if supports("activate") && !minimized && info["active"] != true {
-                offered.push("activate");
-            }
-            node.actions.extend(offered.into_iter().map(String::from));
-            node.provenance.insert(
-                "window".into(),
-                json!({"x11_window": info["window"], "minimized": minimized, "maximized": maximized, "active": info["active"]}),
-            );
-        }
     }
 }
 
 const INPUT_HELPER_PROTOCOL: u64 = 1;
+const KEYBOARD_ROUTE_FEATURES: [&str; 4] = [
+    "focus-info",
+    "window-focus",
+    "atomic-key-dispatch",
+    GEOMETRY_FEATURE,
+];
+
+#[derive(Clone, Copy)]
+enum DragKind {
+    Straight,
+    Path,
+    Between,
+}
+
+impl DragKind {
+    const ALL: [Self; 3] = [Self::Straight, Self::Path, Self::Between];
+
+    fn required_features(self) -> &'static [&'static str] {
+        match self {
+            Self::Straight => &["drag", "anchored-straight-drag", GEOMETRY_FEATURE],
+            Self::Path => &[
+                "drag",
+                "anchored-drag-path",
+                "cooperative-cancel",
+                "window-focus",
+                GEOMETRY_FEATURE,
+            ],
+            Self::Between => &[
+                "anchored-drag-between",
+                "cooperative-cancel",
+                "window-focus",
+                GEOMETRY_FEATURE,
+            ],
+        }
+    }
+
+    fn available(self, support: &InputSupport) -> bool {
+        self.required_features()
+            .iter()
+            .all(|feature| support.has(feature))
+    }
+
+    fn require(self, support: &InputSupport) -> Result<(), AutomationError> {
+        self.required_features()
+            .iter()
+            .try_for_each(|feature| support.require(feature))
+    }
+}
 
 /// Capabilities describe the binary, not the user's display. Live display,
 /// focus, UID and hit checks still run for every actual operation.
@@ -2205,21 +2265,67 @@ struct InputSupport {
     features: BTreeSet<String>,
 }
 
+fn anchored_keyboard_features(feature: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(feature)
+        .chain([ANCHORED_KEYBOARD])
+        .chain(KEYBOARD_ROUTE_FEATURES)
+        .chain(matches!(feature, "type-text" | "type-text-keys").then_some(TEXT_EVENT_BARRIER))
+}
+
+/// Check the XTest keyboard route against features from a successful helper handshake.
+pub fn require_x11_keyboard_features(
+    command: &str,
+    mut has_feature: impl FnMut(&str) -> bool,
+) -> Result<(), AutomationError> {
+    if let Some(missing) = anchored_keyboard_features(command).find(|feature| !has_feature(feature))
+    {
+        return Err(missing_helper_feature(missing));
+    }
+    Ok(())
+}
+
 impl InputSupport {
+    fn has_drag(&self) -> bool {
+        DragKind::ALL.into_iter().any(|kind| kind.available(self))
+    }
+
     fn has(&self, feature: &str) -> bool {
         self.features.contains(feature)
+    }
+
+    fn has_anchored_keyboard(&self, feature: &str) -> bool {
+        anchored_keyboard_features(feature).all(|feature| self.has(feature))
+    }
+
+    fn require_anchored_keyboard(&self, feature: &str) -> Result<(), AutomationError> {
+        require_x11_keyboard_features(feature, |required| self.has(required))
     }
 
     fn require(&self, feature: &str) -> Result<(), AutomationError> {
         if self.has(feature) {
             Ok(())
         } else {
-            Err(
-                incompatible_helper("required helper feature is unavailable")
-                    .with_detail("required_feature", json!(feature)),
-            )
+            Err(missing_helper_feature(feature))
         }
     }
+
+    fn has_keyboard_route(&self) -> bool {
+        KEYBOARD_ROUTE_FEATURES
+            .iter()
+            .all(|feature| self.has(feature))
+    }
+
+    fn require_keyboard_route(&self) -> Result<(), AutomationError> {
+        for feature in KEYBOARD_ROUTE_FEATURES {
+            self.require(feature)?;
+        }
+        Ok(())
+    }
+}
+
+fn missing_helper_feature(feature: &str) -> AutomationError {
+    incompatible_helper("required helper feature is unavailable")
+        .with_detail("required_feature", json!(feature))
 }
 
 fn incompatible_helper(reason: &str) -> AutomationError {
@@ -2463,7 +2569,7 @@ fn run_helper_cancellable(
                 }
             }
             let dispatched = stdout_result.as_deref().is_some_and(helper_dispatched);
-            return Err(token
+            let error = token
                 .check()
                 .unwrap_err()
                 .with_effect(if dispatched || !clean_exit {
@@ -2472,7 +2578,11 @@ fn run_helper_cancellable(
                     "not_applied"
                 })
                 .with_detail("dispatch_started", json!(dispatched))
-                .with_detail("helper_exited_before_kill", json!(clean_exit)));
+                .with_detail("helper_exited_before_kill", json!(clean_exit));
+            return Err(with_helper_receipt(
+                error,
+                stdout_result.as_deref().unwrap_or_default(),
+            ));
         }
         if status.is_some() && stdout_result.is_some() && stderr_result.is_some() {
             break;
@@ -2487,9 +2597,13 @@ fn run_helper_cancellable(
                 }
             }
             let dispatched = stdout_result.as_deref().is_some_and(helper_dispatched);
-            return Err(super::timeout_error(dispatched || !clean_exit)
+            let error = super::timeout_error(dispatched || !clean_exit)
                 .with_detail("dispatch_started", json!(dispatched))
-                .with_detail("helper_exited_before_kill", json!(clean_exit)));
+                .with_detail("helper_exited_before_kill", json!(clean_exit));
+            return Err(with_helper_receipt(
+                error,
+                stdout_result.as_deref().unwrap_or_default(),
+            ));
         }
         if let (Some(input), Some(stdin)) = (input, child.stdin.as_mut()) {
             // A helper may stop consuming stdin. Never block cancellation or
@@ -2517,17 +2631,19 @@ fn run_helper_cancellable(
                         }
                     }
                     let dispatched = stdout_result.as_deref().is_some_and(helper_dispatched);
-                    return Err(driver_error(
-                        "DRIVER.ACTION_FAILED",
-                        "helper input could not be written",
-                    )
-                    .with_effect(if dispatched || !clean_exit {
-                        "unknown"
-                    } else {
-                        "not_applied"
-                    })
-                    .with_detail("dispatch_started", json!(dispatched))
-                    .with_detail("helper_exited_before_kill", json!(clean_exit)));
+                    let error =
+                        driver_error("DRIVER.ACTION_FAILED", "helper input could not be written")
+                            .with_effect(if dispatched || !clean_exit {
+                                "unknown"
+                            } else {
+                                "not_applied"
+                            })
+                            .with_detail("dispatch_started", json!(dispatched))
+                            .with_detail("helper_exited_before_kill", json!(clean_exit));
+                    return Err(with_helper_receipt(
+                        error,
+                        stdout_result.as_deref().unwrap_or_default(),
+                    ));
                 }
             }
         }
@@ -2548,6 +2664,51 @@ fn helper_dispatched(bytes: &[u8]) -> bool {
         .any(|value| value["event"] == "dispatch_started" || value["dispatch_started"] == true)
 }
 
+fn helper_progress(bytes: &[u8]) -> Option<Value> {
+    let progress = bytes
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .find(|value| value["event"] == "input_progress")?;
+    parse_helper_progress(&progress)
+}
+
+fn parse_helper_progress(progress: &Value) -> Option<Value> {
+    let unit = progress["unit"].as_str()?;
+    let delivered = progress["delivered"].as_u64()?;
+    let total = progress["total"].as_u64()?;
+    let proven_window = progress["proven_window"].as_u64()?;
+    let released = progress["released"].as_bool()?;
+    if !matches!(unit, "codepoint" | "key" | "chord" | "paste" | "button")
+        || delivered > total
+        || proven_window > u64::from(u32::MAX)
+    {
+        return None;
+    }
+    Some(json!({"unit": unit, "delivered": delivered, "total": total,
+                "proven_window": proven_window, "released": released}))
+}
+
+fn with_helper_receipt(mut error: AutomationError, stdout: &[u8]) -> AutomationError {
+    if let Some(progress) = helper_progress(stdout) {
+        error = error.with_detail("input_progress", progress);
+    }
+    for frame in stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .filter(|value| value["ok"].is_boolean())
+    {
+        if let Some(restored) = frame["restored"].as_str().filter(|state| {
+            matches!(
+                *state,
+                "untouched" | "restored" | "ownership_changed" | "cleared" | "lost" | "unknown"
+            )
+        }) {
+            error = error.with_detail("clipboard_restored", json!(restored));
+        }
+    }
+    error
+}
+
 fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader.take(limit as u64 + 1).read_to_end(&mut bytes)?;
@@ -2565,8 +2726,7 @@ fn terminate(child: &mut Child) {
 }
 
 fn terminate_with_grace(child: &mut Child, grace: Duration) -> bool {
-    // A completed paste can leave its clipboard restorer in the process group.
-    // Never signal that group after its helper has already exited.
+    // Never signal a helper's process group after the helper has exited.
     if child.try_wait().ok().flatten().is_some() {
         return true;
     }
@@ -2591,18 +2751,6 @@ fn terminate_with_grace(child: &mut Child, grace: Duration) -> bool {
     false
 }
 
-fn valid_focus_proof(proof: &Map<String, Value>, process_id: u32) -> bool {
-    proof.get("ok") == Some(&Value::Bool(true))
-        && proof.get("focused") == Some(&Value::Bool(true))
-        && proof.get("expected_pid").and_then(Value::as_u64) == Some(u64::from(process_id))
-        && proof.get("window_bound") == Some(&Value::Bool(true))
-        && proof
-            .get("window")
-            .and_then(Value::as_u64)
-            .is_some_and(|id| id > 0 && id <= u64::from(u32::MAX))
-        && !proof.contains_key("dispatch_started")
-}
-
 fn parse_input_helper(
     output: HelperOutput,
     phase: &str,
@@ -2624,8 +2772,11 @@ fn parse_input_helper(
     }
     if output.status.success() {
         let result = result.ok_or_else(|| {
-            driver_error("DRIVER.UNKNOWN_EFFECT", "helper success result is missing")
-                .with_effect("unknown")
+            with_helper_receipt(
+                driver_error("DRIVER.UNKNOWN_EFFECT", "helper success result is missing")
+                    .with_effect("unknown"),
+                &output.stdout,
+            )
         })?;
         if !dispatched
             || result.get("ok") != Some(&Value::Bool(true))
@@ -2634,19 +2785,26 @@ fn parse_input_helper(
                 .and_then(Value::as_u64)
                 .is_none_or(|events| events < minimum_events)
         {
-            return Err(driver_error(
-                "DRIVER.UNKNOWN_EFFECT",
-                "helper did not prove successful input dispatch",
-            )
-            .with_effect("unknown"));
+            return Err(with_helper_receipt(
+                driver_error(
+                    "DRIVER.UNKNOWN_EFFECT",
+                    "helper did not prove successful input dispatch",
+                )
+                .with_effect("unknown"),
+                &output.stdout,
+            ));
         }
         let mut answer = json!({"native_interface": "XTEST", "synthetic_input": true, "submitted": true, "events": result["events"], "codepoints": result.get("codepoints").cloned().unwrap_or(Value::Null), "expected_process_id": process_id});
+        if let Some(progress) = helper_progress(&output.stdout) {
+            answer["input_progress"] = progress;
+        }
         // Window and paste commands report what they observed afterwards.
         for key in [
             "consumed",
             "restored",
             "reached",
             "window",
+            "window_binding",
             "action",
             "exists",
             "minimized",
@@ -2686,23 +2844,45 @@ fn parse_input_helper(
     }
     let code = output.status.code();
     let helper_code = helper_error_code(&output.stdout);
+    if dispatched && helper_code.as_deref() == Some("drag_endpoint_changed") {
+        return Err(with_helper_receipt(
+            driver_error(
+                "DRIVER.POINT_NOT_PROVEN",
+                "a drag endpoint no longer matches its observed window after dispatch started",
+            )
+            .with_effect("unknown")
+            .with_detail("phase", json!(phase))
+            .with_detail("helper_code", json!(helper_code))
+            .with_detail("dispatch_started", json!(true)),
+            &output.stdout,
+        ));
+    }
     if !dispatched {
         if let Some(mapped) = helper_code.as_deref().and_then(map_helper_code) {
-            return Err(mapped
-                .with_detail("helper_code", json!(helper_code))
-                .with_detail("helper_exit_code", json!(code))
-                .with_detail("dispatch_started", json!(false)));
+            return Err(with_helper_receipt(
+                mapped
+                    .with_detail("helper_code", json!(helper_code))
+                    .with_detail("helper_exit_code", json!(code))
+                    .with_detail("dispatch_started", json!(false)),
+                &output.stdout,
+            ));
         }
     }
     if dispatched || code == Some(70) {
-        return Err(driver_error(
-            "DRIVER.UNKNOWN_EFFECT",
-            "XTest helper failed after dispatch",
-        )
-        .with_effect("unknown")
-        .with_detail("phase", json!(phase))
-        .with_detail("helper_code", json!(helper_code))
-        .with_detail("dispatch_started", json!(dispatched)));
+        let message = match helper_code.as_deref() {
+            Some("text_stroke_unconfirmed") => {
+                "the X11 application did not acknowledge the last key release; typing stopped"
+            }
+            _ => "XTest helper failed after dispatch",
+        };
+        return Err(with_helper_receipt(
+            driver_error("DRIVER.UNKNOWN_EFFECT", message)
+                .with_effect("unknown")
+                .with_detail("phase", json!(phase))
+                .with_detail("helper_code", json!(helper_code))
+                .with_detail("dispatch_started", json!(dispatched)),
+            &output.stdout,
+        ));
     }
     let (error_code, message, retryable) = match code {
         Some(69) => ("DRIVER.UNAVAILABLE", "X11/XTest is unavailable", false),
@@ -2722,11 +2902,14 @@ fn parse_input_helper(
             false,
         ),
     };
-    Err(driver_error(error_code, message)
-        .with_retryable(retryable)
-        .with_detail("helper_exit_code", json!(code))
-        .with_detail("helper_code", json!(helper_code))
-        .with_detail("dispatch_started", json!(false)))
+    Err(with_helper_receipt(
+        driver_error(error_code, message)
+            .with_retryable(retryable)
+            .with_detail("helper_exit_code", json!(code))
+            .with_detail("helper_code", json!(helper_code))
+            .with_detail("dispatch_started", json!(false)),
+        &output.stdout,
+    ))
 }
 
 /// The `code` of the helper's failure record, if it printed one.
@@ -2745,7 +2928,7 @@ fn map_helper_code(code: &str) -> Option<AutomationError> {
             "DRIVER.ACTION_UNSUPPORTED",
             "the window manager does not support this EWMH window request",
         ),
-        "window_not_found" | "window_ambiguous" => driver_error(
+        "window_not_found" | "window_ambiguous" | "target_window_changed" => driver_error(
             "DRIVER.STALE_SNAPSHOT",
             "no single top-level X11 window of the process matches the observed frame",
         ),
@@ -2757,13 +2940,29 @@ fn map_helper_code(code: &str) -> Option<AutomationError> {
             "DRIVER.CLIPBOARD_TOO_LARGE",
             "the clipboard holds more than can be kept, so nothing was pasted",
         ),
+        "clipboard_unreadable" => driver_error(
+            "DRIVER.CLIPBOARD_BUSY",
+            "the original clipboard contents could not be saved, so nothing was pasted",
+        ),
+        "clipboard_owner_changed" => driver_error(
+            "DRIVER.CLIPBOARD_BUSY",
+            "clipboard ownership changed before dispatch, so nothing was pasted",
+        ),
+        "clipboard_timestamp_unavailable" => driver_error(
+            "DRIVER.CLIPBOARD_BUSY",
+            "the X server did not provide a clipboard timestamp, so nothing was pasted",
+        ),
         "clipboard_busy" => driver_error(
             "DRIVER.CLIPBOARD_BUSY",
-            "another client kept the clipboard; nothing was pasted",
+            "the clipboard could not be preserved for this paste, so nothing was pasted",
         ),
         "focus_owner_mismatch" | "focus_owner_changed" => driver_error(
             "DRIVER.FOCUS_LOST",
             "keyboard focus is not in the target's process; no key was sent",
+        ),
+        "text_event_barrier_unavailable" => driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "the observed X11 window does not offer keyboard processing acknowledgements; no key was sent",
         ),
         "target_point_mismatch" => driver_error(
             "DRIVER.POINT_NOT_PROVEN",
@@ -2787,12 +2986,17 @@ fn after_focus(error: AutomationError) -> AutomationError {
     } else if error.code == "DRIVER.UNKNOWN_EFFECT" {
         error
     } else {
-        driver_error(
+        let progress = error.details.get("input_progress").cloned();
+        let mut result = driver_error(
             "DRIVER.UNKNOWN_EFFECT",
             "target focus changed before synthetic input completed",
         )
         .with_effect("unknown")
-        .with_cause(error)
+        .with_cause(error);
+        if let Some(progress) = progress {
+            result = result.with_detail("input_progress", progress);
+        }
+        result
     }
 }
 
@@ -3064,7 +3268,7 @@ impl LinuxBackend {
     fn describe(&self, target: &NativeRef, info: &Map<String, Value>) -> Option<Value> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let (node, _) = self
-            .read_node(target.clone(), None, info, None, deadline)
+            .read_node(target.clone(), None, info, None, None, deadline)
             .ok()?;
         let protected = node.states.get("protected").copied().flatten() == Some(true);
         Some(json!({
@@ -3443,6 +3647,56 @@ mod capture_tests {
     }
 
     #[test]
+    fn legacy_x11_helper_does_not_offer_anchored_keyboard() {
+        let support = InputSupport {
+            path: PathBuf::new(),
+            features: ["type-text", "type-text-keys", "focus-info", "window-focus"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        };
+        for feature in ["type-text", "type-text-keys"] {
+            assert!(!support.has_anchored_keyboard(feature));
+            let error = support.require_anchored_keyboard(feature).unwrap_err();
+            assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+            assert_eq!(error.details["required_feature"], ANCHORED_KEYBOARD);
+        }
+    }
+
+    #[test]
+    fn only_typing_requires_a_helper_that_waits_for_key_processing() {
+        let mut support = InputSupport {
+            path: PathBuf::new(),
+            features: [
+                "type-text",
+                "type-text-keys",
+                "key-chord",
+                "paste",
+                ANCHORED_KEYBOARD,
+            ]
+            .into_iter()
+            .chain(KEYBOARD_ROUTE_FEATURES)
+            .map(str::to_string)
+            .collect(),
+        };
+        for feature in ["paste", "key-chord"] {
+            assert!(support.has_anchored_keyboard(feature));
+            assert!(support.require_anchored_keyboard(feature).is_ok());
+        }
+        for feature in ["type-text", "type-text-keys"] {
+            assert!(!support.has_anchored_keyboard(feature));
+            let error = support.require_anchored_keyboard(feature).unwrap_err();
+            assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+            assert_eq!(error.details["required_feature"], TEXT_EVENT_BARRIER);
+        }
+        support.features.insert(TEXT_EVENT_BARRIER.into());
+        for feature in ["type-text", "type-text-keys"] {
+            assert!(support.has_anchored_keyboard(feature));
+            assert!(support.require_anchored_keyboard(feature).is_ok());
+        }
+    }
+
+    #[test]
     fn capability_probe_executes_only_describe_and_never_requires_a_display() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("aad-helper-probe-{}", uuid::Uuid::new_v4()));
@@ -3487,6 +3741,67 @@ mod capture_tests {
     }
 
     #[test]
+    fn old_helper_supports_plain_pointer_input_without_proving_keyboard_dispatch() {
+        let features = parse_helper_description(HelperOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: br#"{"helper":"aad-linux-xtest","protocol":1,"features":["pointer-gesture","type-text","key-chord","paste","focus-info","window-focus"]}"#.to_vec(),
+            stderr: vec![],
+        }).unwrap();
+        let mut support = InputSupport {
+            path: "/unused".into(),
+            features,
+        };
+        assert!(support.require("pointer-gesture").is_ok());
+        assert!(!support.has_keyboard_route());
+        let error = support.require_keyboard_route().unwrap_err();
+        assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+        assert_eq!(error.details["required_feature"], "atomic-key-dispatch");
+        support.features.insert("atomic-key-dispatch".into());
+        let error = support.require_keyboard_route().unwrap_err();
+        assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+        assert_eq!(error.details["required_feature"], GEOMETRY_FEATURE);
+        support.features.insert(GEOMETRY_FEATURE.into());
+        assert!(support.has_keyboard_route());
+        assert!(support.require_keyboard_route().is_ok());
+    }
+
+    #[test]
+    fn partial_helpers_advertise_only_drag_modes_they_can_dispatch() {
+        let mut support = InputSupport {
+            path: "/unused".into(),
+            features: ["cooperative-cancel", "window-focus", GEOMETRY_FEATURE]
+                .map(str::to_owned)
+                .into(),
+        };
+        assert!(!support.has_drag());
+
+        support.features.insert("drag".into());
+        support.features.insert("anchored-drag-path".into());
+        assert!(support.has_drag());
+        assert!(DragKind::Path.require(&support).is_ok());
+        assert_eq!(
+            DragKind::Straight.require(&support).unwrap_err().details["required_feature"],
+            "anchored-straight-drag"
+        );
+        assert!(!DragKind::Between.available(&support));
+
+        support.features.remove("drag");
+        support.features.remove("anchored-drag-path");
+        support.features.insert("anchored-drag-between".into());
+        assert!(support.has_drag());
+        assert!(DragKind::Between.require(&support).is_ok());
+        assert!(!DragKind::Path.available(&support));
+        assert!(!DragKind::Straight.available(&support));
+
+        support.features.remove("cooperative-cancel");
+        assert!(!support.has_drag());
+        assert_eq!(
+            DragKind::Between.require(&support).unwrap_err().details["required_feature"],
+            "cooperative-cancel"
+        );
+    }
+
+    #[test]
     fn cancellation_waits_for_helper_cleanup_and_preserves_dispatch_evidence() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("aad-helper-cancel-{}", uuid::Uuid::new_v4()));
@@ -3496,7 +3811,8 @@ mod capture_tests {
             &helper,
             concat!(
                 "#!/bin/sh\n",
-                "trap 'touch cleaned; exit 0' TERM\n",
+                "cleanup() { touch cleaned; printf '%s\\n' '{\"event\":\"input_progress\",\"unit\":\"chord\",\"delivered\":1,\"total\":1,\"proven_window\":42,\"released\":true}'; exit 0; }\n",
+                "trap cleanup TERM\n",
                 "printf '%s\\n' '{\"event\":\"dispatch_started\"}'\n",
                 "touch ready\n",
                 "while :; do sleep 0.01; done\n",
@@ -3530,7 +3846,26 @@ mod capture_tests {
         assert_eq!(error.effect, "unknown");
         assert_eq!(error.details["dispatch_started"], true);
         assert_eq!(error.details["helper_exited_before_kill"], true);
+        assert_eq!(error.details["input_progress"]["delivered"], 1);
+        assert_eq!(error.details["input_progress"]["released"], true);
         assert!(dir.join("cleaned").exists());
+        let timeout = run_helper_cancellable(
+            &helper,
+            &[],
+            None,
+            Instant::now() + Duration::from_secs(1),
+            4096,
+            4096,
+            None,
+        )
+        .err()
+        .expect("helper must observe the deadline");
+        assert_eq!(timeout.code, "DRIVER.TIMEOUT");
+        assert_eq!(timeout.effect, "unknown");
+        assert_eq!(
+            timeout.details["input_progress"],
+            error.details["input_progress"]
+        );
         std::fs::remove_file(dir.join("ready")).unwrap();
         let error = run_helper_cancellable(
             &helper,
@@ -3680,6 +4015,101 @@ mod capture_tests {
     }
 
     #[test]
+    fn paste_refusals_explain_why_the_clipboard_could_not_be_preserved() {
+        for (helper_code, exit, reason) in [
+            (
+                "clipboard_unreadable",
+                69,
+                "original clipboard contents could not be saved",
+            ),
+            ("clipboard_owner_changed", 73, "clipboard ownership changed"),
+            (
+                "clipboard_timestamp_unavailable",
+                69,
+                "X server did not provide a clipboard timestamp",
+            ),
+            ("clipboard_busy", 73, "clipboard could not be preserved"),
+        ] {
+            let stdout = json!({"ok": false, "code": helper_code, "dispatch_started": false,
+                                "restored": "untouched"});
+            let error = parse_input_helper(
+                HelperOutput {
+                    status: ExitStatus::from_raw(exit << 8),
+                    stdout: stdout.to_string().into_bytes(),
+                    stderr: vec![],
+                },
+                "keyboard_dispatch",
+                4,
+                42,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "DRIVER.CLIPBOARD_BUSY");
+            assert_eq!(error.effect, "not_applied");
+            assert_eq!(error.details["helper_code"], helper_code);
+            assert_eq!(error.details["dispatch_started"], false);
+            assert_eq!(error.details["clipboard_restored"], "untouched");
+            assert!(error.message.contains(reason), "{}", error.message);
+            assert!(
+                error.message.contains("nothing was pasted"),
+                "{}",
+                error.message
+            );
+        }
+
+        let obsolete = with_helper_receipt(
+            driver_error("DRIVER.CLIPBOARD_BUSY", "clipboard refused"),
+            br#"{"ok":false,"restored":"none"}"#,
+        );
+        assert!(obsolete.details.get("clipboard_restored").is_none());
+    }
+
+    #[test]
+    fn helper_progress_preserves_partial_effect_and_excludes_payloads() {
+        let success = parse_input_helper(HelperOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: br#"{"event":"input_progress","unit":"codepoint","delivered":2,"total":2,"proven_window":42,"released":true,"text":"private"}
+{"ok":true,"dispatch_started":true,"events":4}"#.to_vec(),
+            stderr: vec![],
+        }, "keyboard_dispatch", 2, 42).unwrap();
+        assert_eq!(
+            success["input_progress"],
+            json!({"unit":"codepoint", "delivered":2,
+            "total":2, "proven_window":42, "released":true})
+        );
+
+        for (dispatched, exit, code, effect, delivered) in [
+            (false, 73, "DRIVER.FOCUS_LOST", "not_applied", 0),
+            (true, 70, "DRIVER.UNKNOWN_EFFECT", "unknown", 1),
+        ] {
+            let stdout = format!(
+                "{}\n{}\n",
+                json!({"event":"input_progress", "unit":"codepoint", "delivered":delivered,
+                    "total":2, "proven_window":42, "released":true}),
+                json!({"ok":false, "code":"focus_owner_changed", "dispatch_started":dispatched}),
+            );
+            let error = parse_input_helper(
+                HelperOutput {
+                    status: ExitStatus::from_raw(exit << 8),
+                    stdout: stdout.into_bytes(),
+                    stderr: vec![],
+                },
+                "keyboard_dispatch",
+                2,
+                42,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error.effect, effect);
+            assert_eq!(error.details["input_progress"]["delivered"], delivered);
+            let redacted = super::super::redact_secret_error(error);
+            assert_eq!(
+                redacted.details,
+                Map::from_iter([("redacted".into(), json!(true))])
+            );
+        }
+    }
+
+    #[test]
     fn paste_diagnostics_keep_counts_and_flags_without_payloads() {
         let result = parse_input_helper(HelperOutput {
             status: ExitStatus::from_raw(0),
@@ -3715,46 +4145,6 @@ mod capture_tests {
             .into_iter()
             .collect()
         )));
-    }
-
-    #[test]
-    fn focus_proof_requires_a_bound_window_and_expected_pid_without_input_dispatch() {
-        for (proof, expected) in [
-            (
-                json!({"ok": true, "focused": true, "expected_pid": 42}),
-                false,
-            ),
-            (
-                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": true, "window": 123}),
-                true,
-            ),
-            (
-                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": true, "window": 0}),
-                false,
-            ),
-            (
-                json!({"ok": true, "focused": true, "expected_pid": 42, "window_bound": false, "window": 123}),
-                false,
-            ),
-            (
-                json!({"ok": true, "focused": false, "expected_pid": 42}),
-                false,
-            ),
-            (
-                json!({"ok": true, "focused": true, "expected_pid": 43}),
-                false,
-            ),
-            (
-                json!({"ok": false, "focused": true, "expected_pid": 42}),
-                false,
-            ),
-            (
-                json!({"ok": true, "focused": true, "expected_pid": 42, "dispatch_started": false}),
-                false,
-            ),
-        ] {
-            assert_eq!(valid_focus_proof(proof.as_object().unwrap(), 42), expected);
-        }
     }
 
     #[test]

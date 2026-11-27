@@ -1,13 +1,21 @@
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#include <X11/Xlibint.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <X11/XKBlib.h>
 #include <X11/Xproto.h>
 #include <X11/extensions/XTest.h>
+#include <X11/extensions/XResproto.h>
 #include <X11/extensions/record.h>
+#include <X11/extensions/shape.h>
+
+#undef min
+#undef max
 
 #include <algorithm>
+#include <array>
+#include <bitset>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -24,6 +32,7 @@
 #include <poll.h>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -34,6 +43,8 @@ namespace {
 
 constexpr std::size_t kMaxInputBytes = 4096;
 constexpr std::size_t kMaxCodepoints = 1024;
+constexpr useconds_t kTextStrokeGapUs = 2000;
+constexpr auto kTextEventWait = std::chrono::milliseconds(250);
 constexpr int kExitInvalid = 64;
 constexpr int kExitUnavailable = 69;
 constexpr int kExitUnknownEffect = 70;
@@ -65,11 +76,14 @@ int HandleXError(Display *, XErrorEvent *) {
     return 0;
 }
 
-void EmitError(std::string_view code, std::string_view phase, bool dispatched) {
+void EmitError(std::string_view code, std::string_view phase, bool dispatched,
+               std::string_view restored = {}) {
     std::cout << "{\"ok\":false,\"code\":\"" << code
               << "\",\"phase\":\"" << phase
               << "\",\"dispatch_started\":"
-              << (dispatched ? "true" : "false") << "}" << std::endl;
+              << (dispatched ? "true" : "false");
+    if (!restored.empty()) std::cout << ",\"restored\":\"" << restored << '"';
+    std::cout << "}" << std::endl;
 }
 
 bool DeadlineExpired(std::uint64_t deadline_ns) {
@@ -77,6 +91,37 @@ bool DeadlineExpired(std::uint64_t deadline_ns) {
     const auto now_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
     return g_input_cancelled != 0 || now_ns < 0 || static_cast<std::uint64_t>(now_ns) >= deadline_ns;
+}
+
+// Other clients cannot change focus between the proof and XTest processing.
+// Callbacks may query this connection, but must not wait for another client.
+template <typename Verify, typename Emit, typename Release>
+std::string_view AtomicBurst(Display *display, Verify verify, Emit emit, Release release) {
+    g_x_error = false;
+    XGrabServer(display);
+    XSync(display, False);
+    std::string_view problem;
+    if (g_x_error) {
+        problem = "server_grab_failed";
+    } else {
+        problem = verify();
+        if (problem.empty()) {
+            if (g_x_error) {
+                problem = "x11_error";
+            } else {
+                const bool submitted = emit();
+                XSync(display, False);
+                if (!submitted || g_x_error) {
+                    release();
+                    XSync(display, False);
+                    problem = "x11_error";
+                }
+            }
+        }
+    }
+    XUngrabServer(display);
+    XSync(display, False);
+    return problem;
 }
 
 std::optional<std::uint64_t> ParseUnsigned(std::string_view value) {
@@ -222,9 +267,226 @@ struct Geometry {
 struct WindowBinding {
     Window id = None;
     Geometry bounds;
+    bool request_proof = false;
+    std::string proof{};
 };
 bool FocusMatchesWindow(Display *, unsigned long, Atom, const std::optional<WindowBinding> &);
 bool PointMatchesWindow(Display *, int, int, unsigned long, Atom, const std::optional<WindowBinding> &);
+
+std::string_view KeyboardFocusProblem(Display *display, unsigned long pid, Atom pid_atom,
+                                      const std::optional<WindowBinding> &binding,
+                                      std::uint64_t deadline_ns) {
+    if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
+    if (!FocusMatchesWindow(display, pid, pid_atom, binding)) return "focus_owner_changed";
+    if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
+    return {};
+}
+
+// An XSync round-trip only proves server processing. Put an EWMH ping in the
+// same client event queue after key-up and wait for the client to echo it.
+struct KeyboardEventBarrier {
+    Display *display;
+    Window root, target, clock;
+    Atom protocols, ping, stamp;
+
+    static std::optional<KeyboardEventBarrier> Open(Display *display, Window target) {
+        const Atom ping = XInternAtom(display, "_NET_WM_PING", True);
+        Atom *supported = nullptr;
+        int count = 0;
+        if (ping == None || !XGetWMProtocols(display, target, &supported, &count)) return std::nullopt;
+        const bool enabled = count > 0 && std::find(supported, supported + count, ping) != supported + count;
+        XFree(supported);
+        if (!enabled) return std::nullopt;
+        const Window root = DefaultRootWindow(display);
+        const Window clock = XCreateSimpleWindow(display, root, 0, 0, 1, 1, 0, 0, 0);
+        XSelectInput(display, clock, PropertyChangeMask);
+        // Qt/XCB echoes with StructureNotifyMask, GTK uses SubstructureNotifyMask.
+        XSelectInput(display, root, StructureNotifyMask | SubstructureNotifyMask);
+        return KeyboardEventBarrier{display, root, target, clock,
+                                    XInternAtom(display, "WM_PROTOCOLS", False), ping,
+                                    XInternAtom(display, "AAD_TIMESTAMP", False)};
+    }
+
+    bool MatchesReply(const XEvent &event, const XClientMessageEvent &sent, unsigned long request) const {
+        const auto &reply = event.xclient;
+        // Xlib can sign-extend these 32-bit wire values when decoding into long.
+        return event.type == ClientMessage && reply.send_event && reply.serial >= request &&
+               reply.window == root && reply.message_type == protocols && reply.format == 32 &&
+               std::equal(reply.data.l, reply.data.l + 5, sent.data.l, [](long actual, long expected) {
+                   return static_cast<std::uint32_t>(actual) == static_cast<std::uint32_t>(expected);
+               });
+    }
+
+    std::string_view Wait(std::uint64_t deadline_ns) const {
+        const auto until = std::chrono::steady_clock::now() + kTextEventWait;
+        const auto wait_for = [&](auto matches) {
+            while (!DeadlineExpired(deadline_ns) && std::chrono::steady_clock::now() < until) {
+                if (XPending(display)) {
+                    XEvent event{};
+                    XNextEvent(display, &event);
+                    if (matches(event)) return true;
+                } else {
+                    pollfd input{ConnectionNumber(display), POLLIN, 0};
+                    if (poll(&input, 1, 1) < 0 && errno != EINTR) break;
+                }
+            }
+            return false;
+        };
+
+        // Obtain a real server timestamp after the stroke. This identifies
+        // the reply together with the exact target window from the ping.
+        XChangeProperty(display, clock, stamp, XA_STRING, 8, PropModeAppend, nullptr, 0);
+        XFlush(display);
+        Time time = CurrentTime;
+        if (wait_for([&](const XEvent &event) {
+            if (event.type != PropertyNotify || event.xproperty.window != clock ||
+                event.xproperty.atom != stamp || event.xproperty.send_event) return false;
+            time = event.xproperty.time;
+            return time != CurrentTime;
+        })) {
+            XEvent ping_event{};
+            ping_event.xclient.type = ClientMessage;
+            ping_event.xclient.window = target;
+            ping_event.xclient.message_type = protocols;
+            ping_event.xclient.format = 32;
+            ping_event.xclient.data.l[0] = static_cast<long>(ping);
+            ping_event.xclient.data.l[1] = static_cast<long>(time);
+            ping_event.xclient.data.l[2] = static_cast<long>(target);
+            const unsigned long request = NextRequest(display);
+            if (XSendEvent(display, target, False, NoEventMask, &ping_event)) {
+                XFlush(display);
+                if (wait_for([&](const XEvent &event) {
+                    return MatchesReply(event, ping_event.xclient, request);
+                })) return {};
+            }
+        }
+        return DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "text_stroke_unconfirmed";
+    }
+};
+
+std::string_view FinishTextStroke(const std::optional<KeyboardEventBarrier> &barrier, bool wait_for_client,
+                                  Display *display, unsigned long pid, Atom pid_atom,
+                                  const std::optional<WindowBinding> &binding, std::uint64_t deadline_ns) {
+    if (!wait_for_client) return DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "";
+    if (!barrier) {
+        usleep(kTextStrokeGapUs);
+        return {};
+    }
+    const auto problem = barrier->Wait(deadline_ns);
+    if (!problem.empty()) {
+        if (const auto focus = KeyboardFocusProblem(display, pid, pid_atom, binding, deadline_ns);
+            !focus.empty()) return focus;
+    }
+    return problem;
+}
+
+bool KeyIsDown(const char (&keys)[32], KeyCode code) {
+    return (static_cast<unsigned char>(keys[code / 8]) & (1U << (code % 8))) != 0;
+}
+
+std::string_view VerifyStrokeKeys(Display *display, KeyCode key, KeyCode modifier = 0) {
+    char keys[32]{};
+    if (!XQueryKeymap(display, keys)) return "x11_error";
+    if (KeyIsDown(keys, key) || (modifier && KeyIsDown(keys, modifier))) return "input_already_held";
+    return {};
+}
+
+bool SubmitKeystroke(Display *display, KeyCode key, KeyCode modifier) {
+    return (!modifier || XTestFakeKeyEvent(display, modifier, True, 1)) &&
+           XTestFakeKeyEvent(display, key, True, 1) &&
+           XTestFakeKeyEvent(display, key, False, 1) &&
+           (!modifier || XTestFakeKeyEvent(display, modifier, False, 1));
+}
+
+void ReleaseKeystroke(Display *display, KeyCode key, KeyCode modifier = 0) {
+    char keys[32]{};
+    const bool known = XQueryKeymap(display, keys) != 0;
+    if (!known || KeyIsDown(keys, key)) XTestFakeKeyEvent(display, key, False, 0);
+    if (modifier && (!known || KeyIsDown(keys, modifier))) XTestFakeKeyEvent(display, modifier, False, 0);
+}
+
+void MarkDispatchStarted(bool &dispatched) {
+    if (!dispatched) {
+        std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
+        dispatched = true;
+    }
+}
+
+struct InputProgress {
+    std::string_view unit;
+    std::size_t total;
+    std::size_t delivered = 0;
+    Window proven_window = None;
+    std::bitset<256> attempted_keys;
+    unsigned attempted_buttons = 0;
+
+    InputProgress(std::string_view unit, std::size_t total) : unit(unit), total(total) {}
+
+    void RecordKey(KeyCode code, const std::optional<WindowBinding> &binding,
+                   KeyCode modifier = 0) {
+        attempted_keys.set(code);
+        if (modifier) attempted_keys.set(modifier);
+        if (binding) proven_window = binding->id;
+    }
+
+    void Emit(Display *display = nullptr) const {
+        bool released = true;
+        if (attempted_keys.any()) {
+            char keys[32]{};
+            released = XQueryKeymap(display, keys) != 0;
+            for (unsigned code = 0; code < attempted_keys.size() && released; ++code) {
+                released = !attempted_keys.test(code) || !KeyIsDown(keys, static_cast<KeyCode>(code));
+            }
+        }
+        if (attempted_buttons != 0) {
+            Window root = None, child = None;
+            int rx = 0, ry = 0, wx = 0, wy = 0;
+            unsigned mask = 0;
+            released = XQueryPointer(display, DefaultRootWindow(display), &root, &child,
+                                     &rx, &ry, &wx, &wy, &mask) &&
+                       (mask & attempted_buttons) == 0 && released;
+        }
+        std::cout << "{\"event\":\"input_progress\",\"unit\":\"" << unit
+                  << "\",\"delivered\":" << delivered << ",\"total\":" << total
+                  << ",\"proven_window\":" << proven_window << ",\"released\":"
+                  << (released ? "true" : "false") << "}" << std::endl;
+    }
+};
+
+struct WindowGeometryProof;
+enum class DragPhase { Source, Transit, Destination };
+
+struct DragHit {
+    std::vector<Window> path;
+    bool matches = false;
+    std::optional<unsigned long> client_pid;
+};
+
+class DragHitTest {
+public:
+    explicit DragHitTest(Display *display) : display_(display), root_(DefaultRootWindow(display)) {}
+    bool Watch(Window source);
+    void MarkPress() { press_serial_ = NextRequest(display_); }
+    std::optional<DragHit> At(int x, int y, const WindowGeometryProof &source,
+                              const WindowGeometryProof &destination, DragPhase phase);
+
+private:
+    bool UpdateWindows();
+    bool IsDragIcon(Window window, const XWindowAttributes &attributes) const;
+    std::optional<Window> UnderDragIcons(int x, int y) const;
+
+    Display *display_;
+    Window root_;
+    XID source_owner_ = 0, resource_mask_ = 0;
+    Atom window_type_ = None, dnd_type_ = None, dnd_selection_ = None;
+    unsigned long press_serial_ = 0;
+    bool shape_bounding_ = false;
+    bool shape_input_ = false;
+    std::unordered_set<Window> created_, mapped_;
+};
+
+bool StraightDragPointMatches(Display *, unsigned long, Atom, const WindowBinding &, const WindowBinding &,
+                              DragHitTest &, int, int, DragPhase);
 
 bool FocusBelongsToPid(Display *display, unsigned long expected_pid, Atom pid_atom) {
     Window focus = None;
@@ -424,24 +686,64 @@ bool PhysicalShift(XkbDescPtr map, KeyCode code) {
            map->map->modmap[code] == ShiftMask;
 }
 
+// Private, single-request protocol. AX work happens in Rust; this process
+// continues checking cancellation/ownership while the read-only worker waits.
+std::string_view ValidateSegment(std::string_view token, std::size_t index,
+                                    std::uint64_t deadline_ns,
+                                    const std::function<std::string_view()> &verify, int poll_ms, bool recheck_on_eof = false) {
+    std::cout << "{\"event\":\"validate_segment\",\"token\":\"" << token
+              << "\",\"index\":" << index << "}" << std::endl;
+    std::size_t received = 0;
+    char bytes[96];
+    const std::string expected = "ack " + std::string(token) + " " + std::to_string(index) + "\n";
+    for (;;) {
+        if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
+        if (const auto problem = verify(); !problem.empty()) return problem;
+        pollfd input{STDIN_FILENO, POLLIN, 0};
+        const int ready = poll(&input, 1, poll_ms);
+        if (ready < 0) { if (errno == EINTR) continue; return "path_ack_failed"; }
+        if (ready == 0) continue;
+        if ((input.revents & (POLLERR | POLLNVAL)) != 0) return "path_ack_failed";
+        // The caller writes one short, atomic ACK. Check native focus once per
+        // poll/read, rather than querying X11 separately for every byte.
+        const auto count = read(STDIN_FILENO, bytes, std::min(sizeof(bytes), expected.size() - received));
+        if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (count <= 0) {
+            if (recheck_on_eof) {
+                if (const auto problem = verify(); !problem.empty()) return problem;
+            }
+            return "path_ack_eof";
+        }
+        if (!std::equal(bytes, bytes + count, expected.begin() + received)) return "path_ack_invalid";
+        received += static_cast<std::size_t>(count);
+        if (received == expected.size()) {
+            if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
+            return verify();
+        }
+    }
+}
+
+// Run before grabbing the server, with no injected keys held.
+std::string_view ValidateKeyboardAnchor(std::string_view token, std::size_t index,
+                                       Display *display, unsigned long pid, Atom pid_atom,
+                                       const std::optional<WindowBinding> &binding,
+                                       std::uint64_t deadline_ns) {
+    if (token.empty()) return {};
+    const auto verify = [&] { return KeyboardFocusProblem(display, pid, pid_atom, binding, deadline_ns); };
+    if (const auto problem = verify(); !problem.empty()) return problem;
+    return ValidateSegment(token, index, deadline_ns, verify, 1, true);
+}
+
 // Explicit physical typing lets the target's existing IME compose keystrokes.
 // It never installs Unicode mappings or changes the selected input method.
 int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoints,
                     std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom,
-                    const std::optional<WindowBinding> &binding) {
+                    const std::optional<WindowBinding> &binding, InputProgress &progress,
+                    std::string_view anchor_token, const std::optional<KeyboardEventBarrier> &barrier) {
     bool dispatched = false;
-    std::vector<KeyCode> owned;
     unsigned long events = 0;
-    auto release = [&]() {
-        for (auto it = owned.rbegin(); it != owned.rend(); ++it) {
-            XTestFakeKeyEvent(display, *it, False, 1);
-            ++events;
-        }
-        owned.clear();
-        XSync(display, False);
-    };
     auto fail = [&](std::string_view code, int exit_code) {
-        release();
+        progress.Emit(display);
         XCloseDisplay(display);
         EmitError(code, dispatched ? "keyboard_dispatch" : "text_preflight", dispatched);
         return dispatched ? kExitUnknownEffect : exit_code;
@@ -489,23 +791,19 @@ int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoin
         if (!found) return fail("unsupported_keyboard_mapping", kExitUnsupportedText);
     }
     auto verify = [&](const PhysicalStroke &stroke) -> std::string_view {
-        if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
         if (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid))) return "untrusted_process";
-        if (!FocusMatchesWindow(display, expected_pid, pid_atom, binding)) return "focus_owner_changed";
+        if (const auto problem = KeyboardFocusProblem(display, expected_pid, pid_atom, binding, deadline_ns);
+            !problem.empty()) return problem;
         XkbStateRec state{};
         if (XkbGetState(display, XkbUseCoreKbd, &state) != Success) return "keyboard_map_unavailable";
-        const bool own_shift = std::find(owned.begin(), owned.end(), shift) != owned.end();
         if (state.group != initial.group || state.locked_mods != initial.locked_mods ||
-            state.latched_mods != 0 || state.base_mods != (own_shift ? ShiftMask : 0)) {
+            state.latched_mods != 0 || state.base_mods != 0) {
             return "keyboard_state_changed";
         }
         char down[32]{};
-        XQueryKeymap(display, down);
-        for (unsigned code = 0; code < 256; ++code) {
-            if ((static_cast<unsigned char>(down[code / 8]) & (1U << (code % 8))) != 0 &&
-                std::find(owned.begin(), owned.end(), static_cast<KeyCode>(code)) == owned.end()) {
-                return "input_already_held";
-            }
+        if (!XQueryKeymap(display, down)) return "x11_error";
+        if (std::any_of(std::begin(down), std::end(down), [](char keys) { return keys != 0; })) {
+            return "input_already_held";
         }
         PhysicalMap current(display);
         if (!PhysicalSymbol(current.value, stroke.code, state.group,
@@ -515,33 +813,35 @@ int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoin
         if (stroke.shift && !PhysicalShift(current.value, shift)) {
             return "keyboard_mapping_changed";
         }
-        if (g_x_error) return "x11_error";
-        return {};
+        return DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "";
     };
-    for (const auto &stroke : plan) {
-        if (const auto problem = verify(stroke); !problem.empty()) {
+    for (std::size_t index = 0; index < plan.size(); ++index) {
+        if (const auto problem = ValidateKeyboardAnchor(anchor_token, index, display, expected_pid,
+                                                        pid_atom, binding, deadline_ns); !problem.empty()) {
             return fail(problem, problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
         }
-        auto press = [&](KeyCode code) -> bool {
-            if (!dispatched) {
-                std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
-                dispatched = true;
-            }
-            owned.push_back(code);
-            const bool ok = XTestFakeKeyEvent(display, code, True, 1) != 0;
-            ++events;
-            XSync(display, False);
-            return ok && !g_x_error;
-        };
-        if (stroke.shift) {
-            if (!press(shift)) return fail("x11_error", kExitUnknownEffect);
-            if (const auto problem = verify(stroke); !problem.empty()) return fail(problem, kExitUnknownEffect);
+        const auto &stroke = plan[index];
+        const KeyCode stroke_shift = stroke.shift ? shift : 0;
+        bool attempted = false;
+        const auto problem = AtomicBurst(display, [&] { return verify(stroke); }, [&] {
+            attempted = true;
+            return SubmitKeystroke(display, stroke.code, stroke_shift);
+        }, [&] { ReleaseKeystroke(display, stroke.code, stroke_shift); });
+        if (attempted) {
+            MarkDispatchStarted(dispatched);
+            progress.RecordKey(stroke.code, binding, stroke_shift);
         }
-        if (!press(stroke.code)) return fail("x11_error", kExitUnknownEffect);
-        if (const auto problem = verify(stroke); !problem.empty()) return fail(problem, kExitUnknownEffect);
-        release();
-        if (g_x_error) return fail("x11_error", kExitUnknownEffect);
+        if (!problem.empty()) {
+            return fail(problem, problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
+        }
+        events += stroke_shift ? 4 : 2;
+        ++progress.delivered;
+        if (const auto wait = FinishTextStroke(barrier, index + 1 < plan.size(), display, expected_pid,
+                                              pid_atom, binding, deadline_ns); !wait.empty()) {
+            return fail(wait, kExitTargetMismatch);
+        }
     }
+    progress.Emit(display);
     XCloseDisplay(display);
     std::cout << "{\"ok\":true,\"dispatch_started\":true,\"mode\":\"keys\",\"events\":"
               << events << ",\"codepoints\":" << codepoints.size() << "}" << std::endl;
@@ -659,55 +959,50 @@ void SleepUntilOrDeadline(unsigned milliseconds, std::uint64_t deadline_ns) {
     }
 }
 
-// Private, single-request protocol. AX work happens in Rust; this process
-// continues checking cancellation/ownership while the read-only worker waits.
-std::string_view ValidatePathSegment(const GestureRequest &request, std::size_t index,
-                                    std::uint64_t deadline_ns,
-                                    const std::function<std::string_view()> &verify) {
-    std::cout << "{\"event\":\"validate_segment\",\"token\":\"" << request.path_token
-              << "\",\"index\":" << index << "}" << std::endl;
-    std::string frame;
-    const std::string expected = "ack " + request.path_token + " " + std::to_string(index) + "\n";
-    for (;;) {
-        if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
-        if (const auto problem = verify(); !problem.empty()) return problem;
-        pollfd input{STDIN_FILENO, POLLIN, 0};
-        const int ready = poll(&input, 1, 5);
-        if (ready < 0) { if (errno == EINTR) continue; return "path_ack_failed"; }
-        if (ready == 0) continue;
-        if ((input.revents & (POLLERR | POLLNVAL)) != 0) return "path_ack_failed";
-        char byte = 0;
-        const auto count = read(STDIN_FILENO, &byte, 1);
-        if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-        if (count != 1) return "path_ack_eof";
-        frame.push_back(byte);
-        if (frame.size() > 96) return "path_ack_invalid";
-        if (byte == '\n') {
-            if (frame != expected) return "path_ack_invalid";
-            if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
-            return verify();
-        }
-    }
-}
-
 int RunGesture(Display *display, std::string_view command, const GestureRequest &request,
                std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom,
-               const std::optional<WindowBinding> &binding = std::nullopt) {
-    InputCancellation cancellation;
+               const std::optional<WindowBinding> &binding,
+               const std::optional<WindowBinding> &destination_binding, InputProgress &progress,
+               std::string_view anchor_token) {
+    auto refuse = [&](std::string_view code, std::string_view phase, int exit_code) {
+        progress.Emit(display);
+        XCloseDisplay(display);
+        EmitError(code, phase, false);
+        return exit_code;
+    };
     std::vector<KeyCode> chord;
     std::vector<KeyCode> modifiers;
     std::vector<KeyCode> pressed_modifiers;
     std::vector<KeyCode> pressed_chord;
     bool button_pressed = false;
+    const bool requires_focus = command == "key-chord" || !request.modifiers.empty();
+    auto focus_matches = [&]() {
+        return !requires_focus || FocusMatchesWindow(display, expected_pid, pid_atom, binding);
+    };
+    const auto &end_binding = destination_binding ? destination_binding : binding;
+    DragHitTest drag_hit(display);
+    auto point_matches = [&](int x, int y, const std::optional<WindowBinding> &window) {
+        return WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom) &&
+            (!window || PointMatchesWindow(display, x, y, expected_pid, pid_atom, window));
+    };
+    auto endpoints_match = [&]() {
+        return point_matches(request.x, request.y, binding) &&
+            (command != "drag" || point_matches(request.to_x, request.to_y, end_binding));
+    };
+    auto pointer_at = [&](int x, int y) {
+        Window root = None, child = None;
+        int rx = 0, ry = 0, wx = 0, wy = 0;
+        unsigned mask = 0;
+        return XQueryPointer(display, DefaultRootWindow(display), &root, &child, &rx, &ry, &wx, &wy, &mask)
+            && rx == x && ry == y;
+    };
     char held_keys[32]{};
     XQueryKeymap(display, held_keys);
     for (const auto &name : request.modifiers) {
         const KeySym symbol = name == "meta" ? XK_Super_L : KeyNamed(name);
         const KeyCode code = symbol == NoSymbol ? 0 : XKeysymToKeycode(display, symbol);
         if (code == 0 || (held_keys[code / 8] & (1 << (code % 8))) != 0) {
-            XCloseDisplay(display);
-            EmitError("modifier_unavailable_or_held", "key_preflight", false);
-            return kExitTargetMismatch;
+            return refuse("modifier_unavailable_or_held", "key_preflight", kExitTargetMismatch);
         }
         modifiers.push_back(code);
     }
@@ -720,35 +1015,16 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             const bool last = index + 1 == request.keys.size();
             if (code == 0 || IsModifier(symbol) == last || seen_main ||
                 std::find(chord.begin(), chord.end(), code) != chord.end()) {
-                XCloseDisplay(display);
-                EmitError("unsupported_key", "key_preflight", false);
-                return kExitInvalid;
+                return refuse("unsupported_key", "key_preflight", kExitInvalid);
             }
             if ((held_keys[code / 8] & (1 << (code % 8))) != 0) {
-                XCloseDisplay(display);
-                EmitError("input_already_held", "key_preflight", false);
-                return kExitTargetMismatch;
+                return refuse("input_already_held", "key_preflight", kExitTargetMismatch);
             }
             seen_main = last;
             chord.push_back(code);
         }
-    } else {
-        std::vector<std::pair<int, int>> points = {{request.x, request.y}};
-        if (command == "drag") {
-            points.emplace_back(request.to_x, request.to_y);
-            points.insert(points.end(), request.path.begin(), request.path.end());
-        }
-        for (const auto &point : points) {
-            if (!WindowAtPointBelongsToPid(display, point.first, point.second, expected_pid,
-                                           pid_atom) || (!request.path.empty() &&
-                !PointMatchesWindow(display, point.first, point.second, expected_pid, pid_atom, binding))) {
-                XCloseDisplay(display);
-                EmitError("target_point_mismatch", "target_preflight", false);
-                return kExitTargetMismatch;
-            }
-        }
     }
-    if (request.hold_ms != 0 || !request.path.empty()) {
+    if (request.hold_ms != 0 || !request.path.empty() || destination_binding) {
         Window root = None, child = None;
         int rx = 0, ry = 0, wx = 0, wy = 0;
         unsigned mask = 0;
@@ -758,9 +1034,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                                           [](char keys) { return keys != 0; });
         if (!pointer_known || key_held ||
             (mask & (Button1Mask | Button2Mask | Button3Mask | Button4Mask | Button5Mask)) != 0) {
-            XCloseDisplay(display);
-            EmitError("input_already_held", "input_preflight", false);
-            return kExitTargetMismatch;
+            return refuse("input_already_held", "input_preflight", kExitTargetMismatch);
         }
     }
     bool dispatch_started = false;
@@ -778,6 +1052,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             }
         }
         XSync(display, False);
+        progress.Emit(display);
         XCloseDisplay(display);
         EmitError(code, phase, dispatch_started);
         return dispatch_started ? kExitUnknownEffect : pre_dispatch_exit;
@@ -785,13 +1060,13 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
     if (DeadlineExpired(deadline_ns)) {
         return finish_failure("deadline_exceeded", "pre_dispatch", kExitTimeoutBeforeDispatch);
     }
-    if ((command == "key-chord" || !modifiers.empty()) && !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) {
+    if (!focus_matches()) {
         return finish_failure("focus_owner_changed", "target_preflight", kExitTargetMismatch);
     }
-    if (command != "key-chord" &&
-        (!WindowAtPointBelongsToPid(display, request.x, request.y, expected_pid, pid_atom) ||
-         (command == "drag" && !WindowAtPointBelongsToPid(display, request.to_x, request.to_y,
-                                                         expected_pid, pid_atom)))) {
+    if (command != "key-chord" && (!endpoints_match() ||
+        std::any_of(request.path.begin(), request.path.end(), [&](const auto &point) {
+            return !point_matches(point.first, point.second, binding);
+        }))) {
         return finish_failure("target_point_mismatch", "target_preflight", kExitTargetMismatch);
     }
     int path_x = request.x, path_y = request.y;
@@ -800,21 +1075,23 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         if (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid))) return "untrusted_process";
         if (!modifiers.empty() && !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) return "focus_owner_changed";
         if (!PointMatchesWindow(display, path_x, path_y, expected_pid, pid_atom, binding)) return "target_point_mismatch";
-        if (button_pressed) {
-            Window root = None, child = None; int rx = 0, ry = 0, wx = 0, wy = 0; unsigned mask = 0;
-            if (!XQueryPointer(display, DefaultRootWindow(display), &root, &child, &rx, &ry, &wx, &wy, &mask)
-                || rx != path_x || ry != path_y) return "pointer_position_changed";
-        }
+        if (button_pressed && !pointer_at(path_x, path_y)) return "pointer_position_changed";
         if (g_x_error) return "x11_error";
         return {};
     };
     if (!request.path.empty()) {
-        if (const auto problem = ValidatePathSegment(request, 0, deadline_ns, path_problem); !problem.empty()) {
+        if (const auto problem = ValidateSegment(request.path_token, 0, deadline_ns, path_problem, 5); !problem.empty()) {
             return finish_failure(problem, "path_preflight", kExitTargetMismatch);
         }
+        if (!endpoints_match()) {
+            return finish_failure("target_point_mismatch", "path_preflight", kExitTargetMismatch);
+        }
     }
-    std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
-    dispatch_started = true;
+    if (const auto problem = ValidateKeyboardAnchor(anchor_token, 0, display, expected_pid,
+                                                    pid_atom, binding, deadline_ns); !problem.empty()) {
+        return finish_failure(problem, "keyboard_preflight",
+                              problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
+    }
     g_x_error = false;
     bool submitted = true;
     unsigned long event_count = 0;
@@ -822,26 +1099,37 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         submitted = ok && submitted;
         ++event_count;
     };
+    auto straight_drag_problem = [&](int x, int y, DragPhase phase) -> std::string_view {
+        if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
+        if (!destination_binding) return {};
+        if (!submitted || g_x_error) return "x11_error";
+        if (!StraightDragPointMatches(display, expected_pid, pid_atom, *binding, *destination_binding,
+                                      drag_hit, x, y, phase)) return "drag_endpoint_changed";
+        if (!focus_matches()) return "focus_owner_changed";
+        return {};
+    };
+    auto press_button = [&] {
+        progress.attempted_buttons |= Button1Mask << (request.button - 1);
+        submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
+        XSync(display, False);
+        if (submitted && !g_x_error) ++progress.delivered;
+    };
     // A hold is one bounded transaction. Recheck live ownership while down;
     // cleanup releases only inputs this transaction pressed, even after loss.
     auto hold_problem = [&]() -> std::string_view {
         if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
         if (!submitted || g_x_error) return "x11_error";
         if (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid))) return "untrusted_process";
-        if ((command == "key-chord" || !modifiers.empty()) &&
-            !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) return "focus_owner_changed";
         if (command != "key-chord") {
-            Window root = None, child = None;
-            int rx = 0, ry = 0, wx = 0, wy = 0;
-            unsigned mask = 0;
-            if (!XQueryPointer(display, DefaultRootWindow(display), &root, &child, &rx, &ry,
-                               &wx, &wy, &mask) || rx != request.x || ry != request.y) {
-                return "pointer_position_changed";
+            if (destination_binding) {
+                const auto problem = straight_drag_problem(request.x, request.y, DragPhase::Source);
+                if (!problem.empty()) return problem;
+            } else if (!endpoints_match()) {
+                return "target_point_mismatch";
             }
-            if (!WindowAtPointBelongsToPid(display, request.x, request.y, expected_pid, pid_atom) ||
-                (command == "drag" && !WindowAtPointBelongsToPid(display, request.to_x,
-                    request.to_y, expected_pid, pid_atom))) return "target_point_mismatch";
+            if (!pointer_at(request.x, request.y)) return "pointer_position_changed";
         }
+        if (!focus_matches()) return "focus_owner_changed";
         if (!submitted || g_x_error) return "x11_error";
         return {};
     };
@@ -856,23 +1144,38 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             usleep(5000);
         }
     };
-    for (const auto code : modifiers) {
-        if (DeadlineExpired(deadline_ns) || !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) {
-            return finish_failure(DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "focus_owner_changed", "input_dispatch", kExitUnknownEffect);
+    auto press = [&](KeyCode code, std::vector<KeyCode> &pressed) -> std::string_view {
+        bool attempted = false;
+        const auto problem = AtomicBurst(display, [&]() -> std::string_view {
+            if (const auto focus = KeyboardFocusProblem(display, expected_pid, pid_atom, binding, deadline_ns);
+                !focus.empty()) return focus;
+            if (command != "key-chord" && !endpoints_match()) return "target_point_mismatch";
+            if (const auto keys = VerifyStrokeKeys(display, code); !keys.empty()) return keys;
+            return DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "";
+        }, [&] {
+            attempted = true;
+            return XTestFakeKeyEvent(display, code, True, 1) != 0;
+        }, [&] { ReleaseKeystroke(display, code); });
+        if (attempted) {
+            MarkDispatchStarted(dispatch_started);
+            pressed.push_back(code);
+            progress.RecordKey(code, binding);
+            ++event_count;
         }
-        pressed_modifiers.push_back(code);
-        submit(XTestFakeKeyEvent(display, code, True, 1) != 0);
-        XSync(display, False);
+        return problem;
+    };
+    auto press_failed = [&](std::string_view problem) {
+        return finish_failure(problem, "input_dispatch",
+                              problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
+    };
+    for (const auto code : modifiers) {
+        if (const auto problem = press(code, pressed_modifiers); !problem.empty()) return press_failed(problem);
     }
     if (command == "key-chord") {
         for (const KeyCode code : chord) {
-            if (DeadlineExpired(deadline_ns) || !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) {
-                return finish_failure(DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "focus_owner_changed", "input_dispatch", kExitUnknownEffect);
-            }
-            pressed_chord.push_back(code);
-            submit(XTestFakeKeyEvent(display, code, True, 1) != 0);
-            XSync(display, False);
+            if (const auto problem = press(code, pressed_chord); !problem.empty()) return press_failed(problem);
         }
+        progress.delivered = 1;
         if (const auto problem = hold(); !problem.empty()) {
             return finish_failure(problem, "input_hold", kExitUnknownEffect);
         }
@@ -883,17 +1186,33 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         if (submitted && !g_x_error) pressed_chord.clear();
     } else {
         if (DeadlineExpired(deadline_ns)) {
-            return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+            return finish_failure("deadline_exceeded", "input_dispatch", kExitTimeoutBeforeDispatch);
         }
+        if (binding && !endpoints_match()) {
+            return finish_failure("target_point_mismatch", "pointer_dispatch", kExitTargetMismatch);
+        }
+        if (!focus_matches()) {
+            return finish_failure("focus_owner_changed", "pointer_dispatch", kExitTargetMismatch);
+        }
+        MarkDispatchStarted(dispatch_started);
         submit(XTestFakeMotionEvent(display, -1, request.x, request.y, 1) != 0);
         if (command == "drag") {
             XSync(display, False);
             if (DeadlineExpired(deadline_ns)) {
                 return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
             }
+            if (destination_binding && !drag_hit.Watch(binding->id)) {
+                return finish_failure("x11_error", "button_dispatch", kExitTargetMismatch);
+            }
+            if (binding && (!endpoints_match() || !pointer_at(request.x, request.y))) {
+                return finish_failure("target_point_mismatch", "button_dispatch", kExitTargetMismatch);
+            }
+            if (!focus_matches()) {
+                return finish_failure("focus_owner_changed", "button_dispatch", kExitTargetMismatch);
+            }
+            if (destination_binding) drag_hit.MarkPress();
             button_pressed = true;
-            submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
-            XSync(display, False);
+            press_button();
             if (const auto problem = hold(); !problem.empty()) {
                 return finish_failure(problem, "input_hold", kExitUnknownEffect);
             }
@@ -901,7 +1220,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                 auto route = request.path;
                 route.emplace_back(request.to_x, request.to_y);
                 for (std::size_t index = 0; index < route.size(); ++index) {
-                    if (const auto problem = ValidatePathSegment(request, index + 1, deadline_ns, path_problem); !problem.empty()) {
+                    if (const auto problem = ValidateSegment(request.path_token, index + 1, deadline_ns, path_problem, 5); !problem.empty()) {
                         return finish_failure(problem, "path_validation", kExitUnknownEffect);
                     }
                     const auto next = route[index];
@@ -915,40 +1234,55 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                     if (!submitted || g_x_error) return finish_failure("x11_error", "path_dispatch", kExitUnknownEffect);
                     SleepUntilOrDeadline(15, deadline_ns);
                 }
-                if (const auto problem = ValidatePathSegment(request, route.size() + 1, deadline_ns, path_problem); !problem.empty()) {
+                if (const auto problem = ValidateSegment(request.path_token, route.size() + 1, deadline_ns, path_problem, 5); !problem.empty()) {
                     return finish_failure(problem, "path_release", kExitUnknownEffect);
                 }
             } else {
-            // Glide in steps: many toolkits only start a drag after the
-            // pointer has moved a few pixels with the button held.
-            constexpr int kSteps = 12;
-            for (int step = 1; step <= kSteps; ++step) {
-                if (DeadlineExpired(deadline_ns)) {
-                    return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
+                // Glide in steps: many toolkits only start a drag after the
+                // pointer has moved a few pixels with the button held.
+                constexpr int kSteps = 12;
+                for (int step = 1; step <= kSteps; ++step) {
+                    const int x = request.x + (request.to_x - request.x) * step / kSteps;
+                    const int y = request.y + (request.to_y - request.y) * step / kSteps;
+                    const auto phase = step == kSteps ? DragPhase::Destination : DragPhase::Transit;
+                    if (const auto problem = straight_drag_problem(x, y, phase); !problem.empty()) {
+                        return finish_failure(problem, "input_dispatch", kExitUnknownEffect);
+                    }
+                    if (!destination_binding && request.hold_ms != 0 &&
+                        (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid)) ||
+                         !focus_matches() ||
+                         !WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom))) {
+                        return finish_failure("target_changed", "input_dispatch", kExitUnknownEffect);
+                    }
+                    submit(XTestFakeMotionEvent(display, -1, x, y, 1) != 0);
+                    XSync(display, False);
+                    SleepUntilOrDeadline(15, deadline_ns);
                 }
-                const int x = request.x + (request.to_x - request.x) * step / kSteps;
-                const int y = request.y + (request.to_y - request.y) * step / kSteps;
-                if (request.hold_ms != 0 &&
-                    (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid)) ||
-                     (!modifiers.empty() && !FocusMatchesWindow(display, expected_pid, pid_atom, binding)) ||
-                     !WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom))) {
-                    return finish_failure("target_changed", "input_dispatch", kExitUnknownEffect);
+                if (destination_binding) {
+                    const auto problem = straight_drag_problem(request.to_x, request.to_y,
+                                                               DragPhase::Destination);
+                    if (!problem.empty()) {
+                        return finish_failure(problem, "drag_release", kExitUnknownEffect);
+                    }
+                    if (!pointer_at(request.to_x, request.to_y)) {
+                        return finish_failure("pointer_position_changed", "drag_release", kExitUnknownEffect);
+                    }
                 }
-                submit(XTestFakeMotionEvent(display, -1, x, y, 1) != 0);
-                XSync(display, False);
-                SleepUntilOrDeadline(15, deadline_ns);
-            }
             }
             submit(XTestFakeButtonEvent(display, request.button, False, 1) != 0);
             XSync(display, False);
             if (submitted && !g_x_error) button_pressed = false;
         } else if (request.mode == "click") {
+            if (binding) XSync(display, False);
             for (unsigned click = 0; click < request.count; ++click) {
                 if (DeadlineExpired(deadline_ns)) {
                     return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
                 }
+                if (binding && (!endpoints_match() || !pointer_at(request.x, request.y))) {
+                    return finish_failure("target_point_mismatch", "button_dispatch", kExitTargetMismatch);
+                }
                 button_pressed = true;
-                submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
+                press_button();
                 if (const auto problem = hold(); !problem.empty()) {
                     return finish_failure(problem, "input_hold", kExitUnknownEffect);
                 }
@@ -961,7 +1295,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                 if (DeadlineExpired(deadline_ns)) {
                     return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
                 }
-                submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
+                press_button();
                 submit(XTestFakeButtonEvent(display, request.button, False, 1) != 0);
                 XSync(display, False);
             }
@@ -981,6 +1315,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
     if (!submitted || g_x_error) {
         return finish_failure("x11_error", "input_dispatch", kExitUnknownEffect);
     }
+    progress.Emit(display);
     XCloseDisplay(display);
     std::cout << "{\"ok\":true,\"dispatch_started\":true,\"events\":" << event_count << "}"
               << std::endl;
@@ -1338,6 +1673,40 @@ std::optional<std::string> ReadStdin(std::size_t limit) {
     return input;
 }
 
+// The same pipe carries subsequent ACKs. Read exactly the payload bytes
+// without a buffered stream that could consume the next frame.
+std::string_view ReadTextFrame(std::size_t limit, std::uint64_t deadline, std::string *text) {
+    auto read_bytes = [&](char *out, std::size_t length) -> std::string_view {
+        while (length != 0) {
+            if (DeadlineExpired(deadline)) return "deadline_exceeded";
+            pollfd input{STDIN_FILENO, POLLIN, 0};
+            const int ready = poll(&input, 1, 5);
+            if (ready == 0 || (ready < 0 && errno == EINTR)) continue;
+            if (ready < 0) return "unsupported_text";
+            const auto count = read(STDIN_FILENO, out, length);
+            if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+            if (count <= 0) return "unsupported_text";
+            out += count;
+            length -= static_cast<std::size_t>(count);
+        }
+        return {};
+    };
+    std::string header;
+    char byte = 0;
+    while (byte != '\n') {
+        if (const auto problem = read_bytes(&byte, 1); !problem.empty()) return problem;
+        if (byte == '\n') break;
+        if (header.size() == 25) return "input_too_large";
+        header.push_back(byte);
+    }
+    if (header.compare(0, 5, "text ") != 0) return "unsupported_text";
+    const auto size = ParseUnsigned(std::string_view(header).substr(5));
+    if (!size || *size == 0) return "unsupported_text";
+    if (*size > limit) return "input_too_large";
+    text->resize(static_cast<std::size_t>(*size));
+    return read_bytes(text->data(), text->size());
+}
+
 std::vector<Atom> AtomList(Display *display, Window window, Atom property) {
     std::vector<Atom> result;
     Atom actual_type = None;
@@ -1468,29 +1837,6 @@ std::optional<long> IcccmState(const Ewmh &ewmh, Window window) {
     return result;
 }
 
-void CollectClients(Display *display, Window window, int depth, std::vector<Window> *out) {
-    Window root = None;
-    Window parent = None;
-    Window *children = nullptr;
-    unsigned int count = 0;
-    g_x_error = false;
-    const Status status = XQueryTree(display, window, &root, &parent, &children, &count);
-    XSync(display, False);
-    if (!status || g_x_error) {
-        return;
-    }
-    for (unsigned int index = 0; index < count && out->size() < 4096; ++index) {
-        out->push_back(children[index]);
-        if (depth < 3) {
-            CollectClients(display, children[index], depth + 1, out);
-        }
-    }
-    if (children != nullptr) {
-        XFree(children);
-    }
-}
-
-
 std::optional<Geometry> RootGeometry(Display *display, Window window) {
     XWindowAttributes attributes{};
     g_x_error = false;
@@ -1519,88 +1865,31 @@ bool Exists(Display *display, Window window) {
     return status && !g_x_error;
 }
 
-// The one top-level client window of `pid` at `want` (the AT-SPI frame's
-// screen extents). With a single client window of that process its geometry
-// may be stale (e.g. while minimized), so it is accepted alone.
-std::optional<Window> FindClientWindow(const Ewmh &ewmh, unsigned long pid, const Geometry &want,
-                                       std::string *problem, bool allow_single = true) {
-    std::vector<Window> all;
-    if (ewmh.present) {
-        Atom actual_type = None;
-        int actual_format = 0;
-        unsigned long count = 0;
-        unsigned long bytes_after = 0;
-        unsigned char *data = nullptr;
-        g_x_error = false;
-        if (XGetWindowProperty(ewmh.display, ewmh.root, ewmh.client_list, 0, 4096, False,
-                               XA_WINDOW, &actual_type, &actual_format, &count, &bytes_after,
-                               &data) == Success &&
-            actual_type == XA_WINDOW && actual_format == 32 && data != nullptr) {
-            const auto *windows = reinterpret_cast<Window *>(data);
-            all.assign(windows, windows + count);
-        }
-        if (data != nullptr) {
-            XFree(data);
-        }
-        XSync(ewmh.display, False);
-    }
-    if (all.empty()) {
-        CollectClients(ewmh.display, ewmh.root, 0, &all);
-    }
-    std::vector<Window> owned;
-    for (const Window window : all) {
-        if (OwnPid(ewmh.display, window, ewmh.pid) != pid) {
-            continue;
-        }
-        XWindowAttributes attributes{};
-        g_x_error = false;
-        if (!XGetWindowAttributes(ewmh.display, window, &attributes) || g_x_error ||
-            attributes.override_redirect || attributes.c_class != InputOutput) {
-            continue;
-        }
-        const bool managed = IcccmState(ewmh, window).has_value();
-        if (!managed && attributes.map_state != IsViewable) {
-            continue;
-        }
-        owned.push_back(window);
-    }
-    std::vector<Window> exact;
-    for (const Window window : owned) {
-        const auto geometry = RootGeometry(ewmh.display, window);
-        if (geometry.has_value() && std::abs(static_cast<long long>(geometry->x) - want.x) <= 2 &&
-            std::abs(static_cast<long long>(geometry->y) - want.y) <= 2 && geometry->width == want.width &&
-            geometry->height == want.height) {
-            exact.push_back(window);
-        }
-    }
-    if (exact.size() == 1) {
-        return exact[0];
-    }
-    if (allow_single && exact.empty() && owned.size() == 1) {
-        return owned[0];
-    }
-    *problem = owned.empty() ? "window_not_found" : "window_ambiguous";
-    return std::nullopt;
+#include "x11_window_geometry.hpp"
+
+bool BoundClientViewable(Display *display, unsigned long pid, Atom pid_atom, Window id) {
+    XWindowAttributes attributes{};
+    return ValidXid(id) && OwnPid(display, id, pid_atom) == pid &&
+        XGetWindowAttributes(display, id, &attributes) && !g_x_error &&
+        attributes.map_state == IsViewable && !attributes.override_redirect &&
+        attributes.c_class == InputOutput;
 }
 
-// Keyboard ownership requires the precise observed client window and live
-// geometry. A child focus window is allowed; a same-process sibling is not.
-bool FocusMatchesWindow(Display *display, unsigned long pid, Atom pid_atom,
-                        const std::optional<WindowBinding> &binding) {
-    if (!FocusBelongsToPid(display, pid, pid_atom)) return false;
-    if (!binding.has_value()) return true; // legacy helper protocol only
-    if (binding->id == None || OwnPid(display, binding->id, pid_atom) != pid) return false;
-    const auto bounds = RootGeometry(display, binding->id);
-    XWindowAttributes attributes{};
-    if (!bounds.has_value() || !XGetWindowAttributes(display, binding->id, &attributes) ||
-        attributes.map_state != IsViewable ||
-        std::abs(static_cast<long long>(bounds->x) - binding->bounds.x) > 2 ||
-        std::abs(static_cast<long long>(bounds->y) - binding->bounds.y) > 2 ||
-        bounds->width != binding->bounds.width || bounds->height != binding->bounds.height) return false;
+bool WindowBindingMatches(Display *display, unsigned long pid, Atom pid_atom,
+                          const WindowBinding &binding, int legacy_tolerance) {
+    if (!BoundClientViewable(display, pid, pid_atom, binding.id)) return false;
+    if (!binding.proof.empty()) return RecheckGeometryProof(LoadEwmh(display), pid, binding).has_value();
+    const auto bounds = RootGeometry(display, binding.id);
+    return bounds && GeometryMatches(*bounds, binding.bounds, legacy_tolerance);
+}
+
+bool FocusInClient(Display *display, Window client) {
     Window current = None; int revert = 0;
+    g_x_error = false;
     XGetInputFocus(display, &current, &revert); XSync(display, False);
+    if (g_x_error) return false;
     for (int depth = 0; depth < 64 && current != None && current != PointerRoot; ++depth) {
-        if (current == binding->id) return true;
+        if (current == client) return true;
         Window root = None, parent = None, *children = nullptr; unsigned count = 0;
         g_x_error = false;
         const Status found = XQueryTree(display, current, &root, &parent, &children, &count);
@@ -1612,54 +1901,255 @@ bool FocusMatchesWindow(Display *display, unsigned long pid, Atom pid_atom,
     return false;
 }
 
-bool PointMatchesWindow(Display *display, int x, int y, unsigned long pid, Atom pid_atom,
+// Keyboard focus must be in the observed client, including its children.
+bool FocusMatchesWindow(Display *display, unsigned long pid, Atom pid_atom,
                         const std::optional<WindowBinding> &binding) {
-    if (!binding.has_value() || binding->id == None || OwnPid(display, binding->id, pid_atom) != pid) return false;
-    const auto bounds = RootGeometry(display, binding->id);
-    XWindowAttributes attributes{};
-    if (!bounds.has_value() || !XGetWindowAttributes(display, binding->id, &attributes) ||
-        attributes.map_state != IsViewable || bounds->x != binding->bounds.x || bounds->y != binding->bounds.y ||
-        bounds->width != binding->bounds.width || bounds->height != binding->bounds.height) return false;
+    return FocusBelongsToPid(display, pid, pid_atom) &&
+        (!binding || (WindowBindingMatches(display, pid, pid_atom, *binding, 2) &&
+                      FocusInClient(display, binding->id)));
+}
+
+std::optional<Window> PointChild(Display *display, Window parent, int x, int y) {
+    Window child = None;
+    int local_x = 0, local_y = 0;
+    g_x_error = false;
+    const bool translated = XTranslateCoordinates(display, DefaultRootWindow(display), parent, x, y,
+                                                   &local_x, &local_y, &child) != 0;
+    XSync(display, False);
+    if (!translated || g_x_error) return std::nullopt;
+    return child;
+}
+
+bool PointInClient(Display *display, int x, int y, Window client) {
     Window current = DefaultRootWindow(display);
     for (int depth = 0; depth < 64; ++depth) {
-        Window child = None; int local_x = 0, local_y = 0;
-        g_x_error = false;
-        const bool ok = XTranslateCoordinates(display, DefaultRootWindow(display), current, x, y, &local_x, &local_y, &child) != 0;
-        XSync(display, False);
-        if (!ok || g_x_error || child == None) return false;
-        if (child == binding->id) return true;
-        current = child;
+        const auto child = PointChild(display, current, x, y);
+        if (!child || *child == None) return false;
+        if (*child == client) return true;
+        current = *child;
     }
     return false;
+}
+
+bool DragHitTest::Watch(Window source) {
+    resource_mask_ = ResourceMask(display_, XAllocID(display_)).value_or(0);
+    source_owner_ = source & ~resource_mask_;
+    window_type_ = XInternAtom(display_, "_NET_WM_WINDOW_TYPE", False);
+    dnd_type_ = XInternAtom(display_, "_NET_WM_WINDOW_TYPE_DND", False);
+    dnd_selection_ = XInternAtom(display_, "XdndSelection", False);
+    int major = 0, minor = 0;
+    shape_bounding_ = XShapeQueryVersion(display_, &major, &minor) != 0;
+    shape_input_ = shape_bounding_ && (major > 1 || (major == 1 && minor >= 1));
+    g_x_error = false;
+    XSelectInput(display_, root_, SubstructureNotifyMask);
+    XSync(display_, False);
+    return !g_x_error;
+}
+
+bool DragHitTest::UpdateWindows() {
+    if (!press_serial_) return true;
+    XEvent event{};
+    for (unsigned count = 0; XCheckWindowEvent(display_, root_, SubstructureNotifyMask, &event); ++count) {
+        if (count == 4096) return false;
+        if (event.xany.send_event || event.xany.serial < press_serial_) continue;
+        if (event.type == CreateNotify) created_.insert(event.xcreatewindow.window);
+        if (event.type == MapNotify) mapped_.insert(event.xmap.window);
+        if (event.type == UnmapNotify) mapped_.erase(event.xunmap.window);
+        if (event.type == DestroyNotify) {
+            created_.erase(event.xdestroywindow.window);
+            mapped_.erase(event.xdestroywindow.window);
+        }
+        if (created_.size() > 4096 || mapped_.size() > 4096) return false;
+    }
+    return true;
+}
+
+bool DragHitTest::IsDragIcon(Window window, const XWindowAttributes &attributes) const {
+    if (!resource_mask_ || (window & ~resource_mask_) != source_owner_ ||
+        !attributes.override_redirect || attributes.c_class != InputOutput ||
+        !created_.count(window) || !mapped_.count(window)) return false;
+    const auto type = ReadProperty32(display_, window, window_type_, XA_ATOM, 8);
+    if (!type) return false;
+    if (!type->values.empty() && type->values.front() == dnd_type_) {
+        // GTK's visual proxy can have a nonempty input shape. Tie it to
+        // the source X client's live XDND selection as well as its type.
+        const Window owner = XGetSelectionOwner(display_, dnd_selection_);
+        if (!g_x_error && owner != None && owner != window && (owner & ~resource_mask_) == source_owner_) {
+            return true;
+        }
+    }
+    if (!shape_input_) return false;
+    int count = -1, order = 0;
+    XRectangle *rects = XShapeGetRectangles(display_, window, ShapeInput, &count, &order);
+    if (rects) XFree(rects);
+    return !g_x_error && count == 0;
+}
+
+std::optional<Window> DragHitTest::UnderDragIcons(int x, int y) const {
+    Window root = None, parent = None, *children = nullptr;
+    unsigned count = 0;
+    if (!XQueryTree(display_, root_, &root, &parent, &children, &count) || g_x_error ||
+        root != root_ || count > 4096) {
+        if (children) XFree(children);
+        return std::nullopt;
+    }
+    std::optional<Window> hit = Window{None};
+    while (count > 0) {
+        const Window window = children[--count]; // XQueryTree lists bottom to top.
+        XWindowAttributes attributes{};
+        if (!XGetWindowAttributes(display_, window, &attributes) || g_x_error) {
+            hit.reset();
+            break;
+        }
+        if (attributes.map_state != IsViewable) continue;
+        const auto local_x = static_cast<long long>(x) - attributes.x - attributes.border_width;
+        const auto local_y = static_cast<long long>(y) - attributes.y - attributes.border_width;
+        if (local_x < -attributes.border_width || local_y < -attributes.border_width ||
+            local_x >= attributes.width + attributes.border_width ||
+            local_y >= attributes.height + attributes.border_width) continue;
+        if (shape_bounding_) {
+            int count_rects = -1, order = 0;
+            XRectangle *rects = XShapeGetRectangles(display_, window, ShapeBounding, &count_rects, &order);
+            const bool contains = count_rects > 0 && rects &&
+                std::any_of(rects, rects + count_rects, [&](const XRectangle &rect) {
+                    return local_x >= rect.x && local_y >= rect.y &&
+                        local_x < rect.x + rect.width && local_y < rect.y + rect.height;
+                });
+            if (rects) XFree(rects);
+            if (g_x_error || count_rects < 0) {
+                hit.reset();
+                break;
+            }
+            if (!contains) continue;
+        }
+        const bool icon = IsDragIcon(window, attributes);
+        if (g_x_error) {
+            hit.reset();
+            break;
+        }
+        if (icon) continue;
+        hit = window;
+        break;
+    }
+    if (children) XFree(children);
+    return hit;
+}
+
+bool MatchDragEndpoint(DragHit &hit, int x, int y, const WindowGeometryProof &proof, bool transit) {
+    const Window branch = hit.path.front();
+    if (branch != proof.client && (proof.frames.empty() || branch != proof.frames.back().id)) return false;
+    for (const Window window : hit.path) {
+        if (window == proof.client) {
+            hit.client_pid = proof.pid;
+            return true;
+        }
+        const auto &wm = *proof.wm;
+        if ((window & ~wm.mask) != (wm.identity & ~wm.mask)) return false;
+    }
+    // Only transit between distinct clients can cross a proven title bar or border.
+    const auto &client = proof.client_bounds;
+    return transit && (x < client.x || x >= client.x + client.width ||
+                       y < client.y || y >= client.y + client.height);
+}
+
+std::optional<DragHit> DragHitTest::At(int x, int y, const WindowGeometryProof &source,
+                                     const WindowGeometryProof &destination, DragPhase phase) {
+    auto branch = PointChild(display_, root_, x, y);
+    // The hit query drains map notifications for windows already on screen.
+    if (!branch || !UpdateWindows()) return std::nullopt;
+    if (created_.count(*branch)) {
+        XWindowAttributes attributes{};
+        if (!XGetWindowAttributes(display_, *branch, &attributes) || g_x_error) return std::nullopt;
+        if (IsDragIcon(*branch, attributes)) branch = UnderDragIcons(x, y);
+    }
+    if (!branch || g_x_error) return std::nullopt;
+    DragHit hit;
+    for (int depth = 0; *branch != None; ++depth) {
+        if (depth == 64) return std::nullopt;
+        hit.path.push_back(*branch);
+        branch = PointChild(display_, *branch, x, y);
+        if (!branch) return std::nullopt;
+    }
+    const bool transit = phase == DragPhase::Transit && source.client != destination.client;
+    if (hit.path.empty()) hit.matches = transit;
+    else if (phase == DragPhase::Source) hit.matches = MatchDragEndpoint(hit, x, y, source, false);
+    else hit.matches = MatchDragEndpoint(hit, x, y, destination, transit) ||
+        (transit && MatchDragEndpoint(hit, x, y, source, true));
+    return hit;
+}
+
+bool StraightDragPointMatches(Display *display, unsigned long pid, Atom pid_atom, const WindowBinding &source,
+                              const WindowBinding &destination, DragHitTest &hit, int x, int y, DragPhase phase) {
+    if (!BoundClientViewable(display, pid, pid_atom, source.id) ||
+        !BoundClientViewable(display, pid, pid_atom, destination.id)) return false;
+    const auto wm = LoadEwmh(display);
+    const auto source_proof = RecheckGeometryProof(wm, pid, source);
+    const auto destination_proof = RecheckGeometryProof(wm, pid, destination);
+    if (!source_proof || !destination_proof) return false;
+    const auto point = hit.At(x, y, *source_proof, *destination_proof, phase);
+    return point && point->matches;
+}
+
+bool PointMatchesWindow(Display *display, int x, int y, unsigned long pid, Atom pid_atom,
+                        const std::optional<WindowBinding> &binding) {
+    return binding && WindowBindingMatches(display, pid, pid_atom, *binding, 0) &&
+        PointInClient(display, x, y, binding->id);
 }
 
 // Strip internal window binding options before the legacy command parsers.
 // All four bounds are required together; actual dispatch additionally needs id.
 bool ExtractWindowBinding(int *argc, char ***argv, std::vector<char *> *filtered,
-                          std::optional<WindowBinding> *binding) {
+                          std::optional<WindowBinding> *binding, std::string_view prefix = "--",
+                          std::string_view *anchor_token = nullptr) {
     filtered->assign(*argv, *argv + std::min(*argc, 2));
     WindowBinding parsed; unsigned seen = 0;
     for (int i = 2; i < *argc; ++i) {
-        const std::string_view option((*argv)[i]);
+        std::string_view option((*argv)[i]);
+        if (anchor_token && option == "--anchor-token") {
+            if (!anchor_token->empty() || ++i >= *argc) return false;
+            *anchor_token = (*argv)[i];
+            if (anchor_token->size() != 32 ||
+                !std::all_of(anchor_token->begin(), anchor_token->end(),
+                             [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })) {
+                return false;
+            }
+            continue;
+        }
+        if (option.substr(0, prefix.size()) != prefix) {
+            filtered->push_back((*argv)[i]);
+            continue;
+        }
+        option.remove_prefix(prefix.size());
         unsigned bit = 0; int *destination = nullptr;
-        if (option == "--window-x") { bit = 1; destination = &parsed.bounds.x; }
-        if (option == "--window-y") { bit = 2; destination = &parsed.bounds.y; }
-        if (option == "--window-width") { bit = 4; destination = &parsed.bounds.width; }
-        if (option == "--window-height") { bit = 8; destination = &parsed.bounds.height; }
-        if (option == "--window-id") bit = 16;
+        if (option == "window-x") { bit = 1; destination = &parsed.bounds.x; }
+        if (option == "window-y") { bit = 2; destination = &parsed.bounds.y; }
+        if (option == "window-width") { bit = 4; destination = &parsed.bounds.width; }
+        if (option == "window-height") { bit = 8; destination = &parsed.bounds.height; }
+        if (option == "window-id") bit = 16;
+        if (option == "geometry-proof") bit = 32;
+        if (option == "window-proof") bit = 64;
         if (bit == 0) { filtered->push_back((*argv)[i]); continue; }
         if ((seen & bit) != 0 || ++i >= *argc) return false;
         seen |= bit;
         if (destination) {
             if (!ParseInt((*argv)[i], destination)) return false;
-        } else {
+        } else if (bit == 16) {
             const auto id = ParseUnsigned((*argv)[i]);
             if (!id.has_value() || *id == 0 || *id > 0xffffffffUL) return false;
             parsed.id = static_cast<Window>(*id);
+        } else if (bit == 32) {
+            if (std::string_view((*argv)[i]) != "1") return false;
+            parsed.request_proof = true;
+        } else {
+            const std::string_view proof((*argv)[i]);
+            if (proof.empty() || proof.size() > kMaxGeometryProofBytes) return false;
+            parsed.proof = proof;
         }
     }
     if (seen) {
-        if ((seen & 15) != 15 || parsed.bounds.width <= 0 || parsed.bounds.height <= 0) return false;
+        if ((seen & 15) != 15 || !ValidGeometry(parsed.bounds) ||
+            (parsed.request_proof && parsed.id != None) ||
+            (!parsed.proof.empty() && parsed.id == None)) return false;
         *binding = parsed;
     }
     *argc = static_cast<int>(filtered->size());
@@ -1717,6 +2207,9 @@ struct WindowArgs {
     std::uint64_t deadline_ns = 0;
     Geometry geometry;
     std::string action;
+    bool request_proof = false;
+    Window expected_window = None;
+    std::string proof;
 };
 
 std::optional<WindowArgs> ParseWindowArgs(int argc, char **argv, bool action) {
@@ -1724,11 +2217,13 @@ std::optional<WindowArgs> ParseWindowArgs(int argc, char **argv, bool action) {
                                              "deadline-monotonic-ns"};
     if (action) {
         allowed.push_back("action");
+        allowed.push_back("window-id");
+        allowed.push_back("window-proof");
+    } else {
+        allowed.push_back("geometry-proof");
     }
     const auto pairs = ParsePairs(argc, argv, allowed);
-    if (!pairs.has_value() || pairs->size() != allowed.size()) {
-        return std::nullopt;
-    }
+    if (!pairs) return std::nullopt;
     WindowArgs parsed;
     const auto pid = ParseUnsigned(Pair(*pairs, "expected-pid").value_or(""));
     const auto deadline = ParseUnsigned(Pair(*pairs, "deadline-monotonic-ns").value_or(""));
@@ -1738,16 +2233,32 @@ std::optional<WindowArgs> ParseWindowArgs(int argc, char **argv, bool action) {
         !ParseInt(Pair(*pairs, "y").value_or(""), &parsed.geometry.y) ||
         !ParseInt(Pair(*pairs, "width").value_or(""), &parsed.geometry.width) ||
         !ParseInt(Pair(*pairs, "height").value_or(""), &parsed.geometry.height) ||
-        parsed.geometry.width <= 0 || parsed.geometry.height <= 0) {
+        !ValidGeometry(parsed.geometry)) {
         return std::nullopt;
     }
     parsed.pid = pid.value();
     parsed.deadline_ns = deadline.value();
+    if (const auto proof = Pair(*pairs, "geometry-proof")) {
+        if (*proof != "1") return std::nullopt;
+        parsed.request_proof = true;
+    }
     if (action) {
         parsed.action = Pair(*pairs, "action").value_or("");
         if (parsed.action != "minimize" && parsed.action != "maximize" &&
             parsed.action != "restore" && parsed.action != "close" &&
             parsed.action != "activate") {
+            return std::nullopt;
+        }
+        if (const auto id = Pair(*pairs, "window-id")) {
+            const auto parsed_id = ParseUnsigned(*id);
+            if (!parsed_id || *parsed_id == 0 || *parsed_id > UINT32_MAX) return std::nullopt;
+            parsed.expected_window = static_cast<Window>(*parsed_id);
+        }
+        if (const auto proof = Pair(*pairs, "window-proof")) {
+            if (proof->empty() || proof->size() > kMaxGeometryProofBytes) return std::nullopt;
+            parsed.proof = *proof;
+        }
+        if ((parsed.expected_window != None) != !parsed.proof.empty()) {
             return std::nullopt;
         }
     }
@@ -1791,29 +2302,40 @@ int RunWindow(std::string_view command, int argc, char **argv) {
         return exit_code;
     }
     const Ewmh ewmh = LoadEwmh(display);
-    std::string problem;
-    const auto window = FindClientWindow(ewmh, static_cast<unsigned long>(args->pid),
-                                         args->geometry, &problem);
-    if (!window.has_value()) {
+    const auto pid = static_cast<unsigned long>(args->pid);
+    const auto resolve = [&] {
+        const bool anchored = args->expected_window != None;
+        auto result = ResolveWindow(LoadEwmh(display), pid, args->geometry, args->request_proof || anchored);
+        if (anchored && (result.client != args->expected_window ||
+            !result.proof || GeometryProofJson(*result.proof) != args->proof)) {
+            return WindowResolution{None, {}, "target_window_changed"};
+        }
+        return result;
+    };
+    const auto window = resolve();
+    if (window.client == None) {
         XCloseDisplay(display);
-        EmitError(problem, "target_preflight", false);
+        EmitError(window.problem, "target_preflight", false);
         return kExitTargetMismatch;
     }
-    const WindowState before = ReadWindowState(ewmh, window.value());
+    const WindowState before = ReadWindowState(ewmh, window.client);
     const bool maximize = Contains(ewmh.supported, ewmh.net_wm_state) &&
                           Contains(ewmh.supported, ewmh.max_vert) &&
                           Contains(ewmh.supported, ewmh.max_horz);
     const bool activate = Contains(ewmh.supported, ewmh.active);
     const bool close = Contains(ewmh.supported, ewmh.close);
     if (!action) {
-        std::cout << "{\"ok\":true,\"window\":" << window.value()
+        std::cout << "{\"ok\":true,\"window\":" << window.client
+                  << ",\"window_binding\":\"geometry\""
                   << ",\"ewmh\":" << (ewmh.present ? "true" : "false")
                   << ",\"supports\":{\"minimize\":" << (ewmh.present ? "true" : "false")
                   << ",\"maximize\":" << (maximize ? "true" : "false")
+                  << ",\"restore\":" << ((before.minimized ? activate : maximize) ? "true" : "false")
                   << ",\"activate\":" << (activate ? "true" : "false")
                   << ",\"close\":" << (close ? "true" : "false") << "}," << StateJson(before)
-                  << WindowTitleJson(display,window.value())
-                  << "}" << std::endl;
+                  << WindowTitleJson(display, window.client);
+        if (window.proof) std::cout << ",\"geometry_proof\":" << GeometryProofJson(*window.proof);
+        std::cout << "}" << std::endl;
         XCloseDisplay(display);
         return 0;
     }
@@ -1829,6 +2351,12 @@ int RunWindow(std::string_view command, int argc, char **argv) {
         EmitError("window_manager_unsupported", "target_preflight", false);
         return kExitUnavailable;
     }
+    const auto current = resolve();
+    if (!before.exists || current.client != window.client) {
+        XCloseDisplay(display);
+        EmitError("target_window_changed", "target_preflight", false);
+        return kExitTargetMismatch;
+    }
     if (DeadlineExpired(args->deadline_ns)) {
         XCloseDisplay(display);
         EmitError("deadline_exceeded", "pre_dispatch", false);
@@ -1836,7 +2364,7 @@ int RunWindow(std::string_view command, int argc, char **argv) {
     }
     std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
     g_x_error = false;
-    const Window target = window.value();
+    const Window target = window.client;
     bool restoring_minimized = false;
     if (name == "minimize") {
         XIconifyWindow(display, target, DefaultScreen(display));
@@ -1881,7 +2409,7 @@ int RunWindow(std::string_view command, int argc, char **argv) {
             const bool alive = XGetWindowAttributes(display, target, &attributes) && !g_x_error;
             reached = !alive || (attributes.map_state == IsUnmapped && !after.minimized);
         } else {
-            reached = after.active;
+            reached = after.active && !after.minimized;
         }
         if (reached || DeadlineExpired(args->deadline_ns) ||
             std::chrono::steady_clock::now() >= until) {
@@ -1895,6 +2423,7 @@ int RunWindow(std::string_view command, int argc, char **argv) {
         return kExitUnknownEffect;
     }
     std::cout << "{\"ok\":true,\"dispatch_started\":true,\"events\":1,\"window\":" << target
+              << ",\"window_binding\":\"geometry\""
               << ",\"action\":\"" << name << "\",\"reached\":" << (reached ? "true" : "false")
               << "," << StateJson(after) << "}" << std::endl;
     return 0;
@@ -2061,11 +2590,24 @@ int RunFocusInfo(int argc, char **argv, std::optional<WindowBinding> binding) {
         return exit_code;
     }
     const Atom pid_atom = XInternAtom(display, "_NET_WM_PID", True);
+    std::optional<WindowGeometryProof> proof;
     if (binding.has_value()) {
         const auto ewmh = LoadEwmh(display);
-        std::string problem;
-        const auto window = FindClientWindow(ewmh, static_cast<unsigned long>(pid), binding->bounds, &problem, false);
-        binding->id = window.value_or(None);
+        if (!binding->proof.empty()) {
+            proof = RecheckGeometryProof(ewmh, static_cast<unsigned long>(pid), *binding);
+            if (!proof) {
+                binding->id = None;
+            } else {
+                binding->bounds = proof->client_bounds;
+                binding->proof.clear();
+            }
+        } else if (binding->request_proof) {
+            proof = FindGeometryProof(ewmh, static_cast<unsigned long>(pid), binding->bounds);
+            binding->id = proof ? proof->client : None;
+            if (proof) binding->bounds = proof->client_bounds;
+        } else {
+            binding->id = ResolveWindow(ewmh, static_cast<unsigned long>(pid), binding->bounds, false).client;
+        }
     }
     const bool focused = pid_atom != None &&
                          FocusMatchesWindow(display, static_cast<unsigned long>(pid), pid_atom, binding);
@@ -2077,7 +2619,9 @@ int RunFocusInfo(int argc, char **argv, std::optional<WindowBinding> binding) {
     std::cout << "{\"ok\":true,\"focused\":" << (focused ? "true" : "false")
               << ",\"expected_pid\":" << pid
               << ",\"window_bound\":" << (binding.has_value() ? "true" : "false")
-              << ",\"window\":" << (binding.has_value() ? binding->id : None) << "}" << std::endl;
+              << ",\"window\":" << (binding.has_value() ? binding->id : None);
+    if (proof) std::cout << ",\"geometry_proof\":" << GeometryProofJson(*proof);
+    std::cout << "}" << std::endl;
     return 0;
 }
 
@@ -2135,15 +2679,14 @@ int RunClipboardRead(int argc, char **argv) {
 }
 
 // A server timestamp for selection ownership (ICCCM forbids CurrentTime).
-Time ServerTime(const Selection &selection) {
+Time ServerTime(const Selection &selection, std::uint64_t deadline_ns) {
     const Atom stamp = XInternAtom(selection.display, "AAD_TIMESTAMP", False);
     unsigned char zero = 0;
     XChangeProperty(selection.display, selection.window, stamp, XA_STRING, 8, PropModeAppend,
                     &zero, 0);
     XFlush(selection.display);
     XEvent event{};
-    if (WaitEvent(selection.display, selection.window, PropertyNotify, &event,
-                  std::numeric_limits<std::uint64_t>::max(), 1000)) {
+    if (WaitEvent(selection.display, selection.window, PropertyNotify, &event, deadline_ns, 1000)) {
         return event.xproperty.time;
     }
     return CurrentTime;
@@ -2247,50 +2790,60 @@ std::optional<std::vector<Item>> SaveClipboard(const Selection &selection,
     return saved;
 }
 
-// Own CLIPBOARD with the saved contents from a detached process until another
-// client takes it (or an hour passes), so the person's clipboard survives.
-bool StartRestorer(const std::vector<Item> &saved, int inherited_display_fd) {
+// Restore only the offer this action acquired. The worker has its own session
+// and startup bound, then serves the saved contents until ownership changes.
+std::string_view RestoreClipboard(const std::vector<Item> &saved, const Selection &offer) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const auto deadline_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        deadline.time_since_epoch()).count();
     int ready[2];
     if (pipe(ready) != 0) {
-        return false;
+        return "lost";
     }
     const pid_t child = fork();
     if (child < 0) {
         close(ready[0]);
         close(ready[1]);
-        return false;
+        return "lost";
     }
     if (child == 0) {
         close(ready[0]);
-        if (fork() != 0) {
-            _exit(0);  // the grandchild is reparented and never waited for
-        }
-        // This new process owns only clipboard restoration, not the cancelled
-        // input operation. Its bounded server-timestamp wait must still run.
+        if (setsid() == -1) _exit(1);
         g_input_cancelled = 0;
         std::signal(SIGTERM, SIG_DFL);
         std::signal(SIGINT, SIG_DFL);
+        std::signal(SIGPIPE, SIG_IGN);
+        // Also bound Xlib startup if the X server stops answering. Leave time
+        // to report the handoff after its separate two-second deadline.
+        alarm(3);
         // Never touch the parent's X connection; just let go of its socket.
-        close(inherited_display_fd);
+        close(ConnectionNumber(offer.display));
         const int null = open("/dev/null", O_RDWR);
-        if (null >= 0) {
-            dup2(null, 0);
-            dup2(null, 1);
-            dup2(null, 2);
-        }
+        if (null < 0) _exit(1);
+        dup2(null, 0);
+        dup2(null, 1);
+        dup2(null, 2);
+        if (null > STDERR_FILENO) close(null);
         Display *display = XOpenDisplay(nullptr);
         if (display == nullptr) {
             _exit(1);
         }
         const Selection selection = OpenSelection(display);
-        XSelectInput(display, selection.window, PropertyChangeMask);
-        const Time time = ServerTime(selection);
-        XSetSelectionOwner(display, selection.clipboard, selection.window, time);
-        const bool owned = XGetSelectionOwner(display, selection.clipboard) == selection.window;
-        const char signal = owned ? '1' : '0';
-        if (write(ready[1], &signal, 1) < 0) {
-            _exit(1);
-        }
+        const Time time = ServerTime(selection, deadline_ns);
+        const auto problem = AtomicBurst(display, [&]() -> std::string_view {
+            if (XGetSelectionOwner(display, selection.clipboard) != offer.window) {
+                return "ownership_changed";
+            }
+            return DeadlineExpired(deadline_ns) || time == CurrentTime ? "deadline_exceeded" : "";
+        }, [&] {
+            XSetSelectionOwner(display, selection.clipboard, selection.window, time);
+            return XGetSelectionOwner(display, selection.clipboard) == selection.window;
+        }, [] {});
+        const bool owned = problem.empty();
+        alarm(0);
+        const char signal = owned ? '1' : problem == "ownership_changed" ? '2' : '0';
+        // Keep serving after a successful handoff even if the action exited.
+        (void)write(ready[1], &signal, 1);
         close(ready[1]);
         const auto until = std::chrono::steady_clock::now() + std::chrono::hours(1);
         while (owned && std::chrono::steady_clock::now() < until) {
@@ -2310,13 +2863,23 @@ bool StartRestorer(const std::vector<Item> &saved, int inherited_display_fd) {
         _exit(0);
     }
     close(ready[1]);
-    int status = 0;
-    waitpid(child, &status, 0);
-    char signal = '0';
+    std::string_view result = "unknown";
     pollfd fds[1] = {{ready[0], POLLIN, 0}};
-    const bool answered = poll(fds, 1, 2000) > 0 && read(ready[0], &signal, 1) == 1;
+    for (auto now = std::chrono::steady_clock::now(); now < deadline;
+         now = std::chrono::steady_clock::now()) {
+        const auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count();
+        const int polled = poll(fds, 1, static_cast<int>(left));
+        if (polled < 0 && errno == EINTR) continue;
+        if (polled > 0) {
+            char signal = '0';
+            const auto length = read(ready[0], &signal, 1);
+            if (length < 0 && errno == EINTR) continue;
+            result = signal == '1' ? "restored" : signal == '2' ? "ownership_changed" : "lost";
+        }
+        break;
+    }
     close(ready[0]);
-    return answered && signal == '1';
+    return result;
 }
 
 std::optional<std::vector<KeyCode>> ChordCodes(Display *display,
@@ -2448,7 +3011,8 @@ Window FocusedPidWindow(Display *display, unsigned long pid, Atom pid_atom) {
     return None;
 }
 
-int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding) {
+int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding,
+             std::string_view anchor_token) {
     InputCancellation cancellation;
     std::uint64_t pid_value = 0;
     std::uint64_t deadline_value = 0;
@@ -2459,8 +3023,15 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
     }
     const std::optional<std::uint64_t> pid = pid_value;
     const std::optional<std::uint64_t> deadline = deadline_value;
-    const auto text = ReadStdin(kMaxPasteBytes);
-    if (!text.has_value() || text->empty() || !DecodeUtf8(*text).has_value()) {
+    InputProgress progress("paste", 1);
+    std::string text;
+    if (anchor_token.empty()) {
+        text = ReadStdin(kMaxPasteBytes).value_or("");
+    } else if (const auto problem = ReadTextFrame(kMaxPasteBytes, *deadline, &text); !problem.empty()) {
+        EmitError(problem, "text_preflight", false);
+        return problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitUnsupportedText;
+    }
+    if (text.empty() || !DecodeUtf8(text).has_value()) {
         EmitError("unsupported_text", "text_preflight", false);
         return kExitUnsupportedText;
     }
@@ -2470,76 +3041,61 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
         return exit_code;
     }
     int event_base = 0, error_base = 0, major = 0, minor = 0;
+    auto refuse = [&](std::string_view code, std::string_view phase, int exit_code) {
+        progress.Emit(display);
+        XCloseDisplay(display);
+        EmitError(code, phase, false, "untouched");
+        return exit_code;
+    };
     const Atom pid_atom = XInternAtom(display, "_NET_WM_PID", True);
     if (!XTestQueryExtension(display, &event_base, &error_base, &major, &minor) ||
         pid_atom == None) {
-        XCloseDisplay(display);
-        EmitError("xtest_unavailable", "x11_preflight", false);
-        return kExitUnavailable;
+        return refuse("xtest_unavailable", "x11_preflight", kExitUnavailable);
     }
     const KeyCode control = XKeysymToKeycode(display, XK_Control_L);
     const KeyCode v = XKeysymToKeycode(display, XK_v);
     if (control == 0 || v == 0) {
-        XCloseDisplay(display);
-        EmitError("unsupported_key", "key_preflight", false);
-        return kExitInvalid;
+        return refuse("unsupported_key", "key_preflight", kExitInvalid);
     }
     if (!FocusMatchesWindow(display, static_cast<unsigned long>(*pid), pid_atom, binding)) {
-        XCloseDisplay(display);
-        EmitError("focus_owner_mismatch", "target_preflight", false);
-        return kExitTargetMismatch;
+        return refuse("focus_owner_mismatch", "target_preflight", kExitTargetMismatch);
     }
     const Selection selection = OpenSelection(display);
     auto fail = [&](std::string_view code, std::string_view phase, bool dispatched,
-                    int pre_dispatch_exit) {
+                    int pre_dispatch_exit, std::string_view restored = "untouched") {
         XDestroyWindow(display, selection.window);
+        progress.Emit(display);
         XCloseDisplay(display);
-        EmitError(code, phase, dispatched);
+        EmitError(code, phase, dispatched, restored);
         return dispatched ? kExitUnknownEffect : pre_dispatch_exit;
     };
     // Keep what the person had before anything changes.
-    const bool had_owner = XGetSelectionOwner(display, selection.clipboard) != None;
+    const Window previous_owner = XGetSelectionOwner(display, selection.clipboard);
     std::vector<Item> saved;
-    if (had_owner) {
+    if (previous_owner != None) {
         std::string problem;
-        const auto kept = SaveClipboard(selection, deadline.value(), &problem);
+        auto kept = SaveClipboard(selection, deadline.value(), &problem);
         if (!kept.has_value()) {
             return fail(problem, "clipboard_preflight", false, kExitTooLarge);
         }
-        saved = kept.value();
+        saved = std::move(*kept);
     }
     // A cancelled clipboard read can have returned only part of the original
     // offer. Never replace its owner unless the entire preflight completed.
     if (DeadlineExpired(deadline.value())) {
         return fail("deadline_exceeded", "clipboard_preflight", false, kExitTimeoutBeforeDispatch);
     }
+    if (previous_owner != None && saved.empty()) {
+        return fail("clipboard_unreadable", "clipboard_preflight", false, kExitUnavailable);
+    }
     const std::vector<Item> offer = {
-        {selection.utf8, selection.utf8, 8, *text},
-        {selection.plain_utf8, selection.plain_utf8, 8, *text},
-        {selection.text, selection.utf8, 8, *text},
+        {selection.utf8, selection.utf8, 8, text},
+        {selection.plain_utf8, selection.plain_utf8, 8, text},
+        {selection.text, selection.utf8, 8, text},
         {selection.password_hint, selection.password_hint, 8, "secret"},
     };
-    const Time time = ServerTime(selection);
-    XSetSelectionOwner(display, selection.clipboard, selection.window, time);
-    if (XGetSelectionOwner(display, selection.clipboard) != selection.window) {
-        return fail("clipboard_busy", "clipboard_preflight", false, kExitUnavailable);
-    }
-    auto restore = [&]() -> std::string {
-        // A new owner may represent a later user copy. Restore only while this
-        // transaction still owns the temporary selection.
-        if (XGetSelectionOwner(display, selection.clipboard) != selection.window) {
-            return "ownership_changed";
-        }
-        if (!had_owner) {
-            XSetSelectionOwner(display, selection.clipboard, None, CurrentTime);
-            XSync(display, False);
-            return "cleared";
-        }
-        if (saved.empty()) {
-            return "none";
-        }
-        return StartRestorer(saved, ConnectionNumber(display)) ? "restored" : "lost";
-    };
+    const auto mask = ResourceMask(display, selection.window);
+    const Time time = ServerTime(selection, *deadline);
     // The caller has just focused the element; give the focus change a moment.
     const auto focus_until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     while (!FocusMatchesWindow(display, static_cast<unsigned long>(pid.value()), pid_atom, binding) &&
@@ -2547,22 +3103,62 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
            std::chrono::steady_clock::now() < focus_until) {
         usleep(5000);
     }
-    if (DeadlineExpired(deadline.value()) ||
-        !FocusMatchesWindow(display, static_cast<unsigned long>(pid.value()), pid_atom, binding)) {
-        restore();
+    if (DeadlineExpired(*deadline)) {
+        return fail("deadline_exceeded", "clipboard_preflight", false, kExitTimeoutBeforeDispatch);
+    }
+    if (!FocusMatchesWindow(display, static_cast<unsigned long>(*pid), pid_atom, binding)) {
         return fail("focus_owner_mismatch", "target_preflight", false, kExitTargetMismatch);
     }
-    const Window pid_window =
-        FocusedPidWindow(display, static_cast<unsigned long>(pid.value()), pid_atom);
-    const auto mask = ResourceMask(display, selection.window);
-    std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
-    if (!PressChord(display, {control, v}, [&] {
-            return !DeadlineExpired(*deadline) &&
-                   FocusMatchesWindow(display, static_cast<unsigned long>(*pid), pid_atom, binding);
-        })) {
-        restore();
-        return fail("x11_error", "keyboard_dispatch", true, kExitUnknownEffect);
+    if (time == CurrentTime) {
+        return fail("clipboard_timestamp_unavailable", "clipboard_preflight", false, kExitUnavailable);
     }
+    if (const auto problem = ValidateKeyboardAnchor(anchor_token, 0, display, *pid,
+                                                    pid_atom, binding, *deadline); !problem.empty()) {
+        return fail(problem, "keyboard_preflight", false,
+                    problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
+    }
+    Window pid_window = None;
+    bool dispatched = false;
+    bool acquired = false;
+    bool attempted = false;
+    auto restore = [&]() -> std::string_view {
+        if (!acquired) return "untouched";
+        if (previous_owner != None) return RestoreClipboard(saved, selection);
+        // Destroying this offer's window clears the selection if it is still ours.
+        return XGetSelectionOwner(display, selection.clipboard) == selection.window
+            ? "cleared" : "ownership_changed";
+    };
+    const auto problem = AtomicBurst(display, [&]() -> std::string_view {
+        if (const auto focus = KeyboardFocusProblem(display, *pid, pid_atom, binding, *deadline);
+            !focus.empty()) return focus;
+        // A copy made during the save or while awaiting ACK belongs to the user.
+        if (XGetSelectionOwner(display, selection.clipboard) != previous_owner) {
+            return "clipboard_owner_changed";
+        }
+        pid_window = FocusedPidWindow(display, *pid, pid_atom);
+        if (pid_window == None) return "focus_owner_changed";
+        if (const auto keys = VerifyStrokeKeys(display, v, control); !keys.empty()) return keys;
+        if (DeadlineExpired(*deadline)) return "deadline_exceeded";
+        XSetSelectionOwner(display, selection.clipboard, selection.window, time);
+        acquired = XGetSelectionOwner(display, selection.clipboard) == selection.window;
+        // The ownership confirmation is a round trip. Cancellation can arrive
+        // while we wait, even though the server is grabbed and focus is stable.
+        if (DeadlineExpired(*deadline)) return "deadline_exceeded";
+        return acquired ? "" : "clipboard_busy";
+    }, [&] {
+        attempted = true;
+        return SubmitKeystroke(display, v, control);
+    }, [&] { ReleaseKeystroke(display, v, control); });
+    if (attempted) {
+        MarkDispatchStarted(dispatched);
+        progress.RecordKey(v, binding, control);
+    }
+    if (!problem.empty()) {
+        return fail(problem, "keyboard_dispatch", dispatched,
+                    problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch,
+                    restore());
+    }
+    progress.delivered = 1;
     // Serve the text only to the expected process; wait (bounded) for it.
     bool consumed = false;
     bool lost = false;
@@ -2586,8 +3182,7 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
             break;
         }
         if (!FocusMatchesWindow(display, static_cast<unsigned long>(*pid), pid_atom, binding)) {
-            restore();
-            return fail("focus_owner_changed", "paste_delivery", true, kExitUnknownEffect);
+            return fail("focus_owner_changed", "paste_delivery", true, kExitUnknownEffect, restore());
         }
         unsigned batch_events = 0;
         while (!lost && XPending(display) > 0 && !DeadlineExpired(deadline.value()) &&
@@ -2619,8 +3214,9 @@ int RunPaste(int argc, char **argv, const std::optional<WindowBinding> &binding)
         pollfd fds[1] = {{ConnectionNumber(display), POLLIN, 0}};
         poll(fds, 1, 10);
     }
-    const std::string restored = restore();
+    const auto restored = restore();
     XDestroyWindow(display, selection.window);
+    progress.Emit(display);
     XCloseDisplay(display);
     std::cout << "{\"ok\":true,\"dispatch_started\":true,\"events\":4,\"consumed\":"
               << (consumed ? "true" : "false") << ",\"restored\":\"" << restored
@@ -2719,19 +3315,30 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
         // This protocol handshake does not open a display or touch input state.
-        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys","anchored-drag-between"]})"
+        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys","anchored-drag-between","anchored-type-text","atomic-key-dispatch","text-event-barrier","window-geometry-proof-v1","anchored-straight-drag"]})"
                   << std::endl;
         return 0;
     }
     std::optional<WindowBinding> binding;
+    std::optional<WindowBinding> destination_binding;
     std::vector<char *> filtered;
-    if (!ExtractWindowBinding(&argc, &argv, &filtered, &binding) ||
-        (binding.has_value() && command != "focus-info" && binding->id == None)) {
+    std::vector<char *> filtered_destination;
+    std::string_view anchor_token;
+    if ((command != "window-info" && command != "window-action" &&
+         !ExtractWindowBinding(&argc, &argv, &filtered, &binding, "--", &anchor_token)) ||
+        (!anchor_token.empty() &&
+         (!binding || (command != "type-text" && command != "key-chord" && command != "paste"))) ||
+        (binding.has_value() && command != "focus-info" && (binding->id == None || binding->request_proof))) {
         EmitError("invalid_window_binding", "arguments", false);
         return kExitInvalid;
     }
     if (binding.has_value() && command != "focus-info" && command != "type-text" &&
         command != "key-chord" && command != "paste" && command != "pointer-gesture" && command != "drag") {
+        EmitError("invalid_window_binding", "arguments", false);
+        return kExitInvalid;
+    }
+    if (command == "drag" &&
+        !ExtractWindowBinding(&argc, &argv, &filtered_destination, &destination_binding, "--destination-")) {
         EmitError("invalid_window_binding", "arguments", false);
         return kExitInvalid;
     }
@@ -2748,35 +3355,44 @@ int main(int argc, char **argv) {
         return RunFocusInfo(argc, argv, binding);
     }
     if (command == "paste") {
-        return RunPaste(argc, argv, binding);
+        return RunPaste(argc, argv, binding, anchor_token);
     }
     if (command == "global-key") {
         return RunGlobalKey(argc, argv);
     }
-    std::optional<InputCancellation> cancellation;
-    if (command == "type-text" || command == "pointer-click") cancellation.emplace();
+    InputCancellation cancellation;
     std::optional<std::uint64_t> expected_pid;
     std::optional<std::uint64_t> deadline_ns;
     std::optional<int> click_x;
     std::optional<int> click_y;
     std::optional<GestureRequest> gesture;
     bool physical_keys = false;
+    bool require_event_barrier = false;
     if (command == "pointer-gesture" || command == "drag" || command == "key-chord") {
         gesture = ParseGesture(command, argc, argv, &expected_pid, &deadline_ns);
         if (!gesture.has_value()) {
             EmitError("invalid_arguments", "arguments", false);
             return kExitInvalid;
         }
+        const bool needs_destination_proof = command == "drag" && gesture->path.empty() &&
+            binding && !binding->proof.empty();
+        if (needs_destination_proof != destination_binding.has_value() ||
+            (destination_binding && destination_binding->proof.empty())) {
+            EmitError("invalid_window_binding", "arguments", false);
+            return kExitInvalid;
+        }
     } else if (command == "type-text") {
-        if ((argc != 6 && argc != 8) || std::string_view(argv[2]) != "--expected-pid" ||
-            std::string_view(argv[4]) != "--deadline-monotonic-ns" ||
-            (argc == 8 && (std::string_view(argv[6]) != "--mode" || std::string_view(argv[7]) != "keys"))) {
+        const auto pairs = ParsePairs(argc, argv, {"expected-pid", "deadline-monotonic-ns", "mode", "text-event-barrier"});
+        const auto mode = pairs ? Pair(*pairs, "mode") : std::nullopt;
+        const auto barrier = pairs ? Pair(*pairs, "text-event-barrier") : std::nullopt;
+        if (!pairs || (mode && *mode != "keys") || (barrier && (*barrier != "required" || anchor_token.empty()))) {
             EmitError("invalid_arguments", "arguments", false);
             return kExitInvalid;
         }
-        expected_pid = ParseUnsigned(argv[3]);
-        deadline_ns = ParseUnsigned(argv[5]);
-        physical_keys = argc == 8;
+        expected_pid = ParseUnsigned(Pair(*pairs, "expected-pid").value_or(""));
+        deadline_ns = ParseUnsigned(Pair(*pairs, "deadline-monotonic-ns").value_or(""));
+        physical_keys = mode.has_value();
+        require_event_barrier = barrier.has_value();
     } else if (command == "pointer-click") {
         if (argc != 10 || std::string_view(argv[2]) != "--expected-pid" ||
             std::string_view(argv[4]) != "--x" || std::string_view(argv[6]) != "--y" ||
@@ -2816,18 +3432,17 @@ int main(int argc, char **argv) {
     std::optional<std::vector<std::uint32_t>> codepoints;
     if (command == "type-text") {
         std::string input;
-        input.reserve(kMaxInputBytes);
-        char buffer[1024];
-        while (std::cin.good()) {
-            std::cin.read(buffer, sizeof(buffer));
-            const std::streamsize count = std::cin.gcount();
-            if (count > 0) {
-                input.append(buffer, static_cast<std::size_t>(count));
-                if (input.size() > kMaxInputBytes) {
-                    EmitError("input_too_large", "text_preflight", false);
-                    return kExitInvalid;
-                }
+        if (anchor_token.empty()) {
+            auto legacy = ReadStdin(kMaxInputBytes);
+            if (!legacy) {
+                EmitError("input_too_large", "text_preflight", false);
+                return kExitInvalid;
             }
+            input = std::move(*legacy);
+        } else if (const auto problem = ReadTextFrame(kMaxInputBytes, *deadline_ns, &input);
+                   !problem.empty()) {
+            EmitError(problem, "text_preflight", false);
+            return problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitUnsupportedText;
         }
         codepoints = DecodeUtf8(input);
         if (!codepoints.has_value() || codepoints->empty()) {
@@ -2835,44 +3450,54 @@ int main(int argc, char **argv) {
             return kExitUnsupportedText;
         }
     }
+    std::optional<InputProgress> progress;
+    if (codepoints) {
+        progress.emplace(physical_keys && anchor_token.empty() ? "key" : "codepoint", codepoints->size());
+    } else if (command == "key-chord") {
+        progress.emplace("chord", 1);
+    } else if (command == "drag") {
+        progress.emplace("button", 1);
+    } else if (gesture) {
+        const unsigned count = gesture->mode == "click" ? gesture->count :
+                               gesture->mode == "wheel" ? gesture->notches : 0;
+        progress.emplace("button", count);
+    }
+    auto refuse = [&](std::string_view code, std::string_view phase, int exit_code, Display *display = nullptr) {
+        if (progress) progress->Emit();
+        if (display) XCloseDisplay(display);
+        EmitError(code, phase, false);
+        return exit_code;
+    };
     if (DeadlineExpired(deadline_ns.value())) {
-        EmitError("deadline_exceeded", "pre_dispatch", false);
-        return kExitTimeoutBeforeDispatch;
+        return refuse("deadline_exceeded", "pre_dispatch", kExitTimeoutBeforeDispatch);
     }
 
     XSetErrorHandler(HandleXError);
     Display *display = XOpenDisplay(nullptr);
     if (display == nullptr) {
-        EmitError("display_unavailable", "x11_preflight", false);
-        return kExitUnavailable;
+        return refuse("display_unavailable", "x11_preflight", kExitUnavailable);
     }
     int event_base = 0;
     int error_base = 0;
     int major = 0;
     int minor = 0;
     if (!XTestQueryExtension(display, &event_base, &error_base, &major, &minor)) {
-        XCloseDisplay(display);
-        EmitError("xtest_unavailable", "x11_preflight", false);
-        return kExitUnavailable;
+        return refuse("xtest_unavailable", "x11_preflight", kExitUnavailable, display);
     }
     const Atom pid_atom = XInternAtom(display, "_NET_WM_PID", True);
     if (pid_atom == None) {
-        XCloseDisplay(display);
-        EmitError("pid_property_unavailable", "target_preflight", false);
-        return kExitTargetMismatch;
+        return refuse("pid_property_unavailable", "target_preflight", kExitTargetMismatch, display);
     }
     while ((command == "type-text" || command == "key-chord" || (gesture.has_value() && !gesture->modifiers.empty())) &&
            !FocusMatchesWindow(display, expected_pid.value(), pid_atom, binding)) {
-        if (DeadlineExpired(deadline_ns.value())) {
-            XCloseDisplay(display);
-            EmitError("focus_owner_mismatch", "target_preflight", false);
-            return kExitTargetMismatch;
+        if (!anchor_token.empty() || DeadlineExpired(deadline_ns.value())) {
+            return refuse("focus_owner_mismatch", "target_preflight", kExitTargetMismatch, display);
         }
         usleep(5000);
     }
     if (gesture.has_value()) {
         return RunGesture(display, command, gesture.value(), expected_pid.value(),
-                          deadline_ns.value(), pid_atom, binding);
+                          deadline_ns.value(), pid_atom, binding, destination_binding, *progress, anchor_token);
     }
     if (command == "pointer-click") {
         if (!click_x.has_value() || !click_y.has_value() ||
@@ -2923,9 +3548,16 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    std::optional<KeyboardEventBarrier> event_barrier;
+    if (require_event_barrier) {
+        event_barrier = KeyboardEventBarrier::Open(display, binding->id);
+        if (!event_barrier) {
+            return refuse("text_event_barrier_unavailable", "text_preflight", kExitUnavailable, display);
+        }
+    }
     if (physical_keys) {
         return RunPhysicalText(display, codepoints.value(), expected_pid.value(),
-                               deadline_ns.value(), pid_atom, binding);
+                               deadline_ns.value(), pid_atom, binding, *progress, anchor_token, event_barrier);
     }
 
     int minimum = 0;
@@ -2939,9 +3571,7 @@ int main(int argc, char **argv) {
         if (mapping != nullptr) {
             XFree(mapping);
         }
-        XCloseDisplay(display);
-        EmitError("keyboard_map_unavailable", "text_preflight", false);
-        return kExitUnavailable;
+        return refuse("keyboard_map_unavailable", "text_preflight", kExitUnavailable, display);
     }
     const auto spares =
         FindUnusedKeycodes(display, minimum, maximum, symbols_per_code, mapping);
@@ -2949,9 +3579,7 @@ int main(int argc, char **argv) {
                                    symbols_per_code, mapping, spares);
     if (!plan.has_value()) {
         XFree(mapping);
-        XCloseDisplay(display);
-        EmitError("unsupported_keyboard_mapping", "text_preflight", false);
-        return kExitUnsupportedText;
+        return refuse("unsupported_keyboard_mapping", "text_preflight", kExitUnsupportedText, display);
     }
     const KeyCode shift = XKeysymToKeycode(display, XK_Shift_L);
     bool requires_shift = false;
@@ -2960,9 +3588,7 @@ int main(int argc, char **argv) {
     }
     if (requires_shift && shift == 0) {
         XFree(mapping);
-        XCloseDisplay(display);
-        EmitError("shift_unavailable", "text_preflight", false);
-        return kExitUnsupportedText;
+        return refuse("shift_unavailable", "text_preflight", kExitUnsupportedText, display);
     }
 
     std::vector<std::vector<KeySym>> original_mappings;
@@ -2993,6 +3619,7 @@ int main(int argc, char **argv) {
                               int pre_dispatch_exit) {
         restore_mapping();
         XSync(display, False);
+        progress->Emit(display);
         XCloseDisplay(display);
         EmitError(code, phase, dispatch_started);
         return dispatch_started ? kExitUnknownEffect : pre_dispatch_exit;
@@ -3020,44 +3647,50 @@ int main(int argc, char **argv) {
         usleep(50'000);
     }
 
-    for (const auto &stroke : plan->strokes) {
-        if (DeadlineExpired(deadline_ns.value())) {
-            return finish_failure("deadline_exceeded", "keyboard_dispatch",
-                                  kExitTimeoutBeforeDispatch);
+    for (std::size_t index = 0; index < plan->strokes.size(); ++index) {
+        if (const auto problem = ValidateKeyboardAnchor(anchor_token, index, display, *expected_pid,
+                                                        pid_atom, binding, *deadline_ns); !problem.empty()) {
+            return finish_failure(problem, "keyboard_dispatch",
+                                  problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
         }
-        if (!FocusMatchesWindow(display, expected_pid.value(), pid_atom, binding)) {
-            return finish_failure("focus_owner_changed", "keyboard_dispatch",
-                                  kExitTargetMismatch);
+        const auto &stroke = plan->strokes[index];
+        const KeyCode stroke_shift = stroke.shift ? shift : 0;
+        bool attempted = false;
+        const auto problem = AtomicBurst(display, [&]() -> std::string_view {
+            if (const auto focus = KeyboardFocusProblem(display, expected_pid.value(), pid_atom,
+                                                        binding, deadline_ns.value()); !focus.empty()) {
+                return focus;
+            }
+            if (const auto keys = VerifyStrokeKeys(display, stroke.keycode, stroke_shift); !keys.empty()) return keys;
+            return DeadlineExpired(deadline_ns.value()) ? "deadline_exceeded" : "";
+        }, [&] {
+            attempted = true;
+            return SubmitKeystroke(display, stroke.keycode, stroke_shift);
+        }, [&] { ReleaseKeystroke(display, stroke.keycode, stroke_shift); });
+        if (attempted) {
+            MarkDispatchStarted(dispatch_started);
+            progress->RecordKey(stroke.keycode, binding, stroke_shift);
         }
-        if (!dispatch_started) {
-            std::cout << "{\"event\":\"dispatch_started\"}" << std::endl;
-            dispatch_started = true;
+        if (!problem.empty()) {
+            return finish_failure(problem, "keyboard_dispatch",
+                                  problem == "deadline_exceeded" ? kExitTimeoutBeforeDispatch : kExitTargetMismatch);
         }
-        g_x_error = false;
-        bool submitted = true;
-        if (stroke.shift) {
-            submitted = XTestFakeKeyEvent(display, shift, True, 1) != 0;
-            ++event_count;
-        }
-        submitted =
-            XTestFakeKeyEvent(display, stroke.keycode, True, 1) != 0 && submitted;
-        submitted =
-            XTestFakeKeyEvent(display, stroke.keycode, False, 1) != 0 && submitted;
-        event_count += 2;
-        if (stroke.shift) {
-            submitted =
-                XTestFakeKeyEvent(display, shift, False, 1) != 0 && submitted;
-            ++event_count;
-        }
-        XSync(display, False);
-        if (!submitted || g_x_error) {
-            return finish_failure("x11_error", "keyboard_dispatch",
-                                  kExitUnknownEffect);
+        event_count += stroke_shift ? 4 : 2;
+        ++progress->delivered;
+        // A native final stroke can close the target. A temporary keycode
+        // must stay mapped until the client has processed it.
+        const bool wait_for_client = index + 1 < plan->strokes.size() ||
+            (event_barrier && std::any_of(plan->dynamic_mappings.begin(), plan->dynamic_mappings.end(),
+                                         [&](const DynamicMapping &mapping) { return mapping.keycode == stroke.keycode; }));
+        if (const auto wait = FinishTextStroke(event_barrier, wait_for_client, display,
+                                              *expected_pid, pid_atom, binding, *deadline_ns); !wait.empty()) {
+            return finish_failure(wait, "keyboard_dispatch", kExitTargetMismatch);
         }
     }
     restore_mapping();
     XSync(display, False);
     const bool final_error = g_x_error;
+    progress->Emit(display);
     XCloseDisplay(display);
     if (final_error) {
         EmitError("x11_error", "post_dispatch", dispatch_started);

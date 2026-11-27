@@ -82,10 +82,19 @@ pub struct NativeRef {
 
 /// A top-level window from the same freshly captured tree as an input target.
 /// This is an internal anchor, never a caller-provided coordinate or window id.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WindowAnchor {
     pub native: NativeRef,
     pub bounds: Bounds,
+    x11: Option<X11WindowBinding>,
+}
+
+/// Private platform state returned by the Linux backend for this observation.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct X11WindowBinding {
+    client: u32,
+    proof: Value,
 }
 
 /// Private native path: source, intermediate anchors, then destination. Every
@@ -125,6 +134,26 @@ pub struct BackendSnapshot {
     pub truncated: bool,
     /// Bounded, content-free explanations for an incomplete capture.
     pub truncation_reasons: Vec<Value>,
+    /// Private geometry inventory used only for Qt/X11 window proof.
+    #[doc(hidden)]
+    pub qt_x11_windows: Option<Vec<QtX11Window>>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct QtX11Window {
+    native: NativeRef,
+    name: String,
+    raw: Bounds,
+    candidates: Vec<QtX11Client>,
+    unique_client: Option<QtX11Client>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QtX11Client {
+    xid: u32,
+    bounds: Bounds,
+    viewable: bool,
 }
 
 /// A pointer gesture, already validated, in X11's own button numbering.
@@ -160,6 +189,14 @@ impl Bounds {
 }
 
 pub trait AtspiBackend: Send + Sync {
+    #[doc(hidden)]
+    fn observe_x11_windows(
+        &self,
+        _snapshot: &mut BackendSnapshot,
+        _deadline: Instant,
+    ) -> BTreeMap<usize, X11WindowBinding> {
+        BTreeMap::new()
+    }
     fn read_table(
         &self,
         _target: &NativeRef,
@@ -173,6 +210,9 @@ pub trait AtspiBackend: Send + Sync {
         ))
     }
     fn supports_cross_resource_drag(&self) -> bool {
+        false
+    }
+    fn retains_resource_observations(&self) -> bool {
         false
     }
     fn qt_text_drop(&self, _request: DragBetweenRequest<'_>) -> Result<Value, AutomationError> {
@@ -387,6 +427,7 @@ pub trait AtspiBackend: Send + Sync {
         &self,
         target: &NativeRef,
         _window: Option<&WindowAnchor>,
+        _destination_window: Option<&WindowAnchor>,
         from: (i32, i32),
         to: (i32, i32),
         button: u8,
@@ -513,6 +554,7 @@ pub trait AtspiBackend: Send + Sync {
     fn window_action(
         &self,
         _target: &NativeRef,
+        _window: Option<&WindowAnchor>,
         _action: &str,
         _bounds: Bounds,
         _process_id: u32,
@@ -571,6 +613,7 @@ struct Scope {
 struct Record {
     public: Value,
     handles: BTreeMap<String, NativeRef>,
+    x11_windows: BTreeMap<String, X11WindowBinding>,
     fingerprints: BTreeMap<String, String>,
     members: BTreeSet<String>,
     application_selector: Map<String, Value>,
@@ -600,12 +643,16 @@ pub struct AtspiProvider {
 
 impl AtspiProvider {
     pub fn new(backend: Arc<dyn AtspiBackend>) -> Result<Self, AutomationError> {
-        let retain_resources = backend.supports_cross_resource_drag();
-        let document = if retain_resources {
+        let cross_resource_drag = backend.supports_cross_resource_drag();
+        let retain_resources = cross_resource_drag || backend.retains_resource_observations();
+        let mut document = if cross_resource_drag {
             cross_resource::enabled_manifest()
         } else {
             manifest_document()
         };
+        if retain_resources {
+            document["retains_resource_observations"] = json!(true);
+        }
         Ok(Self {
             backend,
             manifest: manifest::parse(&document).map_err(|reason| {
@@ -752,7 +799,7 @@ impl AtspiProvider {
                     200000,
                     "max_characters",
                 )? as usize;
-                let (_, _, node, native) = self.fresh_target(args, deadline, false)?;
+                let (_, _, node, native) = self.fresh_target(args, deadline, false, false)?;
                 if node["states"]["protected"] != false
                     || node["provenance"]["scope_context"] == true
                 {
@@ -966,7 +1013,7 @@ impl AtspiProvider {
         scope: Option<Scope>,
         deadline: Instant,
     ) -> Result<Record, AutomationError> {
-        let raw = match scope.as_ref() {
+        let mut raw = match scope.as_ref() {
             Some(scope) => {
                 self.backend
                     .capture_scope(selector, &scope.root, max_depth, max_nodes, deadline)?
@@ -981,6 +1028,7 @@ impl AtspiProvider {
                 "backend exceeded the requested node limit",
             ));
         }
+        let mut observed_windows = self.backend.observe_x11_windows(&mut raw, deadline);
         let mut state = self
             .state
             .lock()
@@ -990,6 +1038,7 @@ impl AtspiProvider {
         let snapshot_id = format!("{}:{revision}", self.generation);
         let mut nodes = Vec::with_capacity(raw.nodes.len());
         let mut handles = BTreeMap::new();
+        let mut x11_windows = BTreeMap::new();
         let mut fingerprints = BTreeMap::new();
         let mut members = BTreeSet::new();
         let mut structural_members = BTreeSet::new();
@@ -1009,6 +1058,9 @@ impl AtspiProvider {
                 })
                 .transpose()?;
             let node_id = format!("n{index}");
+            if let Some(binding) = observed_windows.remove(&index) {
+                x11_windows.insert(node_id.clone(), binding);
+            }
             let in_scope = scope.as_ref().is_none_or(|scope| item.native == scope.root)
                 || parent_id
                     .as_ref()
@@ -1120,6 +1172,7 @@ impl AtspiProvider {
         let record = Record {
             public,
             handles,
+            x11_windows,
             fingerprints,
             members,
             application_selector: selector.clone(),
@@ -1271,11 +1324,12 @@ impl AtspiProvider {
         args: &Map<String, Value>,
         deadline: Instant,
         pin_invoke_name: bool,
+        pin_x11_window: bool,
     ) -> Result<(Record, String, Value, NativeRef), AutomationError> {
         let record = self.observed_record(args)?;
         // Reject invalid observed references before asking the backend for a
         // fresh tree. Both checks use the same identity/fingerprint rules.
-        let (_, observed, _) = Self::revalidate_target(args, &record, &record, deadline)?;
+        let (observed_id, observed, _) = Self::revalidate_target(args, &record, &record, deadline)?;
         let fresh = self.capture_scoped(
             &record.application_selector,
             record.max_depth,
@@ -1285,6 +1339,9 @@ impl AtspiProvider {
         )?;
         let (fresh_id, resolved, native) =
             Self::revalidate_target(args, &record, &fresh, deadline)?;
+        if pin_x11_window {
+            revalidate_x11_window(&record, &observed_id, &fresh, &fresh_id)?;
+        }
         // On a Chromium checkbox the default action can reverse while the
         // object, role and locator all remain identical.
         if pin_invoke_name {
@@ -1310,7 +1367,7 @@ impl AtspiProvider {
         let observed = self.observed_record(args)?;
         let (_, observed_node, _) = Self::revalidate_target(args, &observed, &observed, deadline)?;
         check_secret_target(&observed_node)?;
-        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline, false)?;
+        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline, false, false)?;
         check_secret_target(&node)?;
         remaining(deadline, false)?;
         let result = self.backend.secret_input(&native, text, deadline);
@@ -1413,8 +1470,11 @@ impl AtspiProvider {
         } else {
             None
         };
+        let pin_x11_window = matches!(action, "type_text" | "key_chord" | "paste" | "drag")
+            || WINDOW_ACTIONS.contains(&action)
+            || !modifiers.is_empty();
         let (fresh, fresh_id, node, native) =
-            self.fresh_target(args, deadline, action == "invoke")?;
+            self.fresh_target(args, deadline, action == "invoke", pin_x11_window)?;
         let available = node["actions"].as_array().expect("normalized action array");
         if !available.iter().any(|value| value == action) {
             self.backend.check_action_support(action, deadline)?;
@@ -1472,6 +1532,7 @@ impl AtspiProvider {
         }
         // The destination of a drag is re-verified exactly like the source.
         let mut qt_drop = None;
+        let mut destination_window = None;
         let destination = if action == "drag" {
             let mut to_args = Map::new();
             to_args.insert(
@@ -1482,12 +1543,13 @@ impl AtspiProvider {
                 "locator".into(),
                 args.get("to_locator").cloned().unwrap_or(Value::Null),
             );
-            let (to_id, to_node, to_native) = Self::revalidate_target(
-                &to_args,
-                drag_observation.as_ref().expect("captured for drag"),
-                &fresh,
-                deadline,
-            )?;
+            let observed = drag_observation.as_ref().expect("captured for drag");
+            let (observed_to_id, _, _) =
+                Self::revalidate_target(&to_args, observed, observed, deadline)?;
+            let (to_id, to_node, to_native) =
+                Self::revalidate_target(&to_args, observed, &fresh, deadline)?;
+            revalidate_x11_window(observed, &observed_to_id, &fresh, &to_id)?;
+            destination_window = input_window(&fresh, &to_id);
             if node["provenance"]["wayland_input_window"].is_string() {
                 if !path.is_empty() || hold_ms.is_some() {
                     return Err(driver_error(
@@ -1581,9 +1643,7 @@ impl AtspiProvider {
                     return Err(stale("drag surface geometry or input state changed"));
                 }
                 let current_window = input_window(&now, &id);
-                if expected_window.as_ref().map(|w| (&w.native, w.bounds))
-                    != current_window.as_ref().map(|w| (&w.native, w.bounds))
-                {
+                if expected_window != current_window {
                     return Err(stale("drag window identity or geometry changed"));
                 }
                 let checked = if index == 0 {
@@ -1604,7 +1664,13 @@ impl AtspiProvider {
                     .map(|(record, id)| (record, id.as_str()))
                     .unwrap_or((&now, id.as_str()));
                 for point in checked {
-                    validator.validate_path_point(visibility, visibility_id, *point, deadline)?;
+                    validator.validate_path_point(
+                        visibility,
+                        visibility_id,
+                        *point,
+                        None,
+                        deadline,
+                    )?;
                 }
                 remaining(deadline, false)?;
                 Ok(())
@@ -1766,6 +1832,7 @@ impl AtspiProvider {
                     self.backend.drag_modified(
                         &native,
                         window.as_ref(),
+                        destination_window.as_ref(),
                         pointer.expect("computed above"),
                         destination.expect("computed above"),
                         button,
@@ -1792,11 +1859,17 @@ impl AtspiProvider {
                     self.backend
                         .paste(&native, window.as_ref(), text, process, deadline)
                 }
-                window if WINDOW_ACTIONS.contains(&window) => {
+                window_action if WINDOW_ACTIONS.contains(&window_action) => {
                     let process = process_id(&node, &fresh)?;
                     let bounds = parse_bounds(node.get("bounds"))?;
-                    self.backend
-                        .window_action(&native, window, bounds, process, deadline)
+                    self.backend.window_action(
+                        &native,
+                        window.as_ref(),
+                        window_action,
+                        bounds,
+                        process,
+                        deadline,
+                    )
                 }
                 "toggle" => self.backend.named_action(&native, "click", deadline),
                 "expand" | "collapse" => self.backend.named_action(&native, "activate", deadline),
@@ -1915,7 +1988,7 @@ impl AtspiProvider {
         args: &Map<String, Value>,
         deadline: Instant,
     ) -> Result<(Vec<u8>, Map<String, Value>), AutomationError> {
-        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline, false)?;
+        let (fresh, fresh_id, node, native) = self.fresh_target(args, deadline, false, false)?;
         let expanded = self.private_window_record(&fresh, &fresh_id, "capture", deadline)?;
         let (visibility, visibility_id) = expanded
             .as_ref()
@@ -2141,6 +2214,7 @@ impl AtspiProvider {
         record: &Record,
         node_id: &str,
         point: (i32, i32),
+        native_hit_window: Option<&NativeRef>,
         deadline: Instant,
     ) -> Result<(), AutomationError> {
         self.validate_point(record, node_id, point, deadline)?;
@@ -2150,9 +2224,25 @@ impl AtspiProvider {
         // order is not assumed; this deliberately rejects uncertain overlaps.
         let allowed = descendants(record, node_id);
         let ancestors = ancestor_chain(record, node_id);
+        // Cross-resource drag proves top-level stacking in the X11 helper, which
+        // can distinguish an active drag icon from a window that intercepts input.
+        // AT-SPI still checks every covering branch inside the endpoint window.
+        let within_window = native_hit_window
+            .map(|window| {
+                ancestors
+                    .iter()
+                    .map(String::as_str)
+                    .find(|id| record.handles[*id] == *window)
+                    .map(|id| descendants(record, id))
+                    .ok_or_else(|| stale("drag endpoint window missing during hit validation"))
+            })
+            .transpose()?;
         for candidate in record.public["nodes"].as_array().expect("normalized nodes") {
             let id = candidate["node_id"].as_str().expect("normalized node id");
-            if allowed.contains(id)
+            if within_window
+                .as_ref()
+                .is_some_and(|nodes| !nodes.contains(id))
+                || allowed.contains(id)
                 || ancestors.iter().any(|ancestor| ancestor == id)
                 || candidate["states"]["visible"] == false
                 || candidate["states"]["showing"] == false
@@ -2848,10 +2938,24 @@ fn input_window(record: &Record, node_id: &str) -> Option<WindowAnchor> {
             return Some(WindowAnchor {
                 native: record.handles.get(&id)?.clone(),
                 bounds,
+                x11: record.x11_windows.get(&id).cloned(),
             });
         }
     }
     None
+}
+
+fn revalidate_x11_window(
+    observed: &Record,
+    observed_id: &str,
+    fresh: &Record,
+    fresh_id: &str,
+) -> Result<(), AutomationError> {
+    let binding = |record, id| input_window(record, id).filter(|window| window.x11.is_some());
+    if binding(observed, observed_id) != binding(fresh, fresh_id) {
+        return Err(stale("observed X11 window geometry or identity changed"));
+    }
+    Ok(())
 }
 
 fn descendants(record: &Record, node_id: &str) -> BTreeSet<String> {
@@ -3669,6 +3773,8 @@ pub(crate) use linux::file_dialog::GtkFileDialog;
 pub(crate) use linux::gtk4_picker::Gtk4Picker;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::kde_picker::KdeDialog;
+#[cfg(target_os = "linux")]
+pub use linux::require_x11_keyboard_features;
 
 #[cfg(test)]
 mod tests {
@@ -3705,6 +3811,8 @@ mod tests {
         path_supported: bool,
         path_changed_after: usize,
         path_window_visibility: u8,
+        drag_windows: bool,
+        move_drag_destination: bool,
         capture_only_target: bool,
         cancel_in_window_capture: bool,
         cross_supported: bool,
@@ -3804,6 +3912,21 @@ mod tests {
     }
 
     impl AtspiBackend for FakeBackend {
+        fn observe_x11_windows(
+            &self,
+            snapshot: &mut BackendSnapshot,
+            _deadline: Instant,
+        ) -> BTreeMap<usize, X11WindowBinding> {
+            if !self.drag_windows {
+                return BTreeMap::new();
+            }
+            [1, 2].into_iter().map(|index| {
+                (index, X11WindowBinding {
+                    client: index as u32,
+                            proof: json!({"client_bounds": snapshot.nodes[index].bounds.unwrap().to_json()}),
+                })
+            }).collect()
+        }
         fn supports_cross_resource_drag(&self) -> bool {
             self.cross_supported
         }
@@ -3858,6 +3981,29 @@ mod tests {
                     token.cancel();
                     token.check()?;
                 }
+            }
+            if self.drag_windows {
+                let mut app = self.node("/app");
+                app.role = "application".into();
+                app.bounds = None;
+                let mut source = self.node("/source");
+                source.role = "frame".into();
+                source.parent_index = Some(0);
+                source.name = Some("Source".into());
+                let mut destination = source.clone();
+                destination.native.object_path = "/destination".into();
+                destination.name = Some("Destination".into());
+                destination.bounds.as_mut().unwrap().x += 100;
+                if self.move_drag_destination && self.captures.load(Ordering::SeqCst) > 1 {
+                    destination.bounds.as_mut().unwrap().x += 10;
+                }
+                return Ok(BackendSnapshot {
+                    application: Self::application(),
+                    nodes: vec![app, source, destination],
+                    truncated: false,
+                    truncation_reasons: vec![],
+                    qt_x11_windows: None,
+                });
             }
             let path = if self.replaced && self.captures.load(Ordering::SeqCst) > 1 {
                 "/org/a11y/replacement"
@@ -3918,6 +4064,7 @@ mod tests {
                 application,
                 nodes,
                 truncated: self.truncated,
+                qt_x11_windows: None,
                 truncation_reasons: if self.truncated {
                     vec![json!({"code": "max_nodes", "limit": 1000})]
                 } else {
@@ -3991,6 +4138,7 @@ mod tests {
                 nodes,
                 truncated: self.scoped_truncated,
                 truncation_reasons: vec![],
+                qt_x11_windows: None,
             })
         }
         fn focus(
@@ -4126,6 +4274,7 @@ mod tests {
         fn window_action(
             &self,
             _target: &NativeRef,
+            _window: Option<&WindowAnchor>,
             action: &str,
             bounds: Bounds,
             process_id: u32,
@@ -4185,6 +4334,7 @@ mod tests {
             &self,
             target: &NativeRef,
             _window: Option<&WindowAnchor>,
+            _destination_window: Option<&WindowAnchor>,
             from: (i32, i32),
             to: (i32, i32),
             button: u8,
@@ -4729,6 +4879,40 @@ mod tests {
             1,
             "stale destination must not dispatch another drag"
         );
+    }
+
+    #[test]
+    fn straight_drag_rejects_a_moved_destination_window_before_dispatch() {
+        for moved in [false, true] {
+            let backend = Arc::new(FakeBackend {
+                drag_windows: true,
+                move_drag_destination: moved,
+                ..Default::default()
+            });
+            let provider = AtspiProvider::new(backend.clone()).unwrap();
+            let observed = take_snapshot(&provider);
+            let target = |node_id| {
+                json!({"snapshot_id": observed["snapshot_id"],
+                "revision": observed["revision"], "node_id": node_id})
+            };
+            let result = provider.invoke(
+                "desktop.linux_atspi.drag@1",
+                json!({
+                    "target": target("n1"), "locator": {"name": "Source"},
+                    "to": target("n2"), "to_locator": {"name": "Destination"},
+                    "modifiers": ["ctrl"]
+                }),
+                Some(Duration::from_secs(2)),
+            );
+            if moved {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.code, "DRIVER.STALE_SNAPSHOT");
+                assert_eq!(failure.effect, "not_applied");
+            } else {
+                assert_eq!(result.unwrap()["backend_result"]["to"], json!([130, 30]));
+            }
+            assert_eq!(backend.writes.load(Ordering::SeqCst), usize::from(!moved));
+        }
     }
 
     fn path_args(observed: &Value) -> Value {
