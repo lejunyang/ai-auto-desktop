@@ -1,4 +1,5 @@
 //! Per-window calibration for Qt's logical AT-SPI coordinates on X11.
+use super::super::QtX11Client;
 use super::*;
 use crate::window_geometry::{self, ClientGeometry};
 
@@ -126,23 +127,8 @@ impl LinuxBackend {
             remaining(deadline, false)?;
             let name = zbus::block_on(self.accessible(&native)?.name())
                 .map_err(|e| native_failure("coordinate window name", &native, e))?;
-            let (x, y, width, height) = zbus::block_on(
-                self.component_proxy(&native)?
-                    .get_extents(CoordType::Screen),
-            )
-            .map_err(|e| native_failure("coordinate window geometry", &native, e))?;
-            if width > 0 && height > 0 {
-                result.push((
-                    native,
-                    name,
-                    Bounds {
-                        x,
-                        y,
-                        width,
-                        height,
-                    },
-                ));
-            }
+            let bounds = self.window_bounds(&native, deadline)?;
+            result.push((native, name, bounds));
         }
         self.check_cancelled(false)?;
         remaining(deadline, false)?;
@@ -152,6 +138,7 @@ impl LinuxBackend {
     fn read_client_geometry(
         &self,
         process: u32,
+        include_unviewable: bool,
         deadline: Instant,
     ) -> Result<Vec<ClientGeometry>, AutomationError> {
         if std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("x11")
@@ -187,7 +174,11 @@ impl LinuxBackend {
             .name("aad-window-geometry".into())
             .spawn(move || {
                 let _permit = permit;
-                let _ = send.send(window_geometry::clients(process, until));
+                let _ = send.send(window_geometry::read_clients(
+                    process,
+                    until,
+                    include_unviewable,
+                ));
             })
             .map_err(|_| {
                 driver_error("DRIVER.UNAVAILABLE", "cannot start window geometry reader")
@@ -265,17 +256,53 @@ impl LinuxBackend {
             .application
             .get("process_id")
             .and_then(Value::as_u64)
+            .and_then(|process| u32::try_from(process).ok())
+            .unwrap_or(0);
+        let mut maps = Vec::new();
+        for window in snapshot.nodes.iter().filter(|n| n.parent_index == Some(0)) {
+            let Some(calibrated) = snapshot.qt_x11_windows.iter().flatten().find(|calibrated| {
+                calibrated.native == window.native
+                    && Some(calibrated.raw) == window.bounds
+                    && window.name.as_deref() == Some(calibrated.name.as_str())
+            }) else {
+                continue;
+            };
+            if let Some(client) = calibrated.client.filter(|client| client.viewable) {
+                maps.push(CoordinateMap {
+                    window: calibrated.native.clone(),
+                    raw: calibrated.raw,
+                    physical: client.bounds,
+                    client: client.xid,
+                    process,
+                    members: BTreeSet::new(),
+                });
+            }
+        }
+        self.apply_coordinate_maps(snapshot, maps)
+    }
+
+    pub(super) fn read_qt_x11_windows(
+        &self,
+        application: &mut Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<Option<Vec<QtX11Window>>, AutomationError> {
+        if application.get("toolkit_name").and_then(Value::as_str) != Some("Qt")
+            || crate::wayland_portal::is_wayland_session()
+        {
+            return Ok(None);
+        }
+        let process = application
+            .get("process_id")
+            .and_then(Value::as_u64)
             .and_then(|p| u32::try_from(p).ok())
             .unwrap_or(0);
-        let mut clients = match self.read_client_geometry(process, deadline) {
+        let mut clients = match self.read_client_geometry(process, true, deadline) {
             Ok(clients) => clients,
             Err(error) if matches!(error.code.as_str(), "DRIVER.TIMEOUT" | "DRIVER.CANCELLED") => {
                 return Err(error);
             }
             Err(error) => {
-                snapshot
-                    .application
-                    .insert("coordinate_diagnostic".into(), json!(error.code));
+                application.insert("coordinate_diagnostic".into(), json!(error.code));
                 Vec::new()
             }
         };
@@ -311,62 +338,51 @@ impl LinuxBackend {
             self.check_cancelled(false)?;
             remaining(deadline, false)?;
         }
-        let windows = match self.application_coordinate_windows(&snapshot.application, deadline) {
+        let windows = match self.application_coordinate_windows(application, deadline) {
             Ok(windows) => windows,
             Err(error) if matches!(error.code.as_str(), "DRIVER.TIMEOUT" | "DRIVER.CANCELLED") => {
                 return Err(error);
             }
             Err(error) => {
                 remaining(deadline, false)?;
-                snapshot
-                    .application
-                    .insert("coordinate_diagnostic".into(), json!(error.code));
+                application.insert("coordinate_diagnostic".into(), json!(error.code));
                 Vec::new()
             }
         };
-        let mut maps = Vec::new();
-        for window in snapshot.nodes.iter().filter(|n| n.parent_index == Some(0)) {
-            let Some(raw) = window.bounds.filter(|b| b.width > 0 && b.height > 0) else {
-                continue;
-            };
-            let matches = clients
-                .iter()
-                .filter(|c| {
-                    window
-                        .name
-                        .as_deref()
-                        .is_some_and(|name| c.title_matches(name))
-                        && calibration(raw, bounds(c))
-                })
-                .collect::<Vec<_>>();
-            let [client] = matches.as_slice() else {
-                // Keep semantic observation; synthetic actions must not guess
-                // between clients or use toolkit coordinates as physical ones.
-                continue;
-            };
-            let candidates = windows
-                .iter()
-                .filter(|(_, name, bounds)| {
-                    client.title_matches(name) && calibration(*bounds, self::bounds(client))
-                })
-                .collect::<Vec<_>>();
-            if candidates.len() != 1 || candidates[0].0 != window.native || candidates[0].2 != raw {
-                continue;
-            }
-            maps.push(CoordinateMap {
-                window: window.native.clone(),
-                raw,
-                physical: bounds(client),
-                client: client.id,
-                process,
-                members: BTreeSet::new(),
-            });
-        }
-        let mut counts = BTreeMap::new();
-        for map in &maps {
-            *counts.entry(map.client).or_insert(0usize) += 1;
-        }
-        maps.retain(|map| counts[&map.client] == 1);
+        let calibrated = windows
+            .iter()
+            .map(|(native, name, raw)| {
+                let mut candidates = clients.iter().filter(|client| {
+                    client.title_matches(name) && calibration(*raw, bounds(client))
+                });
+                let client = candidates.next().filter(|client| {
+                    candidates.next().is_none()
+                        && !windows.iter().any(|(other, title, raw)| {
+                            other != native
+                                && client.title_matches(title)
+                                && calibration(*raw, bounds(client))
+                        })
+                });
+                QtX11Window {
+                    native: native.clone(),
+                    name: name.clone(),
+                    raw: *raw,
+                    client: client.map(|client| QtX11Client {
+                        xid: client.id,
+                        bounds: bounds(client),
+                        viewable: client.viewable,
+                    }),
+                }
+            })
+            .collect();
+        Ok(Some(calibrated))
+    }
+
+    fn apply_coordinate_maps(
+        &self,
+        snapshot: &mut BackendSnapshot,
+        mut maps: Vec<CoordinateMap>,
+    ) -> Result<(), AutomationError> {
         for index in 0..snapshot.nodes.len() {
             let mut ancestor = index;
             let mut visited = BTreeSet::new();
@@ -491,7 +507,7 @@ impl LinuxBackend {
                 "coordinate window identity or geometry changed",
             ));
         }
-        let clients = self.read_client_geometry(map.process, deadline)?;
+        let clients = self.read_client_geometry(map.process, false, deadline)?;
         if !clients
             .iter()
             .any(|c| c.id == map.client && bounds(c) == map.physical)

@@ -7,6 +7,7 @@ use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, MapState, WindowClas
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientGeometry {
     pub id: u32,
+    pub viewable: bool,
     pub title: String,
     /// Exact ICCCM WM_NAME, which KDE can keep without the application suffix.
     pub legacy_title: Option<String>,
@@ -48,6 +49,16 @@ fn legacy_title(
 /// X11 round trips may block; callers requiring cancellation must run this read
 /// in a bounded worker and discard late results.
 pub fn clients(process_id: u32, deadline: Instant) -> Result<Vec<ClientGeometry>, String> {
+    read_clients(process_id, deadline, false)
+}
+
+/// Qt capture includes unviewable managed clients, such as minimized windows,
+/// in its complete geometry inventory.
+pub(crate) fn read_clients(
+    process_id: u32,
+    deadline: Instant,
+    include_unviewable: bool,
+) -> Result<Vec<ClientGeometry>, String> {
     let check = || {
         if Instant::now() < deadline {
             Ok(())
@@ -108,7 +119,8 @@ pub fn clients(process_id: u32, deadline: Instant) -> Result<Vec<ClientGeometry>
             .map_err(|e| e.to_string())?
             .reply()
             .map_err(|e| e.to_string())?;
-        if attrs.map_state != MapState::VIEWABLE
+        let viewable = attrs.map_state == MapState::VIEWABLE;
+        if (!viewable && !include_unviewable)
             || attrs.class != WindowClass::INPUT_OUTPUT
             || attrs.override_redirect
         {
@@ -156,6 +168,7 @@ pub fn clients(process_id: u32, deadline: Instant) -> Result<Vec<ClientGeometry>
         );
         result.push(ClientGeometry {
             id,
+            viewable,
             title,
             legacy_title,
             compound_title,
@@ -201,6 +214,7 @@ mod tests {
         }
         let client = ClientGeometry {
             id: 1,
+            viewable: true,
             title: "folder — Dolphin".into(),
             legacy_title: Some("folder".into()),
             compound_title: None,

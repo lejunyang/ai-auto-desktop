@@ -107,7 +107,7 @@ fn add_window_actions(node: &mut BackendNode, info: &Value, binding: &X11WindowB
 }
 
 impl LinuxBackend {
-    fn window_bounds(
+    pub(super) fn window_bounds(
         &self,
         native: &NativeRef,
         deadline: Instant,
@@ -137,13 +137,7 @@ impl LinuxBackend {
                     .iter()
                     .find(|node| node.parent_index == Some(0) && node.native == native)
                     .and_then(|node| node.bounds)
-                    .map_or_else(
-                        || {
-                            let raw = self.window_bounds(&native, deadline)?;
-                            self.physical_window_bounds(&native, raw, deadline)
-                        },
-                        Ok,
-                    )?;
+                    .map_or_else(|| self.window_bounds(&native, deadline), Ok)?;
                 Ok((native, bounds))
             })
             .collect()
@@ -231,8 +225,14 @@ impl LinuxBackend {
         if !support.has(GEOMETRY_FEATURE) || !support.has("window-info") {
             return BTreeMap::new();
         }
-        let Ok(windows) = self.direct_window_bounds(&app.native, &snapshot.nodes, deadline) else {
-            return BTreeMap::new();
+        let native_windows = if snapshot.qt_x11_windows.is_none() {
+            let Ok(windows) = self.direct_window_bounds(&app.native, &snapshot.nodes, deadline)
+            else {
+                return BTreeMap::new();
+            };
+            windows
+        } else {
+            Vec::new()
         };
         snapshot
             .nodes
@@ -241,9 +241,6 @@ impl LinuxBackend {
             .filter(|(_, node)| node.parent_index == Some(0))
             .filter_map(|(index, node)| {
                 let bounds = node.bounds.filter(|b| b.width > 0 && b.height > 0)?;
-                if !windows.iter().any(|(native, _)| *native == node.native) {
-                    return None;
-                }
                 let info = self.window_info(process_id, bounds, &support.path, deadline, true)?;
                 let client = reply_client(&info["window"])?;
                 if info["window_binding"] != "geometry" {
@@ -251,10 +248,12 @@ impl LinuxBackend {
                 }
                 let proof = proof_payload(&info["geometry_proof"], client, process_id, bounds)?;
                 let binding = X11WindowBinding { client, proof };
-                if windows
-                    .iter()
-                    .any(|(native, bounds)| *native != node.native && binding.matches(*bounds))
-                {
+                let unique = if let Some(windows) = &snapshot.qt_x11_windows {
+                    qt_binding_matches(windows, &node.native, bounds, &binding)
+                } else {
+                    unique_native_bounds(&native_windows, &node.native, &binding)
+                };
+                if !unique {
                     return None;
                 }
                 let unproven =
@@ -270,8 +269,8 @@ impl LinuxBackend {
             .collect()
     }
 
-    // Qt observation-time visibility recovery runs before the normalized
-    // snapshot is assembled, so prove its native application ancestry here.
+    // Visibility recovery uses the raw ancestry and bounds to select the
+    // matching entry from the current calibration inventory.
     fn native_window(
         &self,
         target: &NativeRef,
@@ -290,9 +289,8 @@ impl LinuxBackend {
             let role = zbus::block_on(self.accessible(&parent)?.get_role())
                 .map_err(|error| native_failure("window role", &parent, error))?;
             if role == atspi::Role::Application && parent.bus_name == target.bus_name {
-                let raw = self.window_bounds(&current, deadline)?;
-                if raw.width > 0 && raw.height > 0 {
-                    let bounds = self.physical_window_bounds(&current, raw, deadline)?;
+                let bounds = self.window_bounds(&current, deadline)?;
+                if bounds.width > 0 && bounds.height > 0 {
                     return Ok((
                         parent,
                         WindowAnchor {
@@ -364,6 +362,76 @@ impl LinuxBackend {
         deadline: Instant,
         path: &Path,
     ) -> Result<(), AutomationError> {
+        self.with_accessible_focus(target, process_id, deadline, || {
+            if let Some(window) = window {
+                self.verify_window_with_helper(target, window, process_id, deadline, path, true)?;
+                return Ok(());
+            }
+            let (app, mut window) = self.native_window(target, deadline)?;
+            let mut application = self.application_info(&app, deadline)?;
+            if let Some(windows) = self.read_qt_x11_windows(&mut application, deadline)? {
+                return self.verify_calibrated_focus(
+                    &mut window,
+                    process_id,
+                    &windows,
+                    deadline,
+                    path,
+                );
+            }
+            let (binding, focused) = self.window_proof(&window, process_id, path, deadline)?;
+            let windows = self.direct_window_bounds(&app, &[], deadline)?;
+            if focused && unique_native_bounds(&windows, &window.native, &binding) {
+                Ok(())
+            } else {
+                Err(unproven_focus_window())
+            }
+        })
+    }
+
+    pub(super) fn verify_qt_focus(
+        &self,
+        target: &NativeRef,
+        process_id: u32,
+        windows: &[QtX11Window],
+        deadline: Instant,
+        path: &Path,
+    ) -> Result<(), AutomationError> {
+        self.with_accessible_focus(target, process_id, deadline, || {
+            let (_, mut window) = self.native_window(target, deadline)?;
+            self.verify_calibrated_focus(&mut window, process_id, windows, deadline, path)
+        })
+    }
+
+    fn verify_calibrated_focus(
+        &self,
+        window: &mut WindowAnchor,
+        process_id: u32,
+        windows: &[QtX11Window],
+        deadline: Instant,
+        path: &Path,
+    ) -> Result<(), AutomationError> {
+        let client = windows
+            .iter()
+            .find(|entry| entry.native == window.native && entry.raw == window.bounds)
+            .and_then(|entry| entry.client)
+            .filter(|client| client.viewable)
+            .ok_or_else(unproven_focus_window)?;
+        window.bounds = client.bounds;
+        let (binding, focused) = self.window_proof(window, process_id, path, deadline)?;
+        if focused && qt_binding_matches(windows, &window.native, client.bounds, &binding) {
+            Ok(())
+        } else {
+            Err(unproven_focus_window())
+        }
+    }
+
+    fn with_accessible_focus(
+        &self,
+        target: &NativeRef,
+        process_id: u32,
+        deadline: Instant,
+        verify: impl FnOnce() -> Result<(), AutomationError>,
+    ) -> Result<(), AutomationError> {
         let focused = || -> Result<bool, AutomationError> {
             remaining(deadline, false)?;
             let states = zbus::block_on(self.accessible(target)?.get_state())
@@ -383,25 +451,7 @@ impl LinuxBackend {
                 "accessible focus is not proven",
             ));
         }
-        if let Some(window) = window {
-            self.verify_window_with_helper(target, window, process_id, deadline, path, true)?;
-        } else {
-            let (app, window) = self.native_window(target, deadline)?;
-            let (binding, native_focused) =
-                self.window_proof(&window, process_id, path, deadline)?;
-            let windows = self.direct_window_bounds(&app, &[], deadline)?;
-            if !native_focused
-                || !windows.iter().any(|(native, _)| *native == window.native)
-                || windows
-                    .iter()
-                    .any(|(native, bounds)| *native != window.native && binding.matches(*bounds))
-            {
-                return Err(driver_error(
-                    "DRIVER.ACTION_UNSUPPORTED",
-                    "native focus window is unproven",
-                ));
-            }
-        }
+        verify()?;
         if !focused()? || self.process_id(&target.bus_name) != Some(process_id) {
             return Err(driver_error(
                 "DRIVER.ACTION_UNSUPPORTED",
@@ -410,4 +460,49 @@ impl LinuxBackend {
         }
         Ok(())
     }
+}
+
+fn unproven_focus_window() -> AutomationError {
+    driver_error(
+        "DRIVER.ACTION_UNSUPPORTED",
+        "native focus window is unproven",
+    )
+}
+
+fn unique_native_bounds(
+    windows: &[(NativeRef, Bounds)],
+    target: &NativeRef,
+    binding: &X11WindowBinding,
+) -> bool {
+    windows.iter().any(|(native, _)| native == target)
+        && windows
+            .iter()
+            .all(|(native, bounds)| native == target || !binding.matches(*bounds))
+}
+
+fn qt_binding_matches(
+    windows: &[QtX11Window],
+    target: &NativeRef,
+    observed: Bounds,
+    binding: &X11WindowBinding,
+) -> bool {
+    windows.iter().any(|entry| entry.native == *target)
+        && windows.iter().all(|entry| {
+            let Some(client) = entry.client else {
+                return false;
+            };
+            if entry.native == *target {
+                // A minimized window keeps its raw observation for window
+                // actions, which still require a strict native proof.
+                client.xid == binding.client
+                    && observed
+                        == if client.viewable {
+                            client.bounds
+                        } else {
+                            entry.raw
+                        }
+            } else {
+                !binding.matches(client.bounds)
+            }
+        })
 }
