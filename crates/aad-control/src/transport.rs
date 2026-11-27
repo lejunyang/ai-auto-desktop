@@ -287,10 +287,9 @@ impl HandshakeError {
         let possible_exit = matches!(self, Self::Eof)
             || matches!(&self, Self::Write(e) if e.kind() == io::ErrorKind::BrokenPipe);
         if possible_exit {
-            if let Some(status) = child
-                .as_mut()
-                .and_then(|child| observe_exit(child, Instant::now() + CHILD_EXIT_GRACE))
-            {
+            if let Some(status) = child.as_mut().and_then(|child| {
+                observe_exit(Instant::now() + CHILD_EXIT_GRACE, || child.try_wait())
+            }) {
                 *child = None;
                 let message = "child exited before the remote handshake";
                 return if let Some(code) = status.code() {
@@ -336,16 +335,23 @@ fn connect_failure(reason: &str, message: impl Into<String>) -> crate::Automatio
     error("CONTROL.CONNECT_FAILED", message).with_detail("reason", reason.into())
 }
 
-fn observe_exit(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().ok()? {
-            return Some(status);
+fn observe_exit(
+    deadline: Instant,
+    mut try_wait: impl FnMut() -> io::Result<Option<ExitStatus>>,
+) -> Option<ExitStatus> {
+    loop {
+        match try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
         }
-        std::thread::sleep(
-            Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
-        );
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5).min(remaining));
     }
-    None
 }
 
 pub struct RemoteClient {
@@ -692,5 +698,35 @@ impl Endpoint for RemoteClient {
 impl Drop for RemoteClient {
     fn drop(&mut self) {
         self.disconnect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_observation_probes_even_when_the_deadline_has_passed() {
+        let mut checked = false;
+        let status = observe_exit(Instant::now(), || {
+            checked = true;
+            Ok(None)
+        });
+        assert!(checked);
+        assert!(status.is_none());
+    }
+
+    #[test]
+    fn exit_observation_retries_an_interrupted_wait() {
+        let mut outcomes = [
+            Err(io::ErrorKind::Interrupted.into()),
+            Err(io::Error::other("fixture wait error")),
+        ]
+        .into_iter();
+        let status = observe_exit(Instant::now() + Duration::from_secs(10), || {
+            outcomes.next().unwrap()
+        });
+        assert!(outcomes.next().is_none());
+        assert!(status.is_none());
     }
 }
