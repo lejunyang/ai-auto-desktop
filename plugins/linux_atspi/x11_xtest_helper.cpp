@@ -36,6 +36,7 @@ namespace {
 constexpr std::size_t kMaxInputBytes = 4096;
 constexpr std::size_t kMaxCodepoints = 1024;
 constexpr useconds_t kTextStrokeGapUs = 2000;
+constexpr auto kTextEventWait = std::chrono::milliseconds(250);
 constexpr int kExitInvalid = 64;
 constexpr int kExitUnavailable = 69;
 constexpr int kExitUnknownEffect = 70;
@@ -269,6 +270,96 @@ std::string_view KeyboardFocusProblem(Display *display, unsigned long pid, Atom 
     if (!FocusMatchesWindow(display, pid, pid_atom, binding)) return "focus_owner_changed";
     if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
     return {};
+}
+
+// An XSync round-trip only proves server processing. Put an EWMH ping in the
+// same client event queue after key-up and wait for the client to echo it.
+struct KeyboardEventBarrier {
+    Display *display;
+    Window root, target, clock;
+    Atom protocols, ping, stamp;
+
+    static std::optional<KeyboardEventBarrier> Open(Display *display, Window target) {
+        const Atom ping = XInternAtom(display, "_NET_WM_PING", True);
+        Atom *supported = nullptr;
+        int count = 0;
+        if (ping == None || !XGetWMProtocols(display, target, &supported, &count)) return std::nullopt;
+        const bool enabled = count > 0 && std::find(supported, supported + count, ping) != supported + count;
+        XFree(supported);
+        if (!enabled) return std::nullopt;
+        const Window root = DefaultRootWindow(display);
+        const Window clock = XCreateSimpleWindow(display, root, 0, 0, 1, 1, 0, 0, 0);
+        XSelectInput(display, clock, PropertyChangeMask);
+        // Qt/XCB echoes with StructureNotifyMask, GTK uses SubstructureNotifyMask.
+        XSelectInput(display, root, StructureNotifyMask | SubstructureNotifyMask);
+        return KeyboardEventBarrier{display, root, target, clock,
+                                    XInternAtom(display, "WM_PROTOCOLS", False), ping,
+                                    XInternAtom(display, "AAD_TIMESTAMP", False)};
+    }
+
+    std::string_view Wait(std::uint64_t deadline_ns) const {
+        const auto until = std::chrono::steady_clock::now() + kTextEventWait;
+        const auto wait_for = [&](auto matches) {
+            while (!DeadlineExpired(deadline_ns) && std::chrono::steady_clock::now() < until) {
+                if (XPending(display)) {
+                    XEvent event{};
+                    XNextEvent(display, &event);
+                    if (matches(event)) return true;
+                } else {
+                    pollfd input{ConnectionNumber(display), POLLIN, 0};
+                    if (poll(&input, 1, 1) < 0 && errno != EINTR) break;
+                }
+            }
+            return false;
+        };
+
+        // Obtain a real server timestamp after the stroke. This identifies
+        // the reply together with the exact target window from the ping.
+        XChangeProperty(display, clock, stamp, XA_STRING, 8, PropModeAppend, nullptr, 0);
+        XFlush(display);
+        Time time = CurrentTime;
+        if (wait_for([&](const XEvent &event) {
+            if (event.type != PropertyNotify || event.xproperty.window != clock ||
+                event.xproperty.atom != stamp || event.xproperty.send_event) return false;
+            time = event.xproperty.time;
+            return time != CurrentTime;
+        })) {
+            XEvent ping_event{};
+            ping_event.xclient.type = ClientMessage;
+            ping_event.xclient.window = target;
+            ping_event.xclient.message_type = protocols;
+            ping_event.xclient.format = 32;
+            ping_event.xclient.data.l[0] = static_cast<long>(ping);
+            ping_event.xclient.data.l[1] = static_cast<long>(time);
+            ping_event.xclient.data.l[2] = static_cast<long>(target);
+            const unsigned long request = NextRequest(display);
+            if (XSendEvent(display, target, False, NoEventMask, &ping_event)) {
+                XFlush(display);
+                if (wait_for([&](const XEvent &event) {
+                    const auto &reply = event.xclient;
+                    return event.type == ClientMessage && reply.send_event && reply.serial >= request &&
+                           reply.window == root && reply.message_type == protocols && reply.format == 32 &&
+                           std::equal(reply.data.l, reply.data.l + 5, ping_event.xclient.data.l);
+                })) return {};
+            }
+        }
+        return DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "text_stroke_unconfirmed";
+    }
+};
+
+std::string_view FinishTextStroke(const std::optional<KeyboardEventBarrier> &barrier, bool more,
+                                  Display *display, unsigned long pid, Atom pid_atom,
+                                  const std::optional<WindowBinding> &binding, std::uint64_t deadline_ns) {
+    if (!barrier) {
+        if (more) usleep(kTextStrokeGapUs);
+        return {};
+    }
+    const auto problem = barrier->Wait(deadline_ns);
+    if (!problem.empty()) {
+        if (const auto focus = KeyboardFocusProblem(display, pid, pid_atom, binding, deadline_ns);
+            !focus.empty()) return focus;
+    }
+    return problem;
 }
 
 bool KeyIsDown(const char (&keys)[32], KeyCode code) {
@@ -595,7 +686,7 @@ std::string_view ValidateKeyboardAnchor(std::string_view token, std::size_t inde
 int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoints,
                     std::uint64_t expected_pid, std::uint64_t deadline_ns, Atom pid_atom,
                     const std::optional<WindowBinding> &binding, InputProgress &progress,
-                    std::string_view anchor_token) {
+                    std::string_view anchor_token, const std::optional<KeyboardEventBarrier> &barrier) {
     bool dispatched = false;
     unsigned long events = 0;
     auto fail = [&](std::string_view code, int exit_code) {
@@ -692,7 +783,10 @@ int RunPhysicalText(Display *display, const std::vector<std::uint32_t> &codepoin
         }
         events += stroke_shift ? 4 : 2;
         ++progress.delivered;
-        if (index + 1 < plan.size()) usleep(kTextStrokeGapUs);
+        if (const auto wait = FinishTextStroke(barrier, index + 1 < plan.size(), display, expected_pid,
+                                              pid_atom, binding, deadline_ns); !wait.empty()) {
+            return fail(wait, kExitTargetMismatch);
+        }
     }
     progress.Emit(display);
     XCloseDisplay(display);
@@ -2958,7 +3052,7 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
         // This protocol handshake does not open a display or touch input state.
-        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys","anchored-drag-between","anchored-type-text","atomic-key-dispatch"]})"
+        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys","anchored-drag-between","anchored-type-text","atomic-key-dispatch","text-event-barrier"]})"
                   << std::endl;
         return 0;
     }
@@ -3002,6 +3096,7 @@ int main(int argc, char **argv) {
     std::optional<int> click_y;
     std::optional<GestureRequest> gesture;
     bool physical_keys = false;
+    bool require_event_barrier = false;
     if (command == "pointer-gesture" || command == "drag" || command == "key-chord") {
         gesture = ParseGesture(command, argc, argv, &expected_pid, &deadline_ns);
         if (!gesture.has_value()) {
@@ -3009,15 +3104,17 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
     } else if (command == "type-text") {
-        const auto pairs = ParsePairs(argc, argv, {"expected-pid", "deadline-monotonic-ns", "mode"});
+        const auto pairs = ParsePairs(argc, argv, {"expected-pid", "deadline-monotonic-ns", "mode", "text-event-barrier"});
         const auto mode = pairs ? Pair(*pairs, "mode") : std::nullopt;
-        if (!pairs || (mode && *mode != "keys")) {
+        const auto barrier = pairs ? Pair(*pairs, "text-event-barrier") : std::nullopt;
+        if (!pairs || (mode && *mode != "keys") || (barrier && (*barrier != "required" || anchor_token.empty()))) {
             EmitError("invalid_arguments", "arguments", false);
             return kExitInvalid;
         }
         expected_pid = ParseUnsigned(Pair(*pairs, "expected-pid").value_or(""));
         deadline_ns = ParseUnsigned(Pair(*pairs, "deadline-monotonic-ns").value_or(""));
         physical_keys = mode.has_value();
+        require_event_barrier = barrier.has_value();
     } else if (command == "pointer-click") {
         if (argc != 10 || std::string_view(argv[2]) != "--expected-pid" ||
             std::string_view(argv[4]) != "--x" || std::string_view(argv[6]) != "--y" ||
@@ -3173,9 +3270,16 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    std::optional<KeyboardEventBarrier> event_barrier;
+    if (require_event_barrier) {
+        event_barrier = KeyboardEventBarrier::Open(display, binding->id);
+        if (!event_barrier) {
+            return refuse("text_event_barrier_unavailable", "text_preflight", kExitUnavailable, display);
+        }
+    }
     if (physical_keys) {
         return RunPhysicalText(display, codepoints.value(), expected_pid.value(),
-                               deadline_ns.value(), pid_atom, binding, *progress, anchor_token);
+                               deadline_ns.value(), pid_atom, binding, *progress, anchor_token, event_barrier);
     }
 
     int minimum = 0;
@@ -3295,8 +3399,10 @@ int main(int argc, char **argv) {
         }
         event_count += stroke_shift ? 4 : 2;
         ++progress->delivered;
-        // Let the target process the completed stroke between server grabs.
-        if (index + 1 < plan->strokes.size()) usleep(kTextStrokeGapUs);
+        if (const auto wait = FinishTextStroke(event_barrier, index + 1 < plan->strokes.size(), display,
+                                              *expected_pid, pid_atom, binding, *deadline_ns); !wait.empty()) {
+            return finish_failure(wait, "keyboard_dispatch", kExitTargetMismatch);
+        }
     }
     restore_mapping();
     XSync(display, False);

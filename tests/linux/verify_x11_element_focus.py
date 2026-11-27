@@ -72,6 +72,7 @@ def fixture(role, state_file):
     window.add(box)
     entries = {}
     switched = set()
+    delayed = set()
     current_case = None
     trigger = state_file.with_suffix(".switch")
 
@@ -83,6 +84,24 @@ def fixture(role, state_file):
     def keyboard(_widget, ev, tag, phase):
         current = event("key_" + phase, target=tag, key=Gdk.keyval_name(ev.keyval),
                         keycode=ev.hardware_keycode, state=int(ev.state), x_time_ms=ev.time)
+        if owner and tag == "Target entry" and phase == "down" and current.get("queue_delay_ms"):
+            if current["case"] not in delayed:
+                delayed.add(current["case"])
+                # Keep X events queued while the main loop can still answer AT-SPI.
+                source = GLib.main_current_source()
+                assert source.get_name().startswith("GDK X11 Event source")
+                priority = source.get_priority()
+                source.set_priority(GLib.PRIORITY_LOW)
+                resume_at = time.monotonic() + current["queue_delay_ms"] / 1000
+
+                def resume_x_events():
+                    if time.monotonic() < resume_at:
+                        return True
+                    source.set_priority(priority)
+                    event("x_queue_resumed")
+                    return False
+
+                GLib.idle_add(resume_x_events)
         if owner and tag == "Target entry" and phase == "up" and current.get("switch"):
             if current["case"] not in switched:
                 switched.add(current["case"])
@@ -469,6 +488,36 @@ def trial(aad, helper, out, baseline, scenario):
         if scenario == "paste-unreadable":
             paste_unreadable()
             return
+        if scenario == "stroke-barrier":
+            for mode in ("unicode", "keys"):
+                for index in range(9):
+                    case = f"loaded_{mode}_{index + 1}"
+                    reply, values, presses = type_text(case, "abcdefghi", mode, switch="sibling",
+                                                      queue_delay_ms=35)
+                    focus = until(lambda: next((r for r in rows("owner", case)
+                                                if r["kind"] == "focus_trigger"), None), case)
+                    assert focus["sibling_has_focus"] and focus["xid"] == fixtures["owner"]["xid"], focus
+                    assert any(r["kind"] == "x_queue_resumed" for r in rows("owner", case)), case
+                    if not baseline:
+                        details = reply["error"]["details"]
+                        reason = ("cause", "focused_element_changed")
+                        if details.get("helper_code") == "text_stroke_unconfirmed":
+                            reason = ("helper_code", "text_stroke_unconfirmed")
+                        denied(reply, "DRIVER.UNKNOWN_EFFECT", reason, 1, 9, "unknown")
+                        assert values == {"Target entry": "a", "Sibling entry": ""}, values
+                        assert [(r["target"], r["key"]) for r in presses] == [("Target entry", "a")], presses
+            if not baseline:
+                reply, values, presses = type_text("unconfirmed_stroke", "a汉b", queue_delay_ms=450)
+                denied(reply, "DRIVER.UNKNOWN_EFFECT", ("helper_code", "text_stroke_unconfirmed"), 1, 3, "unknown")
+                assert values == {"Target entry": "a", "Sibling entry": ""}, values
+                assert [(r["target"], r["key"]) for r in presses] == [("Target entry", "a")], presses
+                until(lambda: any(r["kind"] == "x_queue_resumed" for r in rows("owner", "unconfirmed_stroke")),
+                      "GTK to resume its X event queue")
+            return
+        if scenario == "typing-speed":
+            for index in range(3):
+                typed(f"timing_{index + 1}", ("abcdefghi" * 114)[:1024])
+            return
 
         old = entries()["Target entry"]["target"]
         assert old != entries()["Target entry"]["target"]
@@ -530,10 +579,11 @@ if __name__ == "__main__":
         parser.add_argument("helper", type=Path)
         parser.add_argument("output", type=Path)
         parser.add_argument("--baseline", action="store_true")
-        parser.add_argument("--scenario", choices=["full", "window-preflight", "paste-recovery", "paste-unreadable"], default="full")
+        parser.add_argument("--scenario", choices=["full", "window-preflight", "paste-recovery", "paste-unreadable",
+                                                  "stroke-barrier", "typing-speed"], default="full")
         args = parser.parse_args()
-        if args.baseline and args.scenario != "full":
-            parser.error("--baseline requires the full scenario")
+        if args.baseline and args.scenario not in {"full", "stroke-barrier", "typing-speed"}:
+            parser.error("--baseline requires the full, stroke-barrier or typing-speed scenario")
         args.output.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, AAD_CALLER_DISPLAY=os.environ.get("DISPLAY", ""),
                    AAD_CALLER_BUS=os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""),

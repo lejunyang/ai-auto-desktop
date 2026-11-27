@@ -42,6 +42,7 @@ const DBUS_NAME: &str = "org.freedesktop.DBus";
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
 const ANCHORED_KEYBOARD: &str = "anchored-type-text";
+const TEXT_EVENT_BARRIER: &str = "text-event-barrier";
 const XTEST_OUTPUT_LIMIT: usize = 64 * 1024;
 const CAPTURE_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 const CAPTURE_METADATA_LIMIT: usize = 64 * 1024;
@@ -260,6 +261,8 @@ impl LinuxBackend {
             "type-text".to_string(),
             "--expected-pid".into(),
             process_id.to_string(),
+            "--text-event-barrier".into(),
+            "required".into(),
         ];
         if keys {
             args.extend(["--mode".into(), "keys".into()]);
@@ -2188,19 +2191,24 @@ struct InputSupport {
     features: BTreeSet<String>,
 }
 
+fn anchored_keyboard_features(feature: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(feature)
+        .chain([ANCHORED_KEYBOARD])
+        .chain(KEYBOARD_ROUTE_FEATURES)
+        .chain(matches!(feature, "type-text" | "type-text-keys").then_some(TEXT_EVENT_BARRIER))
+}
+
 impl InputSupport {
     fn has(&self, feature: &str) -> bool {
         self.features.contains(feature)
     }
 
     fn has_anchored_keyboard(&self, feature: &str) -> bool {
-        self.has(feature) && self.has(ANCHORED_KEYBOARD) && self.has_keyboard_route()
+        anchored_keyboard_features(feature).all(|feature| self.has(feature))
     }
 
     fn require_anchored_keyboard(&self, feature: &str) -> Result<(), AutomationError> {
-        self.require(feature)?;
-        self.require(ANCHORED_KEYBOARD)?;
-        self.require_keyboard_route()
+        anchored_keyboard_features(feature).try_for_each(|feature| self.require(feature))
     }
 
     fn require(&self, feature: &str) -> Result<(), AutomationError> {
@@ -2764,15 +2772,18 @@ fn parse_input_helper(
         }
     }
     if dispatched || code == Some(70) {
+        let message = match helper_code.as_deref() {
+            Some("text_stroke_unconfirmed") => {
+                "the X11 application did not acknowledge the last key release; typing stopped"
+            }
+            _ => "XTest helper failed after dispatch",
+        };
         return Err(with_helper_receipt(
-            driver_error(
-                "DRIVER.UNKNOWN_EFFECT",
-                "XTest helper failed after dispatch",
-            )
-            .with_effect("unknown")
-            .with_detail("phase", json!(phase))
-            .with_detail("helper_code", json!(helper_code))
-            .with_detail("dispatch_started", json!(dispatched)),
+            driver_error("DRIVER.UNKNOWN_EFFECT", message)
+                .with_effect("unknown")
+                .with_detail("phase", json!(phase))
+                .with_detail("helper_code", json!(helper_code))
+                .with_detail("dispatch_started", json!(dispatched)),
             &output.stdout,
         ));
     }
@@ -2851,6 +2862,10 @@ fn map_helper_code(code: &str) -> Option<AutomationError> {
         "focus_owner_mismatch" | "focus_owner_changed" => driver_error(
             "DRIVER.FOCUS_LOST",
             "keyboard focus is not in the target's process; no key was sent",
+        ),
+        "text_event_barrier_unavailable" => driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "the observed X11 window does not offer keyboard processing acknowledgements; no key was sent",
         ),
         "target_point_mismatch" => driver_error(
             "DRIVER.POINT_NOT_PROVEN",
@@ -3548,6 +3563,39 @@ mod capture_tests {
             let error = support.require_anchored_keyboard(feature).unwrap_err();
             assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
             assert_eq!(error.details["required_feature"], ANCHORED_KEYBOARD);
+        }
+    }
+
+    #[test]
+    fn only_typing_requires_a_helper_that_waits_for_key_processing() {
+        let mut support = InputSupport {
+            path: PathBuf::new(),
+            features: [
+                "type-text",
+                "type-text-keys",
+                "key-chord",
+                "paste",
+                ANCHORED_KEYBOARD,
+            ]
+            .into_iter()
+            .chain(KEYBOARD_ROUTE_FEATURES)
+            .map(str::to_string)
+            .collect(),
+        };
+        for feature in ["paste", "key-chord"] {
+            assert!(support.has_anchored_keyboard(feature));
+            assert!(support.require_anchored_keyboard(feature).is_ok());
+        }
+        for feature in ["type-text", "type-text-keys"] {
+            assert!(!support.has_anchored_keyboard(feature));
+            let error = support.require_anchored_keyboard(feature).unwrap_err();
+            assert_eq!(error.code, "DRIVER.HELPER_INCOMPATIBLE");
+            assert_eq!(error.details["required_feature"], TEXT_EVENT_BARRIER);
+        }
+        support.features.insert(TEXT_EVENT_BARRIER.into());
+        for feature in ["type-text", "type-text-keys"] {
+            assert!(support.has_anchored_keyboard(feature));
+            assert!(support.require_anchored_keyboard(feature).is_ok());
         }
     }
 

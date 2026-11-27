@@ -163,6 +163,29 @@ int main() {
             RequireWindow(truncated.code == kExitUnsupportedText && truncated.presses == 0 &&
                           truncated.releases == 0, "truncated text frame reached dispatch");
         }
+        const std::vector<std::string> barrier_args{
+            "type-text", "--anchor-token", nonce, "--text-event-barrier", "required"};
+        const std::string framed = "text 4\na汉" + ack + "ack " + nonce + " 1\n";
+        const auto no_protocol = invoke(barrier_args, false, {}, framed);
+        RequireWindow(no_protocol.code == kExitUnavailable && no_protocol.presses == 0 &&
+                      no_protocol.output.find("text_event_barrier_unavailable") != std::string::npos,
+                      "typing dispatched without a client event processing protocol");
+        Atom ping = XInternAtom(display, "_NET_WM_PING", False);
+        RequireWindow(XSetWMProtocols(display, target, &ping, 1), "could not advertise ping protocol");
+        const auto wrong_reply = invoke(barrier_args, false, [&](const XEvent &event) {
+            if (event.type != ClientMessage || event.xclient.window != target) return;
+            XEvent reply = event;
+            reply.xclient.window = root;
+            ++reply.xclient.data.l[1];
+            XSendEvent(display, root, False, SubstructureNotifyMask, &reply);
+            XFlush(display);
+        }, framed);
+        RequireWindow(wrong_reply.code == kExitUnknownEffect && wrong_reply.presses == 1 &&
+                      wrong_reply.releases == 1 && released() && before == keyboard_map() &&
+                      wrong_reply.output.find("text_stroke_unconfirmed") != std::string::npos &&
+                      wrong_reply.output.find("\"delivered\":1,\"total\":2") != std::string::npos &&
+                      wrong_reply.output.find("\"index\":1") == std::string::npos,
+                      "unmatched client reply authorized another stroke or left input state changed");
         unsigned wrong_window = 0;
         bool switched = false;
         const auto interrupted = invoke({"type-text"}, false, [&](const XEvent &event) {
@@ -206,7 +229,7 @@ int main() {
         const auto moved_proof = invoke({"focus-info"}, true);
         RequireWindow(moved_proof.code == 0 && moved_proof.output.find("\"focused\":false") != std::string::npos, "single-window geometry mismatch accepted");
         XCloseDisplay(display);
-        std::cout << "PASS: strict window binding, queued focus switch, failed burst cleanup, text ACK and mapping cleanup, and hold cleanup\n";
+        std::cout << "PASS: strict window binding, queued focus switch, burst cleanup, text ACK and event barrier, mapping and hold cleanup\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "FAIL: " << error.what() << '\n'; return 1;

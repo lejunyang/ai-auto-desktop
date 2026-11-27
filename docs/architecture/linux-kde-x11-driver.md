@@ -94,19 +94,24 @@ XTest 回执的 `input_progress` 包含 `unit`、`delivered`、`total`、`proven
 `key_chord` 在各自首次按下前请求一次。后端直接对观察到的 AT-SPI 总线名与对象路径调用
 `GetState`，确认节点仍为 Focused、Enabled、Sensitive，并复核总线连接的 PID。证明通过
 才确认这一笔。helper 在空闲时等待确认，随后通过 X11 server grab 再校验窗口并提交输入。
-这三条路径额外要求 helper 声明 `anchored-type-text`。带修饰键的指针动作仍按观察目标的
-实时命中与窗口级键盘焦点校验。
+这三条路径额外要求 helper 声明 `anchored-type-text`，`type_text` 还要求 `text-event-barrier`。
+带修饰键的指针动作仍按观察目标的实时命中与窗口级键盘焦点校验。
 
-同窗换焦会在下一次按下前中止。尚未派发时返回 `DRIVER.FOCUS_LOST / not_applied`。
+Unicode 与 keys 模式在每笔完整释放后、申请下一笔的控件证明之前，向绑定窗口发送
+`_NET_WM_PING` 并等候该次回执。GTK3 从同一 X 事件队列处理按键抬起和这个探测，因此抬起时同步发生的同窗
+切焦会先于下一笔 AT-SPI 证明。等待在 server grab 外执行，每笔最多 250 ms，也受动作期限
+和取消约束。窗口未声明该协议时在派发前拒绝。回执缺失时停止打字，回包保留
+`details.helper_code=text_stroke_unconfirmed` 和已派发笔数。[EWMH 窗口协议](https://specifications.freedesktop.org/wm/latest/ar01s06.html)
+
+复核发现同窗换焦时会在下一次按下前中止。尚未派发时返回 `DRIVER.FOCUS_LOST / not_applied`。
 已有派发时返回 `DRIVER.UNKNOWN_EFFECT / unknown`，`details.cause` 为
 `focused_element_changed`。跨窗换焦可看 `details.helper_code=focus_owner_changed`。
 `details.input_progress` 记录 helper 已派发的笔数 `delivered`、计划笔数 `total`、
 已验证窗口及释放状态。这个计数以本机派发为准。读取字段的实际内容需要重新观察。
 
-每笔保证按下前刚验证过观察节点的焦点。应用仍可在证明之后、处理该笔之前切换内部焦点，
-这时该笔可能进入相邻控件。X11 只能固定本机焦点窗口，无法固定应用内部的焦点或确认哪一个
-控件最终处理了该事件。长文本可将 `timeout_ms` 提高到 30000，或在支持时用 `fill` 直接
-替换值。超时后先结合 `input_progress` 和重新观察的值确认进度。
+每笔按下前都会重新验证观察节点的焦点。窗口回执覆盖原生事件队列，应用异步安排的控件
+焦点变化仍可能发生在证明之后。字段实际收到的内容可重新观察确认。长文本可将 `timeout_ms`
+提高到 30000，或在支持时用 `fill` 直接替换值。超时后先结合 `input_progress` 和重新观察的值确认进度。
 
 显式 keys 模式额外要求 `type-text-keys`，只从当前 XKB group 和锁定状态中寻找现有键位与
 Shift 组合，不创建 Unicode 映射、不使用剪贴板、不切换输入法；无法表示的字符在整个字符串
@@ -203,6 +208,13 @@ main@1733e58c 三次都将余下八字送进相邻框并回报成功。修正后
 布局键为 30.6 ms → 54.2–109.8 ms。1024 个 ASCII 字符的 MCP 调用为 2.81 s → 6.56–9.64 s，
 右侧是三次串行复测范围。并行构建的压力样本中，GTK 曾延迟约 134 ms 才处理首笔释放，
 相邻控件收到第二个字符。该样本回报 `delivered=2`，后续输入停止。
+
+用 `taskset` 将夹具和两个后台负载进程固定到同一 CPU。`--scenario stroke-barrier` 在首笔按下时
+延后 GTK 的 X 事件队列 35 ms，AT-SPI 仍可应答。在 `4c7c907` 上，Unicode 与 keys 各九次均有字符
+进入相邻框。加入回执后，两种模式各九次均只有原框收到首字，回包为 `focused_element_changed`、
+已派发 1/9、已释放。将队列延后 450 ms 时，回包为 `text_stroke_unconfirmed`，仍只派发首字。
+`--scenario typing-speed` 用默认 Unicode 模式输入 1024 个 ASCII 字符，各跑三次。MCP 耗时
+中位数从 6.48 s 降到 5.39 s，GTK 首末按下间隔中位数从 6.14 s 降到 5.07 s。
 
 用同一版本的 aad 和 helper 运行。环境需要 Xvfb、D-Bus、带 PyGObject 的 GTK3 和 xclip。
 若要核对旧行为，传入登记版本的二进制并加 `--baseline`。
