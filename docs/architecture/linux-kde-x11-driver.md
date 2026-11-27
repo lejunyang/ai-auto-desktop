@@ -317,7 +317,7 @@ CI 在私有 Xvfb、session bus 和 AT-SPI bus 中编译 Qt5 C++ fixture，并�
 tests/linux/run-rust-atspi-fixture.sh
 ```
 
-截图、OCR、窗口、粘贴、剪贴板、全局快捷键与启动另有私有 Xvfb + D-Bus + openbox（EWMH 窗口管理器）
+截图、OCR、窗口、粘贴、剪贴板、全局快捷键与启动另有私有 Xvfb、D-Bus 和 xfwm4
 中的效果验证，每一项都以可观察结果判定（截图尺寸等于窗口 bounds、Tesseract 读出标签文字、粘贴后
 字段值变化且 xclip 读回原剪贴板、全局 Ctrl+A/Backspace 清空焦点字段、最大化后应用自己报告的
 宽度变大、最小化/还原经窗口管理器往返、启动的白名单程序作为 resource 出现、close_window 后进程退出）：

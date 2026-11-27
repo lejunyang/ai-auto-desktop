@@ -10,8 +10,8 @@ if [ "${1:-}" = --inside-session ]; then
   export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1
   # Qt input actions are offered only once AT-SPI coordinates are calibrated
   # against a uniquely bound EWMH client window, which needs a window manager.
-  openbox >"${TMPDIR:-/tmp}/aad-rust-atspi-openbox.out" 2>&1 &
-  openbox_pid=$!
+  xfwm4 --compositor=off >"${TMPDIR:-/tmp}/aad-rust-atspi-xfwm4.out" 2>&1 &
+  wm_pid=$!
   for _ in $(seq 1 50); do
     xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' && break
     sleep 0.1
@@ -19,16 +19,16 @@ if [ "${1:-}" = --inside-session ]; then
   # Without a window manager the input actions are withheld and the run fails
   # much later at type-text with no reason given; say so here instead.
   if ! xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id'; then
-    printf '%s\n' 'AT-SPI fixture: no EWMH window manager came up (are openbox and x11-utils installed?)' >&2
-    cat "${TMPDIR:-/tmp}/aad-rust-atspi-openbox.out" >&2 || true
+    printf '%s\n' 'AT-SPI fixture: no EWMH window manager came up (are xfwm4 and x11-utils installed?)' >&2
+    cat "${TMPDIR:-/tmp}/aad-rust-atspi-xfwm4.out" >&2 || true
     exit 1
   fi
   fixture_log=${TMPDIR:-/tmp}/aad-rust-atspi-fixture.out
   "$AAD_ATSPI_FIXTURE_BINARY" >"$fixture_log" 2>&1 &
   fixture_pid=$!
   finish_fixture() {
-    kill "$fixture_pid" "$openbox_pid" 2>/dev/null || true
-    wait "$fixture_pid" "$openbox_pid" 2>/dev/null || true
+    kill "$fixture_pid" "$wm_pid" 2>/dev/null || true
+    wait "$fixture_pid" "$wm_pid" 2>/dev/null || true
   }
   trap finish_fixture EXIT HUP INT TERM
   # Output is mostly sent to /dev/null or jq; say which step stopped the run.
@@ -157,4 +157,4 @@ export XDG_SESSION_TYPE=x11
 export XDG_CURRENT_DESKTOP=KDE
 export GDK_BACKEND=x11
 export GTK_A11Y=always
-exec dbus-run-session -- "$0" --inside-session
+dbus-run-session -- "$0" --inside-session

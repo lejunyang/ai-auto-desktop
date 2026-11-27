@@ -35,7 +35,7 @@ XTest helper 另有 `window-info` / `window-action`（EWMH 窗口动作并读回
 [`linux-kde-x11-driver.md`](../../docs/architecture/linux-kde-x11-driver.md)，效果验证：
 
 ```sh
-tests/linux/run-linux-parity.sh   # 另需 openbox x11-utils xclip tesseract-ocr tesseract-ocr-eng
+tests/linux/run-linux-parity.sh   # 另需 xfwm4 x11-utils xclip tesseract-ocr tesseract-ocr-eng
 ```
 
 XTest 输入和目标截图要求明确的 `XDG_SESSION_TYPE=x11` 与可连接的 `DISPLAY`，不以 KDE、GNOME、
@@ -76,7 +76,7 @@ helper 声明 `anchored-drag-between` 时，Linux provider 另公开内部 `drag
 ## 验证
 
 CI 使用纯 Rust driver 和 [`qt_atspi_fixture.cpp`](../../tests/linux/qt_atspi_fixture.cpp)，
-在私有 Xvfb/session bus/AT-SPI bus 中验证应用枚举、snapshot/find、语义写值、XTest
+在私有 Xvfb/session bus/AT-SPI bus 中使用 xfwm4 提供窗口管理器身份和外框，验证应用枚举、snapshot/find、语义写值、XTest
 Unicode 输入、中心点点击和目标截图，并经 `aad do` 验证双击和 Ctrl+A 后输入：
 
 ```sh
