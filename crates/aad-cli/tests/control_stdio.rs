@@ -101,6 +101,7 @@ fn cli_proxy_explains_invalid_stdout_without_echoing_the_frame() {
         !stderr.contains("aad fixture: starting control serve"),
         "{stderr}"
     );
+    assert!(!stderr.contains("child exited"), "{stderr}");
 }
 
 #[cfg(unix)]
@@ -124,6 +125,31 @@ fn cli_proxy_and_mcp_report_the_child_exit_code() {
             "{stderr}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_proxy_reports_invalid_stdout_and_the_child_exit_code_together() {
+    let stderr = failed_startup(with_remote(
+        &["control", "connect", "--command"],
+        &[
+            "/bin/sh",
+            "-c",
+            "exec 0<&-; printf '%s\\n' 'private fixture banner'; exit 23",
+        ],
+    ));
+    assert!(stderr.starts_with("aad control: --command:"), "{stderr}");
+    assert!(stderr.contains("invalid response frame"), "{stderr}");
+    assert!(stderr.contains("exit code 23"), "{stderr}");
+    assert!(
+        stderr.contains("Send startup messages to stderr"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Run the command separately and check its exit code and stderr"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("private fixture banner"), "{stderr}");
 }
 
 #[cfg(target_os = "linux")]
