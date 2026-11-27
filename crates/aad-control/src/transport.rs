@@ -8,7 +8,7 @@
 use crate::{error, Operation, Request, Response, Result, Session, PROTOCOL_VERSION};
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc, Arc, Mutex,
@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IN_FLIGHT: usize = 8;
+const TRANSPORT_SLACK: Duration = Duration::from_millis(250);
 
 pub trait Endpoint: Send + Sync {
     fn session_id(&self) -> &str;
@@ -39,18 +40,34 @@ impl Endpoint for Session {
 
 /// Read no more than limit+1 bytes, even when a peer never sends a newline.
 pub fn read_frame(input: &mut impl BufRead, limit: usize) -> io::Result<Option<Vec<u8>>> {
+    read_bounded_frame(input, limit).map_err(|failure| match failure {
+        FrameError::Io(error) => error,
+        FrameError::Invalid => io::Error::new(
+            io::ErrorKind::InvalidData,
+            "oversized or incomplete control frame",
+        ),
+    })
+}
+
+enum FrameError {
+    Io(io::Error),
+    Invalid,
+}
+
+fn read_bounded_frame(
+    input: &mut impl BufRead,
+    limit: usize,
+) -> std::result::Result<Option<Vec<u8>>, FrameError> {
     let mut bytes = Vec::new();
     let count = input
         .take((limit + 1) as u64)
-        .read_until(b'\n', &mut bytes)?;
+        .read_until(b'\n', &mut bytes)
+        .map_err(FrameError::Io)?;
     if count == 0 {
         return Ok(None);
     }
     if bytes.len() > limit || !bytes.ends_with(b"\n") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "oversized or incomplete control frame",
-        ));
+        return Err(FrameError::Invalid);
     }
     Ok(Some(bytes))
 }
@@ -87,7 +104,11 @@ fn write_response(output: &mut impl Write, response: &Response) -> io::Result<()
         ));
     }
     bytes.push(b'\n');
-    output.write_all(&bytes)?;
+    write_frame(output, &bytes)
+}
+
+fn write_frame(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    output.write_all(bytes)?;
     output.flush()
 }
 
@@ -219,6 +240,91 @@ struct Packet {
     deadline: Instant,
 }
 
+enum ResponseReadError {
+    InvalidFrame,
+    Eof,
+    Io(io::Error),
+}
+
+fn read_response(input: &mut impl BufRead) -> std::result::Result<Response, ResponseReadError> {
+    let frame = read_bounded_frame(input, MAX_RESPONSE_BYTES)
+        .map_err(|failure| match failure {
+            FrameError::Invalid => ResponseReadError::InvalidFrame,
+            FrameError::Io(error) => ResponseReadError::Io(error),
+        })?
+        .ok_or(ResponseReadError::Eof)?;
+    let response: Response =
+        serde_json::from_slice(&frame).map_err(|_| ResponseReadError::InvalidFrame)?;
+    if response.protocol_version != PROTOCOL_VERSION
+        || response.data.is_some() == response.error.is_some()
+        || !matches!(
+            response.effect.as_str(),
+            "not_applied" | "applied" | "contextual" | "unknown"
+        )
+        || response.commit_state != crate::CommitState::from_effect(&response.effect)
+    {
+        return Err(ResponseReadError::InvalidFrame);
+    }
+    Ok(response)
+}
+
+enum HandshakeError {
+    Read(ResponseReadError),
+    Write(io::Error),
+    Timeout,
+    Rejected,
+    Stopped,
+}
+
+impl HandshakeError {
+    fn diagnostic(self, child: &mut Option<Child>, deadline: Instant) -> crate::AutomationError {
+        // Pipe closure can become visible before the child's exit status.
+        let possible_exit = matches!(self, Self::Read(ResponseReadError::Eof))
+            || matches!(&self, Self::Write(e) if e.kind() == io::ErrorKind::BrokenPipe);
+        if possible_exit {
+            if let Some(status) = child
+                .as_mut()
+                .and_then(|child| observe_exit(child, deadline))
+            {
+                *child = None;
+                let status = status
+                    .code()
+                    .map_or_else(String::new, |code| format!(" (exit code {code})"));
+                return error(
+                    "CONTROL.CONNECT_FAILED",
+                    format!("child exited before the remote handshake{status}. Run the command separately and check its exit code and stderr"),
+                );
+            }
+        }
+        let message = match self {
+            Self::Read(ResponseReadError::InvalidFrame) if child.is_some() =>
+                "remote handshake received an invalid response frame. Child stdout must contain only control protocol NDJSON. Send startup messages to stderr".into(),
+            Self::Read(ResponseReadError::InvalidFrame) =>
+                "remote handshake received an invalid response frame. Expected control protocol NDJSON".into(),
+            Self::Read(ResponseReadError::Eof) =>
+                "remote response stream ended before the handshake completed".into(),
+            Self::Read(ResponseReadError::Io(error)) => format!("remote handshake read failed: {error}"),
+            Self::Write(error) => format!("remote handshake write failed: {error}"),
+            Self::Timeout => "remote handshake timed out".into(),
+            Self::Rejected => "remote server rejected the handshake".into(),
+            Self::Stopped => "remote transport stopped before the handshake completed".into(),
+        };
+        error("CONTROL.CONNECT_FAILED", message)
+    }
+}
+
+fn observe_exit(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().ok()? {
+            return Some(status);
+        }
+        std::thread::sleep(
+            Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    None
+}
+
 pub struct RemoteClient {
     request_gate: bool,
     id: String,
@@ -245,17 +351,7 @@ impl RemoteClient {
             .map_err(|e| error("CONTROL.CONNECT_FAILED", e.to_string()))?;
         let input = child.stdout.take().unwrap();
         let output = child.stdin.take().unwrap();
-        match Self::from_streams(input, output) {
-            Ok(client) => {
-                *client.child.lock().unwrap() = Some(child);
-                Ok(client)
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                Err(e)
-            }
-        }
+        Self::connect(input, output, Some(child))
     }
 
     /// Stream injection is for already authenticated transports and isolated
@@ -264,88 +360,94 @@ impl RemoteClient {
         input: impl Read + Send + 'static,
         output: impl Write + Send + 'static,
     ) -> Result<Self> {
+        Self::connect(input, output, None)
+    }
+
+    fn connect(
+        input: impl Read + Send + 'static,
+        output: impl Write + Send + 'static,
+        child: Option<Child>,
+    ) -> Result<Self> {
         let pending: Pending = Arc::new(Mutex::new(BTreeMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
         let (writer, queue) = mpsc::sync_channel::<Packet>(MAX_IN_FLIGHT);
+        let mut client = Self {
+            request_gate: false,
+            id: String::new(),
+            writer,
+            pending: pending.clone(),
+            closed: closed.clone(),
+            child: Mutex::new(child),
+        };
+        let request = Request::new(None, Operation::Capabilities {});
+        let write_deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
+        let deadline = write_deadline + TRANSPORT_SLACK;
+        let mut bytes = serde_json::to_vec(&request).map_err(|cause| {
+            error(
+                "CONTROL.CONNECT_FAILED",
+                format!("could not encode remote handshake request: {cause}"),
+            )
+        })?;
+        bytes.push(b'\n');
+        let handshake = Packet {
+            bytes,
+            deadline: write_deadline,
+        };
+        let (startup, response) = mpsc::channel();
+        let write_failure = startup.clone();
         let (failed, writing) = (closed.clone(), pending.clone());
         std::thread::spawn(move || {
             let mut output = output;
-            while let Ok(packet) = queue.recv() {
-                if failed.load(Ordering::SeqCst) {
+            let mut write_failure = Some(write_failure);
+            for packet in std::iter::once(handshake).chain(queue) {
+                let startup = write_failure.take();
+                if startup.is_none() && failed.load(Ordering::SeqCst) {
                     break;
                 }
                 if Instant::now() >= packet.deadline {
                     continue;
                 }
-                if output
-                    .write_all(&packet.bytes)
-                    .and_then(|()| output.flush())
-                    .is_err()
-                {
+                if let Err(error) = write_frame(&mut output, &packet.bytes) {
+                    if let Some(startup) = startup {
+                        let _ = startup.send(Err(HandshakeError::Write(error)));
+                    }
                     failed.store(true, Ordering::SeqCst);
                     writing.lock().unwrap().clear();
                     break;
                 }
             }
         });
-        let (waiting, dead) = (pending.clone(), closed.clone());
         std::thread::spawn(move || {
             let mut input = BufReader::new(input);
-            while let Ok(Some(frame)) = read_frame(&mut input, MAX_RESPONSE_BYTES) {
-                let response: Response = match serde_json::from_slice(&frame) {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                if response.protocol_version != PROTOCOL_VERSION
-                    || response.data.is_some() == response.error.is_some()
-                    || !matches!(
-                        response.effect.as_str(),
-                        "not_applied" | "applied" | "contextual" | "unknown"
-                    )
-                    || response.commit_state != crate::CommitState::from_effect(&response.effect)
-                {
-                    break;
-                }
-                let terminal = terminal(&response);
-                if let Some(sender) = waiting.lock().unwrap().remove(&response.request_id) {
-                    let _ = sender.send(response);
-                }
-                if terminal {
-                    break;
+            let hello = read_response(&mut input)
+                .map_err(HandshakeError::Read)
+                .and_then(|response| validate_handshake(response, &request.request_id));
+            let established = hello.is_ok();
+            let _ = startup.send(hello);
+            drop(startup);
+            if established {
+                while let Ok(response) = read_response(&mut input) {
+                    let terminal = terminal(&response);
+                    if let Some(sender) = pending.lock().unwrap().remove(&response.request_id) {
+                        let _ = sender.send(response);
+                    }
+                    if terminal {
+                        break;
+                    }
                 }
             }
-            dead.store(true, Ordering::SeqCst);
+            closed.store(true, Ordering::SeqCst);
             // Dropping senders wakes callers, which classify their own pending
             // write as unknown rather than fabricating a successful response.
-            waiting.lock().unwrap().clear();
+            pending.lock().unwrap().clear();
         });
-        let mut client = Self {
-            request_gate: false,
-            id: String::new(),
-            writer,
-            pending,
-            closed,
-            child: Mutex::new(None),
-        };
-        let request = Request::new(None, Operation::Capabilities {});
-        let response = client.exchange(&request);
-        if response.error.is_some()
-            || response.protocol_version != PROTOCOL_VERSION
-            || response.session_id.is_empty()
-        {
-            return Err(error("CONTROL.CONNECT_FAILED", "remote handshake failed"));
-        }
-        if response
-            .data
-            .as_ref()
-            .and_then(|v| v["session_id"].as_str())
-            != Some(response.session_id.as_str())
-        {
-            return Err(error(
-                "CONTROL.CONNECT_FAILED",
-                "remote session handshake mismatch",
-            ));
-        }
+        let response =
+            match response.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(HandshakeError::Timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(HandshakeError::Stopped),
+            }
+            .map_err(|error| error.diagnostic(client.child.get_mut().unwrap(), deadline))?;
         client.request_gate = response
             .data
             .as_ref()
@@ -475,7 +577,7 @@ impl RemoteClient {
             if self.request_gate && matches!(request.operation, Operation::Act { .. }) {
                 Duration::from_secs(127)
             } else {
-                Duration::from_millis(250)
+                TRANSPORT_SLACK
             };
         match rx.recv_timeout(
             Duration::from_millis(request.timeout_ms.min(crate::MAX_TIMEOUT_MS)) + transport_slack,
@@ -525,6 +627,28 @@ impl RemoteClient {
             }
         }
     }
+}
+
+fn validate_handshake(
+    response: Response,
+    request_id: &str,
+) -> std::result::Result<Response, HandshakeError> {
+    if response.request_id != request_id {
+        return Err(HandshakeError::Read(ResponseReadError::InvalidFrame));
+    }
+    if response.error.is_some() {
+        return Err(HandshakeError::Rejected);
+    }
+    if response.session_id.is_empty()
+        || response
+            .data
+            .as_ref()
+            .and_then(|data| data["session_id"].as_str())
+            != Some(response.session_id.as_str())
+    {
+        return Err(HandshakeError::Read(ResponseReadError::InvalidFrame));
+    }
+    Ok(response)
 }
 
 impl Endpoint for RemoteClient {

@@ -4,7 +4,7 @@ use aad_control::{
     *,
 };
 use serde_json::{json, Value};
-use std::io::{BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -307,6 +307,68 @@ fn framing_rejects_truncation_oversize_and_protocol_injection() {
     assert!(transport::read_frame(&mut BufReader::new(&b"{}"[..]), 64).is_err());
     assert!(serde_json::from_value::<Request>(json!({"request_id":"a","timeout_ms":20,"operation":{"method":"targets","principal":"admin"}})).is_err());
     assert!(serde_json::from_value::<Request>(json!({"request_id":"a","timeout_ms":20,"principal":"admin","operation":{"method":"targets"}})).is_err());
+}
+
+#[test]
+fn handshake_distinguishes_invalid_frames_eof_and_read_errors() {
+    struct FailingReader;
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fixture read error",
+            ))
+        }
+    }
+
+    let invalid = RemoteClient::from_streams(&b"private startup banner\n"[..], io::sink())
+        .err()
+        .unwrap();
+    assert!(invalid.message.contains("invalid response frame"));
+    assert!(invalid.message.contains("control protocol NDJSON"));
+    assert!(!invalid.message.contains("private startup banner"));
+
+    let eof = RemoteClient::from_streams(io::empty(), io::sink())
+        .err()
+        .unwrap();
+    assert!(eof.message.contains("stream ended before the handshake"));
+
+    let read = RemoteClient::from_streams(FailingReader, io::sink())
+        .err()
+        .unwrap();
+    assert_eq!(
+        read.message,
+        "remote handshake read failed: fixture read error"
+    );
+}
+
+#[test]
+fn handshake_reports_write_error_while_response_stream_is_open() {
+    struct FailingWriter;
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "fixture write error",
+            ))
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (reader, _) = listener.accept().unwrap();
+    let write = RemoteClient::from_streams(reader, FailingWriter)
+        .err()
+        .unwrap();
+    assert_eq!(
+        write.message,
+        "remote handshake write failed: fixture write error"
+    );
+    drop(peer);
 }
 
 #[test]

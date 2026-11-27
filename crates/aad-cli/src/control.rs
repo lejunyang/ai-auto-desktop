@@ -289,12 +289,17 @@ fn invalid(error: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
 }
 
+fn remote_client(raw: &str, option: &str) -> std::io::Result<RemoteClient> {
+    RemoteClient::spawn(&command(raw)?)
+        .map_err(|error| invalid(format!("{option}: {}", error.message)))
+}
+
 pub fn mcp(args: &McpArgs) -> std::io::Result<()> {
     let server = if let Some(raw) = &args.connect {
         if args.allow_input || args.grants.any() {
             return Err(invalid("remote grants must be configured on the remote server; local flags cannot replace them"));
         }
-        let client = RemoteClient::spawn(&command(raw)?).map_err(|e| invalid(e.message))?;
+        let client = remote_client(raw, "--connect")?;
         aad_mcp::Server::with_control(Arc::new(client))
     } else {
         args.grants.check(args.allow_input)?;
@@ -326,9 +331,7 @@ pub fn run(command_args: &ControlCommand) -> std::io::Result<()> {
                 args.grants.browser_bidi_port,
             ))
         }
-        ControlCommand::Connect(args) => {
-            Arc::new(RemoteClient::spawn(&command(&args.command)?).map_err(|e| invalid(e.message))?)
-        }
+        ControlCommand::Connect(args) => Arc::new(remote_client(&args.command, "--command")?),
     };
     transport::serve(std::io::stdin(), std::io::stdout(), endpoint)
 }
