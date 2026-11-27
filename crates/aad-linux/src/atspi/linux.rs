@@ -1,6 +1,7 @@
 use super::{
     driver_error, remaining, AtspiBackend, AutomationError, BackendNode, BackendSnapshot, Bounds,
-    Gesture, Map, NativeRef, Value, WindowAnchor, X11WindowBinding, MAX_FIELD_CHARS, MAX_NODES,
+    Gesture, Map, NativeRef, QtX11Window, Value, WindowAnchor, X11WindowBinding, MAX_FIELD_CHARS,
+    MAX_NODES,
 };
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::action::ActionProxy;
@@ -695,6 +696,7 @@ impl LinuxBackend {
         parent_index: Option<usize>,
         application: &Map<String, Value>,
         input: Option<&InputSupport>,
+        qt_windows: Option<&[QtX11Window]>,
         deadline: Instant,
     ) -> Result<(BackendNode, usize), AutomationError> {
         remaining(deadline, false)?;
@@ -859,11 +861,11 @@ impl LinuxBackend {
             && interfaces.contains(Interface::Component)
             && bounds.is_some_and(|bounds| bounds.width > 0 && bounds.height > 0)
             && !protected
-            && process_id.is_some_and(|pid| {
-                self.verify_focused_with_helper(
+            && process_id.zip(qt_windows).is_some_and(|(pid, windows)| {
+                self.verify_qt_focus(
                     &target,
-                    None,
                     pid as u32,
+                    windows,
                     deadline,
                     &input.expect("feature checked").path,
                 )
@@ -2047,7 +2049,7 @@ impl LinuxBackend {
     fn capture_tree(
         &self,
         root: NativeRef,
-        info: Map<String, Value>,
+        mut info: Map<String, Value>,
         ancestors: Vec<NativeRef>,
         max_depth: u32,
         max_nodes: usize,
@@ -2055,6 +2057,7 @@ impl LinuxBackend {
     ) -> Result<BackendSnapshot, AutomationError> {
         self.ensure_focus_discovery(&info, deadline);
         let input = self.probe_input(deadline).ok();
+        let qt_windows = self.read_qt_x11_windows(&mut info, deadline)?;
         let mut snapshot = self.capture_tree_nodes(
             root.clone(),
             info,
@@ -2062,8 +2065,10 @@ impl LinuxBackend {
             max_depth,
             max_nodes,
             input.as_ref(),
+            qt_windows.as_deref(),
             deadline,
         )?;
+        snapshot.qt_x11_windows = qt_windows;
         self.append_focused_branch(
             &root,
             &mut snapshot,
@@ -2085,6 +2090,7 @@ impl LinuxBackend {
         max_depth: u32,
         max_nodes: usize,
         input: Option<&InputSupport>,
+        qt_windows: Option<&[QtX11Window]>,
         deadline: Instant,
     ) -> Result<BackendSnapshot, AutomationError> {
         let mut nodes = Vec::new();
@@ -2096,7 +2102,10 @@ impl LinuxBackend {
         }
         for ancestor in ancestors {
             let parent = nodes.len().checked_sub(1);
-            nodes.push(self.read_node(ancestor, parent, &info, input, deadline)?.0);
+            nodes.push(
+                self.read_node(ancestor, parent, &info, input, qt_windows, deadline)?
+                    .0,
+            );
         }
         let parent = nodes.len().checked_sub(1);
         let mut queue = VecDeque::from([(root, parent, 0u32)]);
@@ -2114,7 +2123,7 @@ impl LinuxBackend {
                 break;
             }
             let (node, child_count) =
-                self.read_node(target.clone(), parent, &info, input, deadline)?;
+                self.read_node(target.clone(), parent, &info, input, qt_windows, deadline)?;
             let current = nodes.len();
             nodes.push(node);
             match self.child_references(&target, deadline) {
@@ -2168,6 +2177,7 @@ impl LinuxBackend {
             nodes,
             truncated,
             truncation_reasons,
+            qt_x11_windows: None,
         })
     }
 
@@ -3086,7 +3096,7 @@ impl LinuxBackend {
     fn describe(&self, target: &NativeRef, info: &Map<String, Value>) -> Option<Value> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let (node, _) = self
-            .read_node(target.clone(), None, info, None, deadline)
+            .read_node(target.clone(), None, info, None, None, deadline)
             .ok()?;
         let protected = node.states.get("protected").copied().flatten() == Some(true);
         Some(json!({

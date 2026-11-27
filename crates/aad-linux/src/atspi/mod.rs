@@ -134,6 +134,18 @@ pub struct BackendSnapshot {
     pub truncated: bool,
     /// Bounded, content-free explanations for an incomplete capture.
     pub truncation_reasons: Vec<Value>,
+    /// Private geometry inventory used only for Qt/X11 window proof.
+    #[doc(hidden)]
+    pub qt_x11_windows: Option<Vec<QtX11Window>>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct QtX11Window {
+    native: NativeRef,
+    name: String,
+    raw: Bounds,
+    client: Option<(u32, Bounds)>,
 }
 
 /// A pointer gesture, already validated, in X11's own button numbering.
@@ -3957,6 +3969,7 @@ mod tests {
                     nodes: vec![app, source, destination],
                     truncated: false,
                     truncation_reasons: vec![],
+                    qt_x11_windows: None,
                 });
             }
             let path = if self.replaced && self.captures.load(Ordering::SeqCst) > 1 {
@@ -4018,6 +4031,7 @@ mod tests {
                 application,
                 nodes,
                 truncated: self.truncated,
+                qt_x11_windows: None,
                 truncation_reasons: if self.truncated {
                     vec![json!({"code": "max_nodes", "limit": 1000})]
                 } else {
@@ -4091,6 +4105,7 @@ mod tests {
                 nodes,
                 truncated: self.scoped_truncated,
                 truncation_reasons: vec![],
+                qt_x11_windows: None,
             })
         }
         fn focus(
