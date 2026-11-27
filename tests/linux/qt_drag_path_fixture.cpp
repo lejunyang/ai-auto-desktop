@@ -47,14 +47,6 @@ protected:
             cover->show();
             cover->raise();
         });
-        if (mode_ == "overlay-straight" || mode_ == "transparent-straight") QTimer::singleShot(1, this, [this] {
-            const QPoint midpoint = mapToGlobal(rect().center());
-            auto *cover = new GeometryCover(window());
-            if (mode_ == "transparent-straight") cover->setWindowFlag(Qt::WindowTransparentForInput);
-            cover->setGeometry(QRect(midpoint - QPoint(10, 10), QSize(20, 20)));
-            cover->show();
-            cover->raise();
-        });
         if (mode_ == "overlay") QTimer::singleShot(1, this, [this] {
             auto *overlay = new QPushButton("Path obstacle", parentWidget());
             overlay->setAccessibleName("Path obstacle"); overlay->setGeometry(geometry()); overlay->show(); overlay->raise();

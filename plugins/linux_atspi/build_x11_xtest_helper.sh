@@ -13,15 +13,15 @@ if ! command -v g++ >/dev/null 2>&1 || ! command -v pkg-config >/dev/null 2>&1; 
     printf '%s\n' '缺少 g++ 或 pkg-config。' >&2
     exit 70
 fi
-if ! pkg-config --exists x11 xtst xext; then
+if ! pkg-config --exists x11 xtst; then
     printf '%s\n' '缺少 X11/XTest 开发包；Debian/Ubuntu 请安装 libx11-dev libxtst-dev。' >&2
     exit 71
 fi
 mkdir -p "$build_dir"
 if [ "${AAD_LINUX_STATIC:-0}" = 1 ]; then
-    set -- $(pkg-config --static --cflags --libs x11 xtst xext) -static-pie -fPIE
+    set -- $(pkg-config --static --cflags --libs x11 xtst) -static-pie -fPIE
 else
-    set -- $(pkg-config --cflags --libs x11 xtst xext)
+    set -- $(pkg-config --cflags --libs x11 xtst)
 fi
 g++ -std=c++17 -O2 -Wall -Wextra -Werror \
     "$script_dir/x11_xtest_helper.cpp" -o "$output" "$@"

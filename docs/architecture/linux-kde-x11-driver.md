@@ -116,10 +116,8 @@ X11 窗口/PID/几何/命中。Rust 只读 worker 不占主循环；AX 调用阻
 只读请求会阻止新路径。
 
 普通 X11 直线拖拽要求 helper 同时声明 `anchored-straight-drag` 和 `window-geometry-proof-v1`，
-并携带起终点冻结的窗口几何证明。helper 在首次派发、按下、停留、每段移动和释放时复核两端的身份和几何，
-按当前阶段核对鼠标落点的顶层命中。按下后映射的 `_NET_WM_WINDOW_TYPE_DND` 图标由活跃 XDND 选择的
-X 客户端持有时可以跳过。同源新建的临时窗需要输入形状为空。helper 仍检查其下方的真实遮挡。
-修饰键额外要求源窗口焦点。派发后发现端点失效会停止移动，
+并携带起终点冻结的窗口几何证明。helper 在首次派发、
+按下、停留、每段移动和释放时复核两端。修饰键额外要求源窗口焦点。派发后发现端点失效会停止移动，
 释放本次按下的按钮，并返回 `DRIVER.POINT_NOT_PROVEN` 和 `unknown`。缺少能力时直线拖拽在输入前
 返回 `DRIVER.HELPER_INCOMPATIBLE`，需同时升级 aad 和 helper。
 

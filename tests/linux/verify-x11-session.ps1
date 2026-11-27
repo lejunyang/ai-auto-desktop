@@ -11,7 +11,7 @@ $BuildDirectory = (Resolve-Path $BuildDirectory).Path
 $binary = Join-Path $BuildDirectory 'x11-session-protocol-test'
 $capture = Join-Path $BuildDirectory 'x11_capture_helper'
 $inputHelper = Join-Path $BuildDirectory 'x11_xtest_helper'
-$flags = ((& pkg-config --cflags --libs x11 xtst xext) -split '\s+') | Where-Object { $_ }
+$flags = ((& pkg-config --cflags --libs x11 xtst) -split '\s+') | Where-Object { $_ }
 if ($LASTEXITCODE -ne 0) { throw 'X11/XTest development packages unavailable' }
 & g++ -std=c++17 -O2 -Wall -Wextra -Werror (Join-Path $root 'tests/linux/x11_session_protocol_test.cpp') -o $binary @flags
 if ($LASTEXITCODE -ne 0) { throw 'session protocol test build failed' }
