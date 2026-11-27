@@ -91,6 +91,13 @@ int main() {
             "--to-y", "40", "--button", "1", "--modifiers", "ctrl"};
         append_proof(bound_drag, target, "--");
         append_proof(bound_drag, other, "--destination-");
+        std::vector<std::string> plain_drag = {"drag", "--x", "30", "--y", "30", "--to-x", "340",
+            "--to-y", "40", "--button", "1"};
+        append_proof(plain_drag, target, "--");
+        XSync(display, True);
+        RequireModifier(invoke(plain_drag).first == kExitInvalid && XPending(display) == 0 && released(),
+                        "straight drag accepted a source proof without a destination proof");
+        append_proof(plain_drag, other, "--destination-");
         auto denied_before_input = [&](const std::vector<std::string> &args, const char *message) {
             XSync(display, True);
             const auto result = invoke(args);
@@ -113,6 +120,12 @@ int main() {
         XMoveWindow(display, other, 300, 20);
         XSync(display, False);
         RequireModifier(invoke(bound_drag, 2000000000LL).first == 0 && released(), "bound two-window drag failed");
+        XSetInputFocus(display, other, RevertToParent, CurrentTime);
+        XSync(display, False);
+        RequireModifier(invoke(plain_drag, 2000000000LL).first == 0 && released(),
+                        "unmodified bound drag required focus in the source window");
+        XSetInputFocus(display, target, RevertToParent, CurrentTime);
+        XSync(display, False);
         click.back() = "ctrl,ctrl";
         RequireModifier(invoke(click).first == kExitInvalid, "duplicate modifiers accepted");
         std::vector<std::string> drag = {"drag", "--x", "30", "--y", "30", "--to-x", "180", "--to-y", "180", "--button", "1", "--modifiers", "ctrl"};

@@ -1,4 +1,5 @@
-param([string]$Aad = '', [string]$InputHelper = '', [string]$BuildDirectory = '', [switch]$BuildOnly)
+param([string]$Aad = '', [string]$InputHelper = '', [string]$BuildDirectory = '', [switch]$BuildOnly,
+      [switch]$StraightGeometryOnly)
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 if (-not $BuildDirectory) { $BuildDirectory = Join-Path ([IO.Path]::GetTempPath()) ('aad-qt-path-' + [guid]::NewGuid().ToString('N')) }
@@ -46,7 +47,10 @@ try {
     $info.EnvironmentVariables['AAD_LINUX_XTEST_HELPER']=(Resolve-Path $InputHelper).Path
     $script:server=[Diagnostics.Process]::Start($info)
     Call-Control @{method='capabilities'} | Out-Null
-    foreach ($caseName in @('invalid','success','success-scoped','geometry','overlay','overlay-scoped','cancel')) {
+    $cases = if ($StraightGeometryOnly) { @('geometry-straight') } else {
+        @('invalid','success','success-scoped','geometry','overlay','overlay-scoped','cancel','geometry-straight')
+    }
+    foreach ($caseName in $cases) {
         $script:caseName = $caseName
         $mode = $caseName.Replace('-scoped','')
         $fi=[Diagnostics.ProcessStartInfo]::new(); $fi.FileName=$fixturePath; $fi.Arguments=$mode
@@ -77,6 +81,9 @@ try {
         $action=@{type='drag';to=$target;fraction=@{fx=0.1;fy=0.1};to_fraction=@{fx=0.9;fy=0.9};
             path=@(@{target=$target;fraction=@{fx=0.8;fy=0.2}},@{target=$target;fraction=@{fx=0.2;fy=0.8}})}
         if ($mode -eq 'invalid') { $action.path[0].fraction.fx=1.1 }
+        if ($mode -eq 'geometry-straight') {
+            $action=@{type='drag';to=$target;fraction=@{fx=0.3;fy=0.3};to_fraction=@{fx=0.7;fy=0.7};hold_ms=250;path=@()}
+        }
         $script:caseClock=[Diagnostics.Stopwatch]::StartNew()
         $running=Send-Control @{method='act';target=$target;action=$action}
         if ($mode -eq 'invalid') {
@@ -98,6 +105,18 @@ try {
                 $expected=@(@(0.8,0.2),@(0.2,0.8),@(0.9,0.9))
                 for ($i=0;$i -lt 3;$i++) {
                     if ([Math]::Abs($moves[$i].fx-$expected[$i][0]) -gt 0.015 -or [Math]::Abs($moves[$i].fy-$expected[$i][1]) -gt 0.015) { throw 'actual pointer trace differs from normalized anchors' }
+                }
+            } elseif ($mode -eq 'geometry-straight') {
+                $extra=$fixture.StandardOutput.ReadLineAsync()
+                if ($extra.Wait(150)) { throw "unexpected event after release: $($extra.Result)" }
+                $moved=Call-Control @{method='observe';resource_id=$rid;max_nodes=100;view=@{mode='nodes'}}
+                $movedSurface=@($moved.data.nodes | Where-Object { $_.name -eq 'Path surface' })
+                if ($movedSurface.Count -ne 1 -or $movedSurface[0].bounds.x -eq $nodes[0].bounds.x) {
+                    throw 'straight drag fixture window did not move'
+                }
+                if ($result.effect -ne 'unknown' -or $result.error.code -ne 'DRIVER.POINT_NOT_PROVEN' -or
+                    ($events.event -join ',') -ne 'down,up' -or $releaseMs -gt 1500) {
+                    throw "moving straight drag delivered $($events.event -join ',') with effect $($result.effect) and code $($result.error.code)"
                 }
             } else {
                 if (-not $result.error -or $result.effect -ne 'unknown') { throw 'interrupted path did not preserve uncertain effect' }

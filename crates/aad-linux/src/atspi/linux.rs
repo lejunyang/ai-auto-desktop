@@ -35,6 +35,8 @@ use focus_discovery::FocusDiscovery;
 mod window_focus;
 use window_focus::{append_window_args, GEOMETRY_FEATURE};
 
+const STRAIGHT_DRAG_FEATURE: &str = "anchored-straight-drag";
+
 const REGISTRY_NAME: &str = "org.a11y.atspi.Registry";
 const REGISTRY_PATH: &str = "/org/a11y/atspi/accessible/root";
 const DBUS_NAME: &str = "org.freedesktop.DBus";
@@ -536,10 +538,17 @@ impl LinuxBackend {
             support.require("bounded-hold")?;
         }
         let keyboard = args.first().is_some_and(|command| command == "key-chord");
-        let bound = if keyboard || modified {
-            for feature in ["focus-info", "window-focus", GEOMETRY_FEATURE] {
-                support.require(feature)?;
-            }
+        let requires_focus = keyboard || modified;
+        let bound_drag = args[0] == "drag" && (modified || support.has(STRAIGHT_DRAG_FEATURE));
+        if requires_focus {
+            support.require("focus-info")?;
+            support.require("window-focus")?;
+        }
+        if bound_drag {
+            support.require(STRAIGHT_DRAG_FEATURE)?;
+        }
+        let bound = if requires_focus || bound_drag {
+            support.require(GEOMETRY_FEATURE)?;
             let window = window.ok_or_else(|| {
                 driver_error(
                     "DRIVER.ACTION_UNSUPPORTED",
@@ -550,7 +559,7 @@ impl LinuxBackend {
         } else {
             None
         };
-        if modified && args[0] == "drag" {
+        if bound_drag {
             let destination = destination_window.ok_or_else(|| {
                 driver_error(
                     "DRIVER.ACTION_UNSUPPORTED",
@@ -571,7 +580,7 @@ impl LinuxBackend {
                 std::thread::sleep(Duration::from_millis(50).min(remaining(deadline, true)?));
                 self.verify_focused_with_helper(target, Some(window), process_id, deadline, &path)
                     .map_err(after_focus)?;
-            } else {
+            } else if requires_focus {
                 self.verify_window_with_helper(target, window, process_id, deadline, &path, true)?;
             }
             append_window_args(&mut args, window, Some(binding));
@@ -2689,6 +2698,16 @@ fn parse_input_helper(
     }
     let code = output.status.code();
     let helper_code = helper_error_code(&output.stdout);
+    if dispatched && helper_code.as_deref() == Some("drag_endpoint_changed") {
+        return Err(driver_error(
+            "DRIVER.POINT_NOT_PROVEN",
+            "a drag endpoint no longer matches its observed window after dispatch started",
+        )
+        .with_effect("unknown")
+        .with_detail("phase", json!(phase))
+        .with_detail("helper_code", json!(helper_code))
+        .with_detail("dispatch_started", json!(true)));
+    }
     if !dispatched {
         if let Some(mapped) = helper_code.as_deref().and_then(map_helper_code) {
             return Err(mapped
