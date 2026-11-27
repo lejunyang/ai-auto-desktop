@@ -67,9 +67,20 @@ enum Command {
     Snapshot(desk::ResourceArgs),
     /// Find the single element matching a locator.
     Find(desk::FindArgs),
-    /// Write a PNG screenshot of one element (browser pages and Windows windows).
+    /// Write a PNG screenshot of one observed element.
     ///
     /// Compare `digest` between captures to tell whether what it shows changed.
+    ///
+    /// Browser page capture is available when the browser provider supports it.
+    /// Desktop window capture is available on Windows, Linux X11, and macOS.
+    ///
+    /// Capturing desktop windows on macOS requires Screen Recording permission
+    /// for MacOSAXHelper.app.
+    ///
+    /// Linux desktop capture requires an X11 session and a screenshot helper. Linux
+    /// release packages include `aad-linux-capture-helper` alongside `aad`. For a
+    /// source build, run `plugins/linux_atspi/build_x11_capture_helper.sh` from the
+    /// repository root. Set `AAD_LINUX_CAPTURE_HELPER` to use a trusted helper path.
     Capture(desk::CaptureArgs),
     /// Find one element and act on it, in one step.
     #[command(subcommand)]
