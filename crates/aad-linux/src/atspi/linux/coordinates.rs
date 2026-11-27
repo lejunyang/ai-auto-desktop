@@ -268,10 +268,7 @@ impl LinuxBackend {
             }) else {
                 continue;
             };
-            if let Some(client) = calibrated
-                .unique_client(windows)
-                .filter(|client| client.viewable)
-            {
+            if let Some(client) = calibrated.unique_client.filter(|client| client.viewable) {
                 maps.push(CoordinateMap {
                     window: calibrated.native.clone(),
                     raw: calibrated.raw,
@@ -353,16 +350,13 @@ impl LinuxBackend {
                 Vec::new()
             }
         };
-        let calibrated = windows
-            .iter()
+        let mut calibrated: Vec<_> = windows
+            .into_iter()
             .map(|(native, name, raw)| QtX11Window {
-                native: native.clone(),
-                name: name.clone(),
-                raw: *raw,
                 candidates: clients
                     .iter()
                     .filter(|client| {
-                        client.title_matches(name) && calibration(*raw, bounds(client))
+                        client.title_matches(&name) && calibration(raw, bounds(client))
                     })
                     .map(|client| QtX11Client {
                         xid: client.id,
@@ -370,8 +364,23 @@ impl LinuxBackend {
                         viewable: client.viewable,
                     })
                     .collect(),
+                native,
+                name,
+                raw,
+                unique_client: None,
             })
             .collect();
+        // The complete inventories have distinct native paths and client XIDs.
+        let mut candidate_counts = BTreeMap::new();
+        for candidate in calibrated.iter().flat_map(|window| &window.candidates) {
+            *candidate_counts.entry(candidate.xid).or_insert(0) += 1;
+        }
+        for window in &mut calibrated {
+            window.unique_client = match window.candidates.as_slice() {
+                [candidate] if candidate_counts[&candidate.xid] == 1 => Some(*candidate),
+                _ => None,
+            };
+        }
         Ok(Some(calibrated))
     }
 

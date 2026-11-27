@@ -413,12 +413,15 @@ impl LinuxBackend {
         let client = windows
             .iter()
             .find(|entry| entry.native == window.native && entry.raw == window.bounds)
-            .and_then(|entry| entry.unique_client(windows))
+            .and_then(|entry| entry.unique_client)
             .filter(|client| client.viewable)
             .ok_or_else(unproven_focus_window)?;
         window.bounds = client.bounds;
         let (binding, focused) = self.window_proof(window, process_id, path, deadline)?;
-        if focused && qt_binding_matches(windows, &window.native, client.bounds, &binding) {
+        if focused
+            && client.xid == binding.client
+            && qt_others_do_not_match(windows, &window.native, &binding)
+        {
             Ok(())
         } else {
             Err(unproven_focus_window())
@@ -475,9 +478,34 @@ fn unique_native_bounds(
     binding: &X11WindowBinding,
 ) -> bool {
     windows.iter().any(|(native, _)| native == target)
-        && windows
+        && others_do_not_match(
+            windows
+                .iter()
+                .filter(|(native, _)| native != target)
+                .map(|(_, bounds)| std::iter::once(*bounds)),
+            binding,
+        )
+}
+
+fn others_do_not_match(
+    mut windows: impl Iterator<Item = impl ExactSizeIterator<Item = Bounds>>,
+    binding: &X11WindowBinding,
+) -> bool {
+    windows.all(|mut candidates| candidates.len() != 0 && !candidates.any(|b| binding.matches(b)))
+}
+
+fn qt_others_do_not_match(
+    windows: &[QtX11Window],
+    target: &NativeRef,
+    binding: &X11WindowBinding,
+) -> bool {
+    others_do_not_match(
+        windows
             .iter()
-            .all(|(native, bounds)| native == target || !binding.matches(*bounds))
+            .filter(|entry| entry.native != *target)
+            .map(|entry| entry.candidates.iter().map(|client| client.bounds)),
+        binding,
+    )
 }
 
 fn qt_binding_matches(
@@ -489,7 +517,7 @@ fn qt_binding_matches(
     let Some(entry) = windows.iter().find(|entry| entry.native == *target) else {
         return false;
     };
-    let Some(client) = entry.unique_client(windows) else {
+    let Some(client) = entry.unique_client else {
         return false;
     };
     // A minimized target still needs a native proof for its raw observation.
@@ -500,14 +528,5 @@ fn qt_binding_matches(
     };
     client.xid == binding.client
         && observed == expected
-        && windows
-            .iter()
-            .filter(|other| other.native != *target)
-            .all(|other| {
-                !other.candidates.is_empty()
-                    && !other
-                        .candidates
-                        .iter()
-                        .any(|candidate| binding.matches(candidate.bounds))
-            })
+        && qt_others_do_not_match(windows, target, binding)
 }
