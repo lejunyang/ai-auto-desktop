@@ -547,9 +547,7 @@ impl LinuxBackend {
         if requires_focus {
             support.require("focus-info")?;
             support.require("window-focus")?;
-            if !bound_drag {
-                support.require(GEOMETRY_FEATURE)?;
-            }
+            support.require(GEOMETRY_FEATURE)?;
         }
         let bound = if requires_focus || bound_drag {
             let window = window.ok_or_else(|| {
@@ -1143,19 +1141,9 @@ impl AtspiBackend for LinuxBackend {
                 "target has no qualified Wayland widget input binding",
             ));
         }
-        let feature = match action {
-            "type_text" => "type-text",
-            "pointer_click" => "pointer-click",
-            "pointer_gesture" => "pointer-gesture",
-            "key_chord" => "key-chord",
-            "drag" | "paste" => action,
-            "activate" | "minimize" | "maximize" | "restore" | "close_window" => "window-action",
-            _ => return Ok(()),
-        };
-        let support = self.probe_input(deadline)?;
         if action == "drag" {
             // The trait receives only the action name. Dispatch checks the selected mode.
-            return if support.has_drag() {
+            return if self.probe_input(deadline)?.has_drag() {
                 Ok(())
             } else {
                 Err(incompatible_helper(
@@ -1163,6 +1151,16 @@ impl AtspiBackend for LinuxBackend {
                 ))
             };
         }
+        let feature = match action {
+            "type_text" => "type-text",
+            "pointer_click" => "pointer-click",
+            "pointer_gesture" => "pointer-gesture",
+            "key_chord" => "key-chord",
+            "paste" => "paste",
+            "activate" | "minimize" | "maximize" | "restore" | "close_window" => "window-action",
+            _ => return Ok(()),
+        };
+        let support = self.probe_input(deadline)?;
         support.require(feature)?;
         if super::WINDOW_ACTIONS.contains(&action) {
             support.require(GEOMETRY_FEATURE)?;
