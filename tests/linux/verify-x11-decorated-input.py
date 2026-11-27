@@ -5,6 +5,7 @@ Run with /usr/bin/python3 and pass the aad and x11_xtest_helper binaries.
 Requires GTK3 GI bindings, xauth, Xvfb, xfwm4, xprop, setxkbmap,
 and a C compiler with X11/XTest development headers for the XRecord observer.
 """
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -101,7 +102,7 @@ def control_client(control):
     return call
 
 
-def drag_fixture(icon):
+def drag_fixture(icon, role="both", obstructed=False):
     import gi
 
     gi.require_version("Gtk", "3.0")
@@ -119,7 +120,8 @@ def drag_fixture(icon):
         surface.add(layout)
         return window, layout
 
-    separate = icon == "two-windows"
+    cross = role != "both"
+    separate = cross or icon == "two-windows"
     window, layout = make_window("AAD GTK drag source", "Trial drag surface",
                                  (270, 180) if separate else (680, 400))
     if separate:
@@ -150,17 +152,29 @@ def drag_fixture(icon):
     destination.add(placeholder)
     status = Gtk.Label(label="Placement source count 0")
     layout.put(status, 20 if separate else 232, 135 if separate else 335)
-    targets = [Gtk.TargetEntry.new("application/x-aad-trial-list-item", Gtk.TargetFlags.SAME_APP, 1)]
+    targets = [Gtk.TargetEntry.new("application/x-aad-trial-list-item",
+                                   0 if cross else Gtk.TargetFlags.SAME_APP, 1)]
     item.drag_source_set(Gdk.ModifierType.BUTTON1_MASK, targets, Gdk.DragAction.MOVE)
-    slot.drag_dest_set(Gtk.DestDefaults.ALL, targets, Gdk.DragAction.MOVE)
+    slot.drag_dest_set(Gtk.DestDefaults.MOTION | Gtk.DestDefaults.HIGHLIGHT, targets, Gdk.DragAction.MOVE)
     payload = b"aad-trial-item"
     placements = 0
     drops = 0
+    cover = None
 
     def begin(_item, context):
-        if icon != "default":
+        nonlocal cover
+        if icon != "default" and not cross:
             hotspot = -35 if separate else 0
             Gtk.drag_set_icon_widget(context, Gtk.Label(label="Moving trial row"), hotspot, hotspot)
+        if obstructed:
+            origin = item.get_window().get_origin()
+            cover = Gtk.Window(type=Gtk.WindowType.POPUP)
+            cover.set_default_size(100, 60)
+            if cross:
+                cover.move(origin.x + 20, origin.y - 150)
+            else:
+                cover.move(origin.x + 190, origin.y)
+            cover.show()
 
     def place():
         nonlocal placements
@@ -172,11 +186,18 @@ def drag_fixture(icon):
         status.set_text(f"Placement destination count {placements}")
         return False
 
+    def drop(widget, context, _x, _y, time_):
+        target = widget.drag_dest_find_target(context, None)
+        if target == Gdk.Atom.intern("NONE", False):
+            return False
+        widget.drag_get_data(context, target, time_)
+        return True
+
     def receive(_slot, context, _x, _y, data, _info, time_):
         nonlocal drops
         drops += 1
         accepted = data.get_data() == payload and row.get_parent() == source and drops == 1
-        Gtk.drag_finish(context, accepted, False, time_)
+        Gtk.drag_finish(context, accepted, accepted and cross, time_)
         if accepted:
             GLib.idle_add(place)
 
@@ -190,9 +211,13 @@ def drag_fixture(icon):
 
     item.connect("drag-begin", begin)
     item.connect("drag-data-get", lambda _, _ctx, data, _info, _time: data.set(data.get_target(), 8, payload))
+    if role == "source":
+        item.connect("drag-data-delete", lambda *_: source.remove(row))
+    slot.connect("drag-drop", drop)
     slot.connect("drag-data-received", receive)
-    window.show_all()
-    if separate:
+    if role != "destination":
+        window.show_all()
+    if separate and role != "source":
         target_window.show_all()
     GLib.io_add_watch(sys.stdin, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, read)
     Gtk.main()
@@ -212,72 +237,102 @@ def straight_drags(aad, recorder):
         call = control_client(control)
         try:
             assert "data" in call("capabilities")
-            for icon in ("default", "custom", "two-windows"):
-                with subprocess.Popen([sys.executable, __file__, "--drag-fixture", icon],
-                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as gtk:
-                    try:
+            for icon, cross, obstructed in (("default", False, False), ("custom", False, False),
+                                            ("two-windows", False, False), ("default", False, True),
+                                            ("default", True, False), ("default", True, True)):
+                case = "cross-process default" if cross else icon
+                if obstructed:
+                    case += " with cover"
+                with ExitStack() as fixtures:
+                    def start_fixture(role):
+                        gtk = fixtures.enter_context(subprocess.Popen(
+                            [sys.executable, __file__, "--drag-fixture", icon, role, str(int(obstructed))],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True))
+                        fixtures.callback(gtk.terminate)
+                        return gtk
+
+                    source = start_fixture("source" if cross else "both")
+                    target = start_fixture("destination") if cross else source
+
+                    def resource_for(gtk):
                         apps = lambda: [r for r in call("targets")["data"]["resources"]
                                         if r["metadata"].get("process_id") == gtk.pid]
-                        resource = try_until(apps, lambda rows: len(rows) == 1)[0]["resource_id"]
+                        return try_until(apps, lambda rows: len(rows) == 1)[0]["resource_id"]
 
-                        def observe():
-                            response = call("observe", resource_id=resource, view={"mode": "nodes"})
-                            assert not response.get("error") and not response["data"]["truncated"], response
-                            return {node["name"]: node for node in response["data"]["nodes"]}
+                    def observe(resource):
+                        response = call("observe", resource_id=resource, view={"mode": "nodes"})
+                        assert not response.get("error") and not response["data"]["truncated"], response
+                        return {node["name"]: node for node in response["data"]["nodes"]}
 
-                        nodes = observe()
-                        assert "Placement source count 0" in nodes
-                        surface = nodes["Trial drag surface"]
-                        destination = nodes.get("Trial destination surface", surface)
-                        start, end = (center(nodes[name]["bounds"]) for name in ("Trial list row", "Destination slot"))
+                    source_resource = resource_for(source)
+                    target_resource = resource_for(target) if cross else source_resource
+                    nodes = observe(source_resource)
+                    target_nodes = observe(target_resource) if cross else nodes
+                    assert "Placement source count 0" in nodes
+                    surface = nodes["Trial drag surface"]
+                    destination = target_nodes.get("Trial destination surface", surface)
+                    start = center(nodes["Trial list row"]["bounds"])
+                    end = center(target_nodes["Destination slot"]["bounds"])
 
-                        def fraction(node, point):
-                            b = node["bounds"]
-                            return {"fx": (point[0] - b["x"]) / b["width"],
-                                    "fy": (point[1] - b["y"]) / b["height"]}
+                    def fraction(node, point):
+                        b = node["bounds"]
+                        return {"fx": (point[0] - b["x"]) / b["width"],
+                                "fy": (point[1] - b["y"]) / b["height"]}
 
-                        with subprocess.Popen([recorder], stdout=subprocess.PIPE, text=True) as record:
-                            try:
-                                assert record.stdout.readline() == "ready\n", "XRecord setup failed"
-                                result = call("act", target=surface["target"],
-                                              action={"type": "drag", "to": destination["target"],
-                                                      "fraction": fraction(surface, start),
-                                                      "to_fraction": fraction(destination, end)})
-                                if result["effect"] == "not_applied":
-                                    record.terminate()
-                                output, _ = record.communicate(timeout=5)
-                            finally:
-                                if record.poll() is None:
-                                    record.kill()
-                        trace = [tuple(map(int, line.split())) for line in output.splitlines()]
-                        buttons = [e for e in trace if e[0] in (4, 5)]
-                        moves = [e for e in trace if e[0] == 6 and e[4] & 256]
-                        def receipt():
-                            gtk.stdin.write("read\n")
-                            gtk.stdin.flush()
-                            return json.loads(gtk.stdout.readline())
+                    with subprocess.Popen([recorder], stdout=subprocess.PIPE, text=True) as record:
+                        try:
+                            assert record.stdout.readline() == "ready\n", "XRecord setup failed"
+                            result = call("act", target=surface["target"],
+                                          action={"type": "drag", "to": destination["target"],
+                                                  "fraction": fraction(surface, start),
+                                                  "to_fraction": fraction(destination, end)})
+                            if result["effect"] == "not_applied":
+                                record.terminate()
+                            output, _ = record.communicate(timeout=5)
+                        finally:
+                            if record.poll() is None:
+                                record.kill()
+                    trace = [tuple(map(int, line.split())) for line in output.splitlines()]
+                    buttons = [e for e in trace if e[0] in (4, 5)]
+                    moves = [e for e in trace if e[0] == 6 and e[4] & 256]
+                    def receipt(gtk):
+                        gtk.stdin.write("read\n")
+                        gtk.stdin.flush()
+                        return json.loads(gtk.stdout.readline())
 
-                        print(f"GTK {icon}: effect={result['effect']}, moves={len(moves)}, buttons={buttons}", flush=True)
-                        if result["effect"] != "applied":
-                            print(f"GTK {icon} receipt: {receipt()}", flush=True)
-                        assert result["effect"] == "applied", result
-                        assert [(e[0], e[3]) for e in buttons] == [(4, 1), (5, 1)], trace
-                        assert len(moves) == 12 and moves[-1][1:3] == buttons[1][1:3], trace
-                        assert buttons[0][1:3] == start and buttons[1][1:3] == end, trace
-                        if icon == "two-windows":
-                            frame = nodes["AAD GTK drag source"]["bounds"]
-                            client = surface["bounds"]
-                            title_hits = [e[1:3] for e in moves[:-1] if contains(frame, e[1:3]) and e[2] < client["y"]]
-                            assert title_hits, (frame, client, moves)
-                            print(f"GTK two-windows: held moves through source title bar {title_hits}", flush=True)
-                        final = try_until(observe, lambda rows: "Placement destination count 1" in rows)
-                        assert contains(final["Destination slot"]["bounds"], center(final["Trial list row"]["bounds"]))
-                        assert receipt() == {
-                            "drops": 1, "placements": 1, "source": 0, "destination": True
-                        }
-                        print(f"PASS decorated GTK {icon}: 12 held moves, one drop and one placement", flush=True)
-                    finally:
-                        gtk.terminate()
+                    print(f"GTK {case}: effect={result['effect']}, moves={len(moves)}, buttons={buttons}", flush=True)
+                    if result["effect"] != "applied":
+                        error = result["error"]
+                        print(f"GTK {case}: {error['code']} {error['details'].get('helper_code', '')}; "
+                              f"receipt={receipt(target)}", flush=True)
+                    assert [(e[0], e[3]) for e in buttons] == [(4, 1), (5, 1)], trace
+                    if obstructed:
+                        assert result["effect"] == "unknown" and result.get("error"), result
+                        assert 0 < len(moves) < 12 and buttons[1][1:3] != end, trace
+                        assert receipt(target)["drops"] == 0 and receipt(source)["source"] == 1
+                        print(f"PASS decorated GTK {case}: stopped before destination and released", flush=True)
+                        continue
+                    assert result["effect"] == "applied", result
+                    assert len(moves) == 12 and moves[-1][1:3] == buttons[1][1:3], trace
+                    assert buttons[0][1:3] == start and buttons[1][1:3] == end, trace
+                    if icon == "two-windows":
+                        frame = nodes["AAD GTK drag source"]["bounds"]
+                        client = surface["bounds"]
+                        title_hits = [e[1:3] for e in moves[:-1] if contains(frame, e[1:3]) and e[2] < client["y"]]
+                        assert title_hits, (frame, client, moves)
+                        print(f"GTK two-windows: held moves through source title bar {title_hits}", flush=True)
+                    if not cross:
+                        final = try_until(lambda: observe(target_resource),
+                                          lambda rows: "Placement destination count 1" in rows)
+                    else:
+                        try_until(lambda: receipt(source), lambda data: data["source"] == 0)
+                        try_until(lambda: receipt(target), lambda data: data["placements"] == 1)
+                        final = observe(target_resource)
+                    assert contains(final["Destination slot"]["bounds"], center(final["Trial list row"]["bounds"]))
+                    assert receipt(target) == {
+                        "drops": 1, "placements": 1, "source": 0, "destination": True
+                    }
+                    print(f"PASS decorated GTK {case}: 12 held moves, one drop and one placement", flush=True)
         finally:
             control.terminate()
 
@@ -472,7 +527,7 @@ if __name__ == "__main__":
     if sys.argv[1] == "--fixture":
         fixture(sys.argv[2] == "decorated")
     elif sys.argv[1] == "--drag-fixture":
-        drag_fixture(sys.argv[2])
+        drag_fixture(sys.argv[2], sys.argv[3], sys.argv[4] == "1")
     elif sys.argv[1] == "--window-fixture":
         window_fixture()
     elif sys.argv[1] == "--private":

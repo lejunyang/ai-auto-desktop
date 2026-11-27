@@ -161,7 +161,7 @@ impl AtspiProvider {
             .as_ref()
             .map(|(r, id)| (r, id.as_str()))
             .unwrap_or((&fresh, id.as_str()));
-        self.validate_path_point(visible, visible_id, point, deadline)?;
+        self.validate_path_point(visible, visible_id, point, Some(&window.native), deadline)?;
         let process_id = process_id(&node, &fresh)?;
         Ok(PreparedEndpoint {
             record: fresh,

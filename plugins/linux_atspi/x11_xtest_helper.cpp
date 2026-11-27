@@ -232,14 +232,21 @@ bool FocusMatchesWindow(Display *, unsigned long, Atom, const std::optional<Wind
 bool PointMatchesWindow(Display *, int, int, unsigned long, Atom, const std::optional<WindowBinding> &);
 
 struct WindowGeometryProof;
-enum class StraightDragPoint { Source, Transit, Destination };
+enum class DragPhase { Source, Transit, Destination };
 
-class StraightDragHitTest {
+struct DragHit {
+    std::vector<Window> path;
+    bool matches = false;
+    std::optional<unsigned long> client_pid;
+};
+
+class DragHitTest {
 public:
-    explicit StraightDragHitTest(Display *display) : display_(display), root_(DefaultRootWindow(display)) {}
+    explicit DragHitTest(Display *display) : display_(display), root_(DefaultRootWindow(display)) {}
     bool Watch(Window source);
     void MarkPress() { press_serial_ = NextRequest(display_); }
-    bool Matches(int x, int y, const WindowGeometryProof &target, const WindowGeometryProof *other);
+    std::optional<DragHit> At(int x, int y, const WindowGeometryProof &source,
+                              const WindowGeometryProof &destination, DragPhase phase);
 
 private:
     bool UpdateWindows();
@@ -257,7 +264,7 @@ private:
 };
 
 bool StraightDragPointMatches(Display *, unsigned long, Atom, const WindowBinding &, const WindowBinding &,
-                              StraightDragHitTest &, int, int, StraightDragPoint);
+                              DragHitTest &, int, int, DragPhase);
 
 bool FocusBelongsToPid(Display *display, unsigned long expected_pid, Atom pid_atom) {
     Window focus = None;
@@ -738,7 +745,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         return !requires_focus || FocusMatchesWindow(display, expected_pid, pid_atom, binding);
     };
     const auto &end_binding = destination_binding ? destination_binding : binding;
-    StraightDragHitTest drag_hit(display);
+    DragHitTest drag_hit(display);
     auto point_matches = [&](int x, int y, const std::optional<WindowBinding> &window) {
         return WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom) &&
             (!window || PointMatchesWindow(display, x, y, expected_pid, pid_atom, window));
@@ -864,7 +871,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         submitted = ok && submitted;
         ++event_count;
     };
-    auto straight_drag_problem = [&](int x, int y, StraightDragPoint phase) -> std::string_view {
+    auto straight_drag_problem = [&](int x, int y, DragPhase phase) -> std::string_view {
         if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
         if (!destination_binding) return {};
         if (!submitted || g_x_error) return "x11_error";
@@ -881,7 +888,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         if (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid))) return "untrusted_process";
         if (command != "key-chord") {
             if (destination_binding) {
-                const auto problem = straight_drag_problem(request.x, request.y, StraightDragPoint::Source);
+                const auto problem = straight_drag_problem(request.x, request.y, DragPhase::Source);
                 if (!problem.empty()) return problem;
             } else if (!endpoints_match()) {
                 return "target_point_mismatch";
@@ -994,7 +1001,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                 for (int step = 1; step <= kSteps; ++step) {
                     const int x = request.x + (request.to_x - request.x) * step / kSteps;
                     const int y = request.y + (request.to_y - request.y) * step / kSteps;
-                    const auto phase = step == kSteps ? StraightDragPoint::Destination : StraightDragPoint::Transit;
+                    const auto phase = step == kSteps ? DragPhase::Destination : DragPhase::Transit;
                     if (const auto problem = straight_drag_problem(x, y, phase); !problem.empty()) {
                         return finish_failure(problem, "input_dispatch", kExitUnknownEffect);
                     }
@@ -1010,7 +1017,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                 }
                 if (destination_binding) {
                     const auto problem = straight_drag_problem(request.to_x, request.to_y,
-                                                               StraightDragPoint::Destination);
+                                                               DragPhase::Destination);
                     if (!problem.empty()) {
                         return finish_failure(problem, "drag_release", kExitUnknownEffect);
                     }
@@ -1646,7 +1653,7 @@ bool PointInClient(Display *display, int x, int y, Window client) {
     return false;
 }
 
-bool StraightDragHitTest::Watch(Window source) {
+bool DragHitTest::Watch(Window source) {
     resource_mask_ = ResourceMask(display_, XAllocID(display_)).value_or(0);
     source_owner_ = source & ~resource_mask_;
     window_type_ = XInternAtom(display_, "_NET_WM_WINDOW_TYPE", False);
@@ -1661,7 +1668,8 @@ bool StraightDragHitTest::Watch(Window source) {
     return !g_x_error;
 }
 
-bool StraightDragHitTest::UpdateWindows() {
+bool DragHitTest::UpdateWindows() {
+    if (!press_serial_) return true;
     XEvent event{};
     for (unsigned count = 0; XCheckWindowEvent(display_, root_, SubstructureNotifyMask, &event); ++count) {
         if (count == 4096) return false;
@@ -1678,9 +1686,10 @@ bool StraightDragHitTest::UpdateWindows() {
     return true;
 }
 
-bool StraightDragHitTest::IsDragIcon(Window window, const XWindowAttributes &attributes) const {
+bool DragHitTest::IsDragIcon(Window window, const XWindowAttributes &attributes) const {
     if (!resource_mask_ || (window & ~resource_mask_) != source_owner_ ||
-        !attributes.override_redirect || attributes.c_class != InputOutput || !mapped_.count(window)) return false;
+        !attributes.override_redirect || attributes.c_class != InputOutput ||
+        !created_.count(window) || !mapped_.count(window)) return false;
     const auto type = ReadProperty32(display_, window, window_type_, XA_ATOM, 8);
     if (!type) return false;
     if (!type->values.empty() && type->values.front() == dnd_type_) {
@@ -1691,14 +1700,14 @@ bool StraightDragHitTest::IsDragIcon(Window window, const XWindowAttributes &att
             return true;
         }
     }
-    if (!shape_input_ || !created_.count(window)) return false;
+    if (!shape_input_) return false;
     int count = -1, order = 0;
     XRectangle *rects = XShapeGetRectangles(display_, window, ShapeInput, &count, &order);
     if (rects) XFree(rects);
     return !g_x_error && count == 0;
 }
 
-std::optional<Window> StraightDragHitTest::UnderDragIcons(int x, int y) const {
+std::optional<Window> DragHitTest::UnderDragIcons(int x, int y) const {
     Window root = None, parent = None, *children = nullptr;
     unsigned count = 0;
     if (!XQueryTree(display_, root_, &root, &parent, &children, &count) || g_x_error ||
@@ -1748,55 +1757,59 @@ std::optional<Window> StraightDragHitTest::UnderDragIcons(int x, int y) const {
     return hit;
 }
 
-bool StraightDragBranchMatches(Display *display, int x, int y, Window branch,
-                               const WindowGeometryProof &proof, bool transit) {
-    if (branch == proof.client) return true;
-    if (proof.frames.empty() || branch != proof.frames.back().id) return false;
-    const auto &client = proof.client_bounds;
-    const bool in_client = x >= client.x && x < client.x + client.width &&
-                           y >= client.y && y < client.y + client.height;
-    const auto &wm = *proof.wm;
-    for (int depth = 0; depth < 64; ++depth) {
-        const auto child = PointChild(display, branch, x, y);
-        if (!child) return false;
-        if (*child == proof.client) return true;
-        // Cross-window transit can cross the title bar and borders of this
-        // proven frame. An unrelated child inside the frame still obstructs.
-        if (*child == None) return transit && !in_client;
-        if ((*child & ~wm.mask) != (wm.identity & ~wm.mask)) return false;
-        branch = *child;
+bool MatchDragEndpoint(DragHit &hit, int x, int y, const WindowGeometryProof &proof, bool transit) {
+    const Window branch = hit.path.front();
+    if (branch != proof.client && (proof.frames.empty() || branch != proof.frames.back().id)) return false;
+    for (const Window window : hit.path) {
+        if (window == proof.client) {
+            hit.client_pid = proof.pid;
+            return true;
+        }
+        const auto &wm = *proof.wm;
+        if ((window & ~wm.mask) != (wm.identity & ~wm.mask)) return false;
     }
-    return false;
+    // Only transit between distinct clients can cross a proven title bar or border.
+    const auto &client = proof.client_bounds;
+    return transit && (x < client.x || x >= client.x + client.width ||
+                       y < client.y || y >= client.y + client.height);
 }
 
-bool StraightDragHitTest::Matches(int x, int y, const WindowGeometryProof &target,
-                                  const WindowGeometryProof *other) {
+std::optional<DragHit> DragHitTest::At(int x, int y, const WindowGeometryProof &source,
+                                     const WindowGeometryProof &destination, DragPhase phase) {
     auto branch = PointChild(display_, root_, x, y);
     // The hit query drains map notifications for windows already on screen.
-    if (!branch || !UpdateWindows()) return false;
-    if (*branch != None) {
+    if (!branch || !UpdateWindows()) return std::nullopt;
+    if (created_.count(*branch)) {
         XWindowAttributes attributes{};
-        if (!XGetWindowAttributes(display_, *branch, &attributes) || g_x_error) return false;
+        if (!XGetWindowAttributes(display_, *branch, &attributes) || g_x_error) return std::nullopt;
         if (IsDragIcon(*branch, attributes)) branch = UnderDragIcons(x, y);
     }
-    if (!branch || g_x_error) return false;
-    if (*branch == None) return other != nullptr;
-    return StraightDragBranchMatches(display_, x, y, *branch, target, other != nullptr) ||
-        (other && !g_x_error && StraightDragBranchMatches(display_, x, y, *branch, *other, true));
+    if (!branch || g_x_error) return std::nullopt;
+    DragHit hit;
+    for (int depth = 0; *branch != None; ++depth) {
+        if (depth == 64) return std::nullopt;
+        hit.path.push_back(*branch);
+        branch = PointChild(display_, *branch, x, y);
+        if (!branch) return std::nullopt;
+    }
+    const bool transit = phase == DragPhase::Transit && source.client != destination.client;
+    if (hit.path.empty()) hit.matches = transit;
+    else if (phase == DragPhase::Source) hit.matches = MatchDragEndpoint(hit, x, y, source, false);
+    else hit.matches = MatchDragEndpoint(hit, x, y, destination, transit) ||
+        (transit && MatchDragEndpoint(hit, x, y, source, true));
+    return hit;
 }
 
 bool StraightDragPointMatches(Display *display, unsigned long pid, Atom pid_atom, const WindowBinding &source,
-                              const WindowBinding &destination, StraightDragHitTest &hit, int x, int y,
-                              StraightDragPoint phase) {
+                              const WindowBinding &destination, DragHitTest &hit, int x, int y, DragPhase phase) {
     if (!BoundClientViewable(display, pid, pid_atom, source.id) ||
         !BoundClientViewable(display, pid, pid_atom, destination.id)) return false;
     const auto wm = LoadEwmh(display);
     const auto source_proof = RecheckGeometryProof(wm, pid, source);
     const auto destination_proof = RecheckGeometryProof(wm, pid, destination);
     if (!source_proof || !destination_proof) return false;
-    if (phase == StraightDragPoint::Source) return hit.Matches(x, y, *source_proof, nullptr);
-    const bool crosses_windows = phase == StraightDragPoint::Transit && source.id != destination.id;
-    return hit.Matches(x, y, *destination_proof, crosses_windows ? &*source_proof : nullptr);
+    const auto point = hit.At(x, y, *source_proof, *destination_proof, phase);
+    return point && point->matches;
 }
 
 bool PointMatchesWindow(Display *display, int x, int y, unsigned long pid, Atom pid_atom,

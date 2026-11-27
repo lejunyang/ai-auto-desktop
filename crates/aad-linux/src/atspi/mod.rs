@@ -1664,7 +1664,13 @@ impl AtspiProvider {
                     .map(|(record, id)| (record, id.as_str()))
                     .unwrap_or((&now, id.as_str()));
                 for point in checked {
-                    validator.validate_path_point(visibility, visibility_id, *point, deadline)?;
+                    validator.validate_path_point(
+                        visibility,
+                        visibility_id,
+                        *point,
+                        None,
+                        deadline,
+                    )?;
                 }
                 remaining(deadline, false)?;
                 Ok(())
@@ -2208,6 +2214,7 @@ impl AtspiProvider {
         record: &Record,
         node_id: &str,
         point: (i32, i32),
+        native_hit_window: Option<&NativeRef>,
         deadline: Instant,
     ) -> Result<(), AutomationError> {
         self.validate_point(record, node_id, point, deadline)?;
@@ -2217,9 +2224,25 @@ impl AtspiProvider {
         // order is not assumed; this deliberately rejects uncertain overlaps.
         let allowed = descendants(record, node_id);
         let ancestors = ancestor_chain(record, node_id);
+        // Cross-resource drag proves top-level stacking in the X11 helper, which
+        // can distinguish an active drag icon from a window that intercepts input.
+        // AT-SPI still checks every covering branch inside the endpoint window.
+        let within_window = native_hit_window
+            .map(|window| {
+                ancestors
+                    .iter()
+                    .map(String::as_str)
+                    .find(|id| record.handles[*id] == *window)
+                    .map(|id| descendants(record, id))
+                    .ok_or_else(|| stale("drag endpoint window missing during hit validation"))
+            })
+            .transpose()?;
         for candidate in record.public["nodes"].as_array().expect("normalized nodes") {
             let id = candidate["node_id"].as_str().expect("normalized node id");
-            if allowed.contains(id)
+            if within_window
+                .as_ref()
+                .is_some_and(|nodes| !nodes.contains(id))
+                || allowed.contains(id)
                 || ancestors.iter().any(|ancestor| ancestor == id)
                 || candidate["states"]["visible"] == false
                 || candidate["states"]["showing"] == false

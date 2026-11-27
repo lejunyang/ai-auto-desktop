@@ -46,44 +46,24 @@ bool CrossManagedDesktop(const Ewmh &wm, Window window, Atom type_atom, Atom des
 
 using CrossGeometry = std::array<WindowGeometryProof, 2>;
 
-bool CrossPointAllowed(Display *display, int x, int y, const CrossEndpoint &source,
-                       const CrossEndpoint &destination, const Ewmh &wm, Atom type_atom, Atom desktop_atom,
-                       const CrossGeometry &geometry) {
-    Window current = DefaultRootWindow(display);
-    std::optional<unsigned long> allowed_pid;
-    const FrameOwner *frame_owner = nullptr;
-    for (int depth = 0; depth < 64; ++depth) {
-        Window child = None; int local_x = 0, local_y = 0;
-        g_x_error = false;
-        const bool translated = XTranslateCoordinates(display, DefaultRootWindow(display), current,
-                                                       x, y, &local_x, &local_y, &child) != 0;
-        XSync(display, False);
-        if (!translated || g_x_error) return false;
-        if (child == None) {
-            if (current == DefaultRootWindow(display)) return true;
-            if (!allowed_pid && frame_owner &&
-                (current & ~frame_owner->mask) == (frame_owner->identity & ~frame_owner->mask)) return true;
-            return allowed_pid.has_value() && WindowPid(display, current, wm.pid) == allowed_pid;
-        }
+bool CrossPointAllowed(DragHitTest &hit_test, int x, int y, DragPhase phase,
+                       const Ewmh &wm, Atom type_atom, Atom desktop_atom, const CrossGeometry &geometry) {
+    const auto hit = hit_test.At(x, y, geometry[0], geometry[1], phase);
+    if (!hit || (!hit->matches && phase != DragPhase::Transit)) return false;
+    auto allowed_pid = hit->client_pid;
+    for (const Window window : hit->path) {
         XWindowAttributes attributes{};
-        if (!XGetWindowAttributes(display, child, &attributes) || attributes.override_redirect) return false;
-        for (const auto &proof : geometry) {
-            if (proof.wm && std::any_of(proof.frames.begin(), proof.frames.end(),
-                                       [&](const FrameGeometry &frame) { return frame.id == child; })) {
-                frame_owner = &*proof.wm;
-            }
+        if (!XGetWindowAttributes(wm.display, window, &attributes) || g_x_error || attributes.override_redirect)
+            return false;
+        if (!hit->matches && !allowed_pid && CrossManagedDesktop(wm, window, type_atom, desktop_atom)) {
+            allowed_pid = OwnPid(wm.display, window, wm.pid);
         }
-        if (child == source.window.id) allowed_pid = source.pid;
-        else if (child == destination.window.id) allowed_pid = destination.pid;
-        else if (!allowed_pid.has_value() && CrossManagedDesktop(wm, child, type_atom, desktop_atom))
-            allowed_pid = OwnPid(display, child, wm.pid);
-        current = child;
     }
-    return false;
+    if (!allowed_pid) return hit->matches && !g_x_error;
+    return !g_x_error && WindowPid(wm.display, hit->path.back(), wm.pid) == allowed_pid;
 }
 
-std::string_view CrossRouteProof(Display *display, int from_x, int from_y, int to_x, int to_y,
-                                 const CrossEndpoint &source, const CrossEndpoint &destination,
+std::string_view CrossRouteProof(DragHitTest &hit_test, int from_x, int from_y, int to_x, int to_y,
                                  const Ewmh &wm, Atom type_atom, Atom desktop_atom,
                                  const CrossGeometry &geometry, std::uint64_t deadline) {
     const long long dx = static_cast<long long>(to_x) - from_x;
@@ -95,7 +75,7 @@ std::string_view CrossRouteProof(Display *display, int from_x, int from_y, int t
         const auto denominator = std::max(steps, 1LL);
         const int x = from_x + static_cast<int>(dx * index / denominator);
         const int y = from_y + static_cast<int>(dy * index / denominator);
-        if (!CrossPointAllowed(display, x, y, source, destination, wm, type_atom, desktop_atom,geometry))
+        if (!CrossPointAllowed(hit_test, x, y, DragPhase::Transit, wm, type_atom, desktop_atom, geometry))
             return "cross_drag_route_obstructed";
     }
     return {};
@@ -164,6 +144,7 @@ int RunDragBetween(int argc, char **argv) {
     const Atom type_atom=XInternAtom(display,"_NET_WM_WINDOW_TYPE",False);
     const Atom desktop_atom=XInternAtom(display,"_NET_WM_WINDOW_TYPE_DESKTOP",False);
     CrossGeometry geometry{};
+    DragHitTest hit_test(display);
     std::vector<KeyCode> modifier_codes, owned_modifiers;
     for (const auto &name:modifier_names) {
         const auto code=XKeysymToKeycode(display,name=="meta"?XK_Super_L:KeyNamed(name));
@@ -182,18 +163,21 @@ int RunDragBetween(int argc, char **argv) {
         release(); XCloseDisplay(display); EmitError(reason,phase,dispatched);
         return dispatched?kExitUnknownEffect:kExitTargetMismatch;
     };
+    auto hit_allowed = [&](int x, int y, DragPhase phase) {
+        return CrossPointAllowed(hit_test, x, y, phase, wm, type_atom, desktop_atom, geometry);
+    };
     auto verify=[&]() -> std::string_view {
         if (DeadlineExpired(*deadline)) return "deadline_exceeded";
         auto source_geometry = CrossWindowGeometry(wm, source);
         auto destination_geometry = CrossWindowGeometry(wm, destination);
         if (!source_geometry || !destination_geometry) return "target_window_changed";
         geometry = {std::move(*source_geometry), std::move(*destination_geometry)};
-        if (!PointInClient(display, source.x, source.y, source.window.id) ||
-            !PointInClient(display, destination.x, destination.y, destination.window.id)) return "target_point_mismatch";
+        if (!hit_allowed(source.x, source.y, DragPhase::Source) ||
+            !hit_allowed(destination.x, destination.y, DragPhase::Destination)) return "target_point_mismatch";
         if (!modifier_codes.empty() && (!FocusBelongsToPid(display, source.pid, wm.pid) ||
                                         !FocusInClient(display, source.window.id))) return "focus_owner_changed";
-        if (!CrossPointAllowed(display,current_x,current_y,source,destination,wm,type_atom,desktop_atom,geometry)) return "cross_drag_route_obstructed";
         if (owned_button) {
+            if (!hit_allowed(current_x, current_y, DragPhase::Transit)) return "cross_drag_route_obstructed";
             Window root=None,child=None; int rx=0,ry=0,wx=0,wy=0; unsigned mask=0;
             if (!XQueryPointer(display,DefaultRootWindow(display),&root,&child,&rx,&ry,&wx,&wy,&mask)
                 || rx!=current_x||ry!=current_y) return "pointer_position_changed";
@@ -210,11 +194,12 @@ int RunDragBetween(int argc, char **argv) {
     };
     if (const auto problem=verify();!problem.empty()) return fail(problem,"target_preflight");
     if (!unheld()) return fail("input_already_held","input_preflight");
-    if (const auto problem=CrossRouteProof(display,source.x,source.y,destination.x,destination.y,
-        source,destination,wm,type_atom,desktop_atom,geometry,*deadline);!problem.empty()) return fail(problem,"route_preflight");
+    if (const auto problem=CrossRouteProof(hit_test,source.x,source.y,destination.x,destination.y,
+        wm,type_atom,desktop_atom,geometry,*deadline);!problem.empty()) return fail(problem,"route_preflight");
     if (const auto problem=ValidatePathSegment(request,0,*deadline,verify);!problem.empty()) return fail(problem,"path_validation");
     if (!unheld()) return fail("input_already_held","input_preflight");
     if (const auto problem=verify();!problem.empty()) return fail(problem,"target_preflight");
+    if (!hit_test.Watch(source.window.id)) return fail("x11_error","target_preflight");
     std::cout << "{\"event\":\"dispatch_started\"}" << std::endl; dispatched=true;
     auto send=[&](bool ok) { ++event_count; XSync(display,False); return ok&&!g_x_error; };
     g_x_error=false;
@@ -230,6 +215,7 @@ int RunDragBetween(int argc, char **argv) {
     if (!unheld(true)) return fail("input_already_held","button_preflight");
     if (const auto problem=verify();!problem.empty()) return fail(problem,"source_dispatch");
     g_x_error=false;
+    hit_test.MarkPress();
     owned_button=true;
     if (!send(XTestFakeButtonEvent(display,*button,True,1)!=0)) return fail("x11_error","source_dispatch");
     const auto hold_until=std::chrono::steady_clock::now()+std::chrono::milliseconds(*hold_ms);
@@ -241,7 +227,7 @@ int RunDragBetween(int argc, char **argv) {
         if(const auto problem=ValidatePathSegment(request,segment+2,*deadline,verify);!problem.empty()) return fail(problem,"path_validation");
         const int x=source.x+static_cast<int>((static_cast<long long>(destination.x)-source.x)*segment/kCrossDragSegments);
         const int y=source.y+static_cast<int>((static_cast<long long>(destination.y)-source.y)*segment/kCrossDragSegments);
-        if(const auto problem=CrossRouteProof(display,current_x,current_y,x,y,source,destination,wm,type_atom,desktop_atom,geometry,*deadline);!problem.empty()) return fail(problem,"route_validation");
+        if(const auto problem=CrossRouteProof(hit_test,current_x,current_y,x,y,wm,type_atom,desktop_atom,geometry,*deadline);!problem.empty()) return fail(problem,"route_validation");
         if(const auto problem=verify();!problem.empty()) return fail(problem,"pointer_dispatch");
         g_x_error=false;
         if (!send(XTestFakeMotionEvent(display,-1,x,y,1)!=0)) return fail("x11_error","pointer_dispatch");

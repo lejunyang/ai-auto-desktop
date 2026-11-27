@@ -118,8 +118,9 @@ X11 窗口/PID/几何/命中。Rust 只读 worker 不占主循环；AX 调用阻
 普通 X11 直线拖拽要求 helper 同时声明 `anchored-straight-drag` 和 `window-geometry-proof-v1`，
 并携带起终点冻结的窗口几何证明。helper 在首次派发、按下、停留、每段移动和释放时复核两端的身份和几何，
 按当前阶段核对鼠标落点的顶层命中。同应用双窗之间的中间段可以经过根窗口空白和两端已证明的 WM 外框，
-按下和释放分别要求命中源和目标客户区。按下后映射的 `_NET_WM_WINDOW_TYPE_DND` 图标由活跃 XDND 选择的
-X 客户端持有时可以跳过。同源新建的 override-redirect 临时窗需要输入形状为空。helper 仍检查图标下方的真实遮挡。
+按下和释放分别要求命中源和目标客户区。只检查源 X 客户端在按下后新建并映射的 override-redirect 临时窗。
+可跳过的窗口须有空输入形状，或标为 `_NET_WM_WINDOW_TYPE_DND` 并有同源的活跃 `XdndSelection`。
+helper 跳过这些图标后仍检查下方的真实遮挡。
 修饰键额外要求源窗口焦点。派发后发现端点失效会停止移动，
 释放本次按下的按钮，并返回 `DRIVER.POINT_NOT_PROVEN` 和 `unknown`。缺少能力时直线拖拽在输入前
 返回 `DRIVER.HELPER_INCOMPATIBLE`，需同时升级 aad 和 helper。
@@ -138,8 +139,10 @@ snapshot/revision/locator、scope 授权与输入租约。
 
 跨资源拖拽不接受非空 `path`；内部直线最大轴距离为 4096 屏幕像素，分 12 次移动。
 每段逐像素检查所经窗口，仅允许两端 client、X 根、已核实同用户桌面和两端可信 WM frame。
+与同应用直线拖拽共用 X11 命中检查，穿过源 X 客户端在本次按下后新建并映射的已核实拖拽图标，
+继续检查图标下方的窗口。AT-SPI 复核两端窗口内的覆盖分支，顶层窗口的叠放顺序由 X11 检查。
 frame 必须为端点的真实祖先、与 WM check 窗口属于同一 X 客户端，且每侧外扩不超过 64 像素；
-未知装饰、外部应用、弹窗和 override-redirect 覆盖均保守拒绝。down/up 只能发生在端点 client。
+未知装饰、外部应用和其余 override-redirect 覆盖均保守拒绝。down/up 只能发生在端点 client。
 带修饰键时保持源窗口键盘焦点要求；不隐式切换到目标窗口。已有或等待期间新按下的外部键鼠不接管。
 
 ## 截图、OCR、窗口、粘贴、剪贴板与全局快捷键
