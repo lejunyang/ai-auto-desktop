@@ -6,6 +6,7 @@
 #include <X11/Xproto.h>
 #include <X11/extensions/XTest.h>
 #include <X11/extensions/record.h>
+#include <X11/extensions/shape.h>
 
 #include <algorithm>
 #include <array>
@@ -228,6 +229,27 @@ struct WindowBinding {
 };
 bool FocusMatchesWindow(Display *, unsigned long, Atom, const std::optional<WindowBinding> &);
 bool PointMatchesWindow(Display *, int, int, unsigned long, Atom, const std::optional<WindowBinding> &);
+bool WindowBindingMatches(Display *, unsigned long, Atom, const WindowBinding &, int);
+
+class StraightDragHitTest {
+public:
+    explicit StraightDragHitTest(Display *display) : display_(display), root_(DefaultRootWindow(display)) {}
+    bool Watch(Window source);
+    void MarkPress() { press_serial_ = NextRequest(display_); }
+    bool Matches(int x, int y, Window target, Window other = None, bool allow_gap = false);
+
+private:
+    bool IsDragIcon(Window window, const XWindowAttributes &attributes) const;
+    std::optional<Window> UnderDragIcons(int x, int y) const;
+
+    Display *display_;
+    Window root_;
+    XID source_owner_ = 0, resource_mask_ = 0;
+    Atom window_type_ = None, dnd_type_ = None, dnd_selection_ = None;
+    unsigned long press_serial_ = 0;
+    bool shape_input_ = false;
+    std::vector<Window> created_, mapped_;
+};
 
 bool FocusBelongsToPid(Display *display, unsigned long expected_pid, Atom pid_atom) {
     Window focus = None;
@@ -708,6 +730,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         return !requires_focus || FocusMatchesWindow(display, expected_pid, pid_atom, binding);
     };
     const auto &end_binding = destination_binding ? destination_binding : binding;
+    StraightDragHitTest drag_hit(display);
     auto point_matches = [&](int x, int y, const std::optional<WindowBinding> &window) {
         return WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom) &&
             (!window || PointMatchesWindow(display, x, y, expected_pid, pid_atom, window));
@@ -833,6 +856,18 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         submitted = ok && submitted;
         ++event_count;
     };
+    auto straight_drag_problem = [&](int x, int y, Window target, Window other = None,
+                                     bool allow_gap = false) -> std::string_view {
+        if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
+        if (!destination_binding) return {};
+        if (!submitted || g_x_error) return "x11_error";
+        if (!PidBelongsToCurrentUser(expected_pid)) return "untrusted_process";
+        if (!WindowBindingMatches(display, expected_pid, pid_atom, *binding, 0) ||
+            !WindowBindingMatches(display, expected_pid, pid_atom, *destination_binding, 0) ||
+            !drag_hit.Matches(x, y, target, other, allow_gap)) return "drag_endpoint_changed";
+        if (!focus_matches()) return "focus_owner_changed";
+        return {};
+    };
     // A hold is one bounded transaction. Recheck live ownership while down;
     // cleanup releases only inputs this transaction pressed, even after loss.
     auto hold_problem = [&]() -> std::string_view {
@@ -840,21 +875,16 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
         if (!submitted || g_x_error) return "x11_error";
         if (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid))) return "untrusted_process";
         if (command != "key-chord") {
-            if (!endpoints_match()) {
-                return destination_binding ? "drag_endpoint_changed" : "target_point_mismatch";
+            if (destination_binding) {
+                const auto problem = straight_drag_problem(request.x, request.y, binding->id);
+                if (!problem.empty()) return problem;
+            } else if (!endpoints_match()) {
+                return "target_point_mismatch";
             }
             if (!pointer_at(request.x, request.y)) return "pointer_position_changed";
         }
         if (!focus_matches()) return "focus_owner_changed";
         if (!submitted || g_x_error) return "x11_error";
-        return {};
-    };
-    auto straight_drag_problem = [&]() -> std::string_view {
-        if (DeadlineExpired(deadline_ns)) return "deadline_exceeded";
-        if (!destination_binding) return {};
-        if (!submitted || g_x_error) return "x11_error";
-        if (!endpoints_match()) return "drag_endpoint_changed";
-        if (!focus_matches()) return "focus_owner_changed";
         return {};
     };
     auto hold = [&]() -> std::string_view {
@@ -915,12 +945,16 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
             if (DeadlineExpired(deadline_ns)) {
                 return finish_failure("deadline_exceeded", "input_dispatch", kExitUnknownEffect);
             }
+            if (destination_binding && !drag_hit.Watch(binding->id)) {
+                return finish_failure("x11_error", "button_dispatch", kExitTargetMismatch);
+            }
             if (binding && (!endpoints_match() || !pointer_at(request.x, request.y))) {
                 return finish_failure("target_point_mismatch", "button_dispatch", kExitTargetMismatch);
             }
             if (!focus_matches()) {
                 return finish_failure("focus_owner_changed", "button_dispatch", kExitTargetMismatch);
             }
+            if (destination_binding) drag_hit.MarkPress();
             button_pressed = true;
             submit(XTestFakeButtonEvent(display, request.button, True, 1) != 0);
             XSync(display, False);
@@ -952,15 +986,18 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                 // Glide in steps: many toolkits only start a drag after the
                 // pointer has moved a few pixels with the button held.
                 constexpr int kSteps = 12;
+                const Window destination = destination_binding ? destination_binding->id : None;
+                const Window source = destination_binding ? binding->id : None;
                 for (int step = 1; step <= kSteps; ++step) {
-                    if (const auto problem = straight_drag_problem(); !problem.empty()) {
-                        return finish_failure(problem, "input_dispatch", kExitUnknownEffect);
-                    }
                     const int x = request.x + (request.to_x - request.x) * step / kSteps;
                     const int y = request.y + (request.to_y - request.y) * step / kSteps;
-                    if (request.hold_ms != 0 &&
+                    const bool intermediate = step < kSteps && source != destination;
+                    const auto problem = straight_drag_problem(x, y, destination,
+                        intermediate ? source : None, intermediate);
+                    if (!problem.empty()) return finish_failure(problem, "input_dispatch", kExitUnknownEffect);
+                    if (!destination_binding && request.hold_ms != 0 &&
                         (!PidBelongsToCurrentUser(static_cast<unsigned long>(expected_pid)) ||
-                         (!destination_binding && !focus_matches()) ||
+                         !focus_matches() ||
                          !WindowAtPointBelongsToPid(display, x, y, expected_pid, pid_atom))) {
                         return finish_failure("target_changed", "input_dispatch", kExitUnknownEffect);
                     }
@@ -969,7 +1006,7 @@ int RunGesture(Display *display, std::string_view command, const GestureRequest 
                     SleepUntilOrDeadline(15, deadline_ns);
                 }
                 if (destination_binding) {
-                    if (const auto problem = straight_drag_problem(); !problem.empty()) {
+                    if (const auto problem = straight_drag_problem(request.to_x, request.to_y, destination); !problem.empty()) {
                         return finish_failure(problem, "drag_release", kExitUnknownEffect);
                     }
                     if (!pointer_at(request.to_x, request.to_y)) {
@@ -1582,18 +1619,133 @@ bool FocusMatchesWindow(Display *display, unsigned long pid, Atom pid_atom,
                       FocusInClient(display, binding->id)));
 }
 
-bool PointInClient(Display *display, int x, int y, Window client) {
-    Window current = DefaultRootWindow(display);
+std::optional<Window> PointChild(Display *display, Window parent, int x, int y) {
+    Window child = None; int local_x = 0, local_y = 0;
+    g_x_error = false;
+    const bool ok = XTranslateCoordinates(display, DefaultRootWindow(display), parent, x, y,
+                                          &local_x, &local_y, &child) != 0;
+    XSync(display, False);
+    if (!ok || g_x_error) return std::nullopt;
+    return child;
+}
+
+bool PointInClientBranch(Display *display, int x, int y, Window client, Window current) {
+    if (current == client) return true;
     for (int depth = 0; depth < 64; ++depth) {
-        Window child = None; int local_x = 0, local_y = 0;
-        g_x_error = false;
-        const bool ok = XTranslateCoordinates(display, DefaultRootWindow(display), current, x, y, &local_x, &local_y, &child) != 0;
-        XSync(display, False);
-        if (!ok || g_x_error || child == None) return false;
-        if (child == client) return true;
-        current = child;
+        const auto child = PointChild(display, current, x, y);
+        if (!child || *child == None) return false;
+        if (*child == client) return true;
+        current = *child;
     }
     return false;
+}
+
+bool PointInClient(Display *display, int x, int y, Window client) {
+    return PointInClientBranch(display, x, y, client, DefaultRootWindow(display));
+}
+
+bool StraightDragHitTest::Watch(Window source) {
+    resource_mask_ = ResourceMask(display_, XAllocID(display_)).value_or(0);
+    source_owner_ = source & ~resource_mask_;
+    window_type_ = XInternAtom(display_, "_NET_WM_WINDOW_TYPE", False);
+    dnd_type_ = XInternAtom(display_, "_NET_WM_WINDOW_TYPE_DND", False);
+    dnd_selection_ = XInternAtom(display_, "XdndSelection", False);
+    int major = 0, minor = 0;
+    shape_input_ = XShapeQueryVersion(display_, &major, &minor) &&
+        (major > 1 || (major == 1 && minor >= 1));
+    g_x_error = false;
+    XSelectInput(display_, root_, SubstructureNotifyMask);
+    XSync(display_, False);
+    return !g_x_error;
+}
+
+bool StraightDragHitTest::IsDragIcon(Window window, const XWindowAttributes &attributes) const {
+    if (!resource_mask_ || (window & ~resource_mask_) != source_owner_ ||
+        !attributes.override_redirect || attributes.c_class != InputOutput ||
+        std::find(mapped_.begin(), mapped_.end(), window) == mapped_.end()) return false;
+    const auto type = ReadProperty32(display_, window, window_type_, XA_ATOM, 8);
+    if (!type) return false;
+    if (!type->values.empty() && type->values.front() == dnd_type_) {
+        // GTK's XDND icon can have a nonempty input shape. Its source must
+        // own the live drag selection; the icon is only the visual proxy.
+        const Window selection_owner = XGetSelectionOwner(display_, dnd_selection_);
+        if (selection_owner != None && selection_owner != window &&
+            (selection_owner & ~resource_mask_) == source_owner_) return true;
+    }
+    if (!shape_input_ || std::find(created_.begin(), created_.end(), window) == created_.end()) {
+        return false;
+    }
+    int count = -1, order = 0;
+    XRectangle *rects = XShapeGetRectangles(display_, window, ShapeInput, &count, &order);
+    if (rects) XFree(rects);
+    return !g_x_error && count == 0;
+}
+
+std::optional<Window> StraightDragHitTest::UnderDragIcons(int x, int y) const {
+    Window root = None, parent = None, *children = nullptr;
+    unsigned count = 0;
+    if (!XQueryTree(display_, root_, &root, &parent, &children, &count) || g_x_error ||
+        root != root_ || count > 4096) {
+        if (children) XFree(children);
+        return std::nullopt;
+    }
+    std::optional<Window> hit = None;
+    while (count > 0) {
+        const Window window = children[--count]; // XQueryTree lists bottom to top.
+        XWindowAttributes attributes{};
+        if (!XGetWindowAttributes(display_, window, &attributes) || g_x_error) {
+            hit.reset();
+            break;
+        }
+        if (attributes.map_state != IsViewable) continue;
+        const auto local_x = static_cast<long long>(x) - attributes.x - attributes.border_width;
+        const auto local_y = static_cast<long long>(y) - attributes.y - attributes.border_width;
+        if (local_x < -attributes.border_width || local_y < -attributes.border_width ||
+            local_x >= attributes.width + attributes.border_width ||
+            local_y >= attributes.height + attributes.border_width) continue;
+        if (shape_input_) {
+            int count_rects = -1, order = 0;
+            XRectangle *rects = XShapeGetRectangles(display_, window, ShapeBounding, &count_rects, &order);
+            const bool contains = rects && std::any_of(rects, rects + count_rects, [&](const XRectangle &rect) {
+                return local_x >= rect.x && local_y >= rect.y &&
+                    local_x < rect.x + rect.width && local_y < rect.y + rect.height;
+            });
+            if (rects) XFree(rects);
+            if (g_x_error || count_rects < 0) {
+                hit.reset();
+                break;
+            }
+            if (!contains) continue;
+        }
+        if (IsDragIcon(window, attributes)) continue;
+        hit = window;
+        break;
+    }
+    if (children) XFree(children);
+    return hit;
+}
+
+bool StraightDragHitTest::Matches(int x, int y, Window target, Window other, bool allow_gap) {
+    XEvent event{};
+    for (unsigned count = 0; XCheckWindowEvent(display_, root_, SubstructureNotifyMask, &event); ++count) {
+        if (count == 4096) return false;
+        if (event.xany.send_event || event.xany.serial < press_serial_) continue;
+        if (event.type == MapNotify || event.type == CreateNotify) {
+            auto &windows = event.type == MapNotify ? mapped_ : created_;
+            if (windows.size() == 4096) return false;
+            windows.push_back(event.type == MapNotify ? event.xmap.window : event.xcreatewindow.window);
+        }
+    }
+    auto branch = PointChild(display_, root_, x, y);
+    if (branch && *branch != None) {
+        XWindowAttributes attributes{};
+        if (!XGetWindowAttributes(display_, *branch, &attributes) || g_x_error) return false;
+        if (IsDragIcon(*branch, attributes)) branch = UnderDragIcons(x, y);
+    }
+    if (!branch || g_x_error) return false;
+    if (*branch == None) return allow_gap;
+    return PointInClientBranch(display_, x, y, target, *branch) ||
+        (other != None && PointInClientBranch(display_, x, y, other, *branch));
 }
 
 bool PointMatchesWindow(Display *display, int x, int y, unsigned long pid, Atom pid_atom,
