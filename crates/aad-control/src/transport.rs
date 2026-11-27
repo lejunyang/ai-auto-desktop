@@ -422,7 +422,7 @@ impl RemoteClient {
             let hello = read_response(&mut input)
                 .map_err(HandshakeError::Read)
                 .and_then(|response| validate_handshake(response, &request.request_id));
-            let established = hello.is_ok();
+            let established = hello.as_ref().is_ok_and(|response| !terminal(response));
             let _ = startup.send(hello);
             drop(startup);
             if established {
