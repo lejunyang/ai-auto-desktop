@@ -110,6 +110,40 @@ struct FrameOwner {
 
 std::optional<XID> ResourceMask(Display *display, Window own_window);
 
+std::optional<unsigned long> ReadLocalClientPid(Display *dpy, Window window, XID resource_mask) {
+    int opcode = 0, event = 0, error = 0;
+    if (!XQueryExtension(dpy, XRES_NAME, &opcode, &event, &error)) return std::nullopt;
+
+    // Use the same connection as geometry checks, which can hold a server grab.
+    LockDisplay(dpy);
+    xXResQueryClientIdsReq *request = nullptr;
+    GetReqExtra(XResQueryClientIds, sz_xXResClientIdSpec, request);
+    request->reqType = opcode;
+    request->XResReqType = X_XResQueryClientIds;
+    request->numSpecs = 1;
+    auto *spec = reinterpret_cast<xXResClientIdSpec *>(request + 1);
+    *spec = {static_cast<CARD32>(window), X_XResLocalClientPIDMask};
+
+    xXResQueryClientIdsReply reply{};
+    std::array<CARD32, 4> value{};
+    g_x_error = false;
+    bool received = false;
+    if (_XReply(dpy, reinterpret_cast<xReply *>(&reply), 0, False)) {
+        if (reply.numIds == 1 && reply.length == value.size()) {
+            received = _XRead(dpy, reinterpret_cast<char *>(value.data()), sizeof(value)) == 0;
+        } else {
+            _XEatDataWords(dpy, reply.length);
+        }
+    }
+    UnlockDisplay(dpy);
+    SyncHandle();
+
+    const auto [client, kind, bytes, pid] = value;
+    if (!received || g_x_error || (client & ~resource_mask) != (window & ~resource_mask) ||
+        kind != X_XResLocalClientPIDMask || bytes != sizeof(pid)) return std::nullopt;
+    return pid;
+}
+
 std::optional<FrameOwner> ReadFrameOwner(const Ewmh &ewmh) {
     if (!ewmh.present) return std::nullopt;
     Display *display = ewmh.display;
@@ -121,13 +155,14 @@ std::optional<FrameOwner> ReadFrameOwner(const Ewmh &ewmh) {
     const Window window = identity->values[0];
     const auto repeated = ReadProperty32(display, window, check, XA_WINDOW, 1);
     if (!repeated || repeated->values != identity->values) return std::nullopt;
-    const auto pid = ReadProperty32(display, window, ewmh.pid, XA_CARDINAL, 1);
-    if (!pid || pid->values.size() != 1 || !PidBelongsToCurrentUser(pid->values[0])) {
-        return std::nullopt;
-    }
+    const auto property = ReadProperty32(display, window, ewmh.pid, XA_CARDINAL, 1);
+    if (!property || (property->present && property->values.size() != 1)) return std::nullopt;
     const auto mask = ResourceMask(display, XAllocID(display));
     if (!mask || !ValidXid(*mask)) return std::nullopt;
-    return FrameOwner{window, pid->values[0], *mask};
+    const auto pid = property->present ? std::optional{property->values[0]} :
+        ReadLocalClientPid(display, window, *mask);
+    if (!pid || !PidBelongsToCurrentUser(*pid)) return std::nullopt;
+    return FrameOwner{window, *pid, *mask};
 }
 
 using FrameExtents = std::array<long long, 4>;

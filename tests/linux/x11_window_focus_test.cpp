@@ -313,6 +313,18 @@ int main() {
         const auto decorated_result = decorated_key(wire_proof);
         RequireWindow(decorated_result.code == 0 && decorated_result.presses == 1 &&
                       decorated_result.releases == 1, "frozen decoration did not allow bound input");
+        const unsigned long invalid_wm_pid = 0;
+        property(wm, identity, pid_atom, XA_CARDINAL, &invalid_wm_pid, 1);
+        XSync(wm, False);
+        RequireWindow(!geometry_proof(outer), "invalid WM PID was accepted");
+        XDeleteProperty(wm, identity, pid_atom);
+        XSync(wm, False);
+        const auto xres_proof = geometry_proof(outer);
+        RequireWindow(xres_proof && GeometryProofJson(*xres_proof) == wire_proof,
+                      "XRes did not prove the local WM client when its PID property was absent");
+        const auto xres_result = decorated_key(wire_proof);
+        RequireWindow(xres_result.code == 0 && xres_result.presses == 1 &&
+                      xres_result.releases == 1, "XRes-proven decoration did not allow bound input");
         auto denied = [&](const Result &result, const char *message) {
             RequireWindow(result.code == kExitTargetMismatch && result.presses == 0 &&
                           result.releases == 0 && released(), message);
@@ -400,7 +412,7 @@ int main() {
                                          std::to_string(target) + ",\"released\":true") != std::string::npos,
                       "last Return closed the window but typing did not report complete dispatch");
         XCloseDisplay(display);
-        std::cout << "PASS: strict window binding, atomic key cleanup, text ACK and 32-bit event barrier, mapping and hold cleanup, and decorated geometry proof\n";
+        std::cout << "PASS: strict window binding, atomic key cleanup, text ACK and 32-bit event barrier, mapping and hold cleanup, and decorated geometry proof with WM PID or XRes\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "FAIL: " << error.what() << '\n'; return 1;

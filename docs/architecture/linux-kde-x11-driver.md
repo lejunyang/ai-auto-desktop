@@ -81,7 +81,9 @@ selection 协议访问（见下文）。观察前通过无输入的 `describe` �
 `window-geometry-proof-v1`。Linux 观察按结构父链
 记录顶层窗口。helper 将 AT-SPI 顶层范围与同 PID 的 X11 客户区和可信窗口管理器外框比较，
 在两类候选的并集中确认唯一 client。初次比较要求宽高相等，原点各轴最多相差 2 px。外框必须
-是 EWMH 窗口管理器实际拥有的客户窗口祖先，每边最多外扩 64 px。`_NET_FRAME_EXTENTS` 存在时
+是 EWMH 窗口管理器实际拥有的客户窗口祖先，每边最多外扩 64 px。窗口管理器的检查窗口未提供
+`_NET_WM_PID` 时，通过 XRes 读取该窗口所属 X client 的本地 PID，仍要求进程与 helper 同用户。
+`_NET_FRAME_EXTENTS` 存在时
 须与实际外扩一致。Qt 坐标校准继续使用客户区。
 
 观察私有保存 client、实测客户区和外框链。键盘、粘贴、带修饰键的指针动作、直线与分段拖拽和
