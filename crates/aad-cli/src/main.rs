@@ -71,8 +71,11 @@ enum Command {
     ///
     /// Compare `digest` between captures to tell whether what it shows changed.
     ///
-    /// Available for browser pages and desktop windows on Windows, Linux X11, and
-    /// macOS when the provider supports capture. macOS requires Screen Recording permission.
+    /// Browser page capture is available when the browser provider supports it.
+    /// Desktop window capture is available on Windows, Linux X11, and macOS.
+    ///
+    /// Capturing desktop windows on macOS requires Screen Recording permission
+    /// for MacOSAXHelper.app.
     ///
     /// Linux desktop capture requires an X11 session and a screenshot helper. Linux
     /// release packages include `aad-linux-capture-helper` alongside `aad`. For a
