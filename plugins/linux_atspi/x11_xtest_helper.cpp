@@ -350,8 +350,10 @@ struct KeyboardEventBarrier {
 std::string_view FinishTextStroke(const std::optional<KeyboardEventBarrier> &barrier, bool more,
                                   Display *display, unsigned long pid, Atom pid_atom,
                                   const std::optional<WindowBinding> &binding, std::uint64_t deadline_ns) {
+    // The last stroke can close the target. A reply only gates the next stroke.
+    if (!more) return DeadlineExpired(deadline_ns) ? "deadline_exceeded" : "";
     if (!barrier) {
-        if (more) usleep(kTextStrokeGapUs);
+        usleep(kTextStrokeGapUs);
         return {};
     }
     const auto problem = barrier->Wait(deadline_ns);

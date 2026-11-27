@@ -119,6 +119,13 @@ def fixture(role, state_file):
         event(kind, target=tag)
         return False
 
+    def submit(entry):
+        if json.loads(state_file.read_text()).get("submit_on_return"):
+            value = entry.get_text()
+            window.destroy()
+            Gdk.Display.get_default().sync()
+            event("submitted_and_closed", value=value)
+
     for tag in (["Target entry", "Sibling entry"] if owner else ["Sink entry"]):
         entry = Gtk.Entry()
         entries[tag] = entry
@@ -129,6 +136,9 @@ def fixture(role, state_file):
         entry.connect("focus-in-event", focus_event, tag, "focus_in")
         entry.connect("focus-out-event", focus_event, tag, "focus_out")
         box.pack_start(entry, False, False, 0)
+    if owner:
+        entries["Target entry"].connect("activate", submit)
+
     def monitor_case():
         nonlocal current_case
         case = json.loads(state_file.read_text())["case"]
@@ -328,9 +338,10 @@ def trial(aad, helper, out, baseline, scenario):
             return {node["name"]: node for node in observed_nodes()
                     if node.get("name") in {"Target entry", "Sibling entry"}}
 
-        def run(case, action, target=None, timeout_ms=10000, before_reply=None, **switch):
+        def run(case, action, target=None, timeout_ms=10000, before_reply=None, submit_on_return=False,
+                **switch):
             x.focus(fixtures["owner"]["xid"])
-            set_case(case, **switch)
+            set_case(case, submit_on_return=submit_on_return, **switch)
             until(lambda: all(any(r["kind"] == "reset" for r in rows(role, case))
                               for role in events), f"{case} reset")
             if target is None:
@@ -342,7 +353,12 @@ def trial(aad, helper, out, baseline, scenario):
                 before_reply(case, pending)
             reply = mcp.recv(pending)
             elapsed_ms = (time.monotonic_ns() - start) / 1e6
-            values = {name: node.get("value") for name, node in entries().items()}
+            if submit_on_return:
+                submission = until(lambda: next((r for r in rows("owner", case)
+                                                  if r["kind"] == "submitted_and_closed"), None), case)
+                values = {"submitted": submission["value"]}
+            else:
+                values = {name: node.get("value") for name, node in entries().items()}
             widgets = rows("owner", case) + rows("sink", case)
             presses = [row for row in widgets if row["kind"] == "key_down"]
             span_ms = (presses[-1]["monotonic_ns"] - presses[0]["monotonic_ns"]) / 1e6 if presses else 0
@@ -357,14 +373,17 @@ def trial(aad, helper, out, baseline, scenario):
         def type_text(case, text, mode="unicode", **kwargs):
             return run(case, dict(type="type_text", text=text, mode=mode), **kwargs)
 
-        def typed(case, text, mode="unicode"):
-            reply, values, presses = type_text(case, text, mode)
+        def complete_text(reply, text):
             assert reply.get("effect") == "applied", reply
-            assert values == {"Target entry": text, "Sibling entry": ""}, values
-            assert all(row["target"] == "Target entry" for row in presses), presses
             if not baseline:
                 progress = reply["data"]["backend_result"]["backend_result"]["input"]["input_progress"]
                 assert progress["delivered"] == progress["total"] == len(text) and progress["released"], progress
+
+        def typed(case, text, mode="unicode"):
+            reply, values, presses = type_text(case, text, mode)
+            complete_text(reply, text)
+            assert values == {"Target entry": text, "Sibling entry": ""}, values
+            assert all(row["target"] == "Target entry" for row in presses), presses
 
         def denied(reply, code, cause, delivered, total, effect):
             error = reply["error"]
@@ -488,6 +507,16 @@ def trial(aad, helper, out, baseline, scenario):
         if scenario == "paste-unreadable":
             paste_unreadable()
             return
+        if scenario in {"submit-unicode", "submit-keys"}:
+            mode = scenario.removeprefix("submit-")
+            text = "abc\n"
+            reply, values, presses = type_text(scenario, text, mode, submit_on_return=True)
+            assert values == {"submitted": "abc"}, values
+            assert [(r["target"], r["key"]) for r in presses] == [
+                ("Target entry", key) for key in ("a", "b", "c", "Return")], presses
+            complete_text(reply, text)
+            assert reply["commit_state"] == "committed", reply
+            return
         if scenario == "stroke-barrier":
             for mode in ("unicode", "keys"):
                 for index in range(9):
@@ -580,7 +609,8 @@ if __name__ == "__main__":
         parser.add_argument("output", type=Path)
         parser.add_argument("--baseline", action="store_true")
         parser.add_argument("--scenario", choices=["full", "window-preflight", "paste-recovery", "paste-unreadable",
-                                                  "stroke-barrier", "typing-speed"], default="full")
+                                                  "stroke-barrier", "typing-speed", "submit-unicode", "submit-keys"],
+                            default="full")
         args = parser.parse_args()
         if args.baseline and args.scenario not in {"full", "stroke-barrier", "typing-speed"}:
             parser.error("--baseline requires the full, stroke-barrier or typing-speed scenario")

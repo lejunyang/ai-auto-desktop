@@ -228,6 +228,23 @@ int main() {
         XUnmapWindow(display, sibling); XSync(display, False);
         const auto moved_proof = invoke({"focus-info"}, true);
         RequireWindow(moved_proof.code == 0 && moved_proof.output.find("\"focused\":false") != std::string::npos, "single-window geometry mismatch accepted");
+        XMoveWindow(display, target, 20, 20);
+        XSetInputFocus(display, child, RevertToParent, CurrentTime);
+        XSync(display, False);
+        bool submitted = false;
+        const auto closed = invoke(barrier_args, false, [&](const XEvent &event) {
+            if (event.type == KeyRelease && event.xkey.window == child &&
+                event.xkey.keycode == XKeysymToKeycode(display, XK_Return)) {
+                submitted = true;
+                XDestroyWindow(display, target);
+                XSync(display, False);
+            }
+        }, "text 1\n\n" + ack);
+        if (closed.code != 0) std::cerr << closed.output;
+        RequireWindow(submitted && closed.code == 0 && closed.presses == 1 && closed.releases == 1 &&
+                      closed.output.find("\"delivered\":1,\"total\":1,\"proven_window\":" +
+                                         std::to_string(target) + ",\"released\":true") != std::string::npos,
+                      "last Return closed the window but typing did not report complete dispatch");
         XCloseDisplay(display);
         std::cout << "PASS: strict window binding, queued focus switch, burst cleanup, text ACK and event barrier, mapping and hold cleanup\n";
         return 0;
