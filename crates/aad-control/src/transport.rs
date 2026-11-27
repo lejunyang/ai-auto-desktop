@@ -40,36 +40,39 @@ impl Endpoint for Session {
 
 /// Read no more than limit+1 bytes, even when a peer never sends a newline.
 pub fn read_frame(input: &mut impl BufRead, limit: usize) -> io::Result<Option<Vec<u8>>> {
-    read_bounded_frame(input, limit).map_err(|failure| match failure {
-        FrameError::Io(error) => error,
-        FrameError::Invalid => io::Error::new(
+    match read_bounded_frame(input, limit) {
+        Ok(frame) => Ok(Some(frame)),
+        Err(FrameError::Eof) => Ok(None),
+        Err(FrameError::Io(error)) => Err(error),
+        Err(FrameError::Invalid) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "oversized or incomplete control frame",
-        ),
-    })
+        )),
+    }
 }
 
 enum FrameError {
     Io(io::Error),
     Invalid,
+    Eof,
 }
 
 fn read_bounded_frame(
     input: &mut impl BufRead,
     limit: usize,
-) -> std::result::Result<Option<Vec<u8>>, FrameError> {
+) -> std::result::Result<Vec<u8>, FrameError> {
     let mut bytes = Vec::new();
     let count = input
         .take((limit + 1) as u64)
         .read_until(b'\n', &mut bytes)
         .map_err(FrameError::Io)?;
     if count == 0 {
-        return Ok(None);
+        return Err(FrameError::Eof);
     }
     if bytes.len() > limit || !bytes.ends_with(b"\n") {
         return Err(FrameError::Invalid);
     }
-    Ok(Some(bytes))
+    Ok(bytes)
 }
 
 fn failure(
@@ -240,21 +243,10 @@ struct Packet {
     deadline: Instant,
 }
 
-enum ResponseReadError {
-    InvalidFrame,
-    Eof,
-    Io(io::Error),
-}
-
-fn read_response(input: &mut impl BufRead) -> std::result::Result<Response, ResponseReadError> {
-    let frame = read_bounded_frame(input, MAX_RESPONSE_BYTES)
-        .map_err(|failure| match failure {
-            FrameError::Invalid => ResponseReadError::InvalidFrame,
-            FrameError::Io(error) => ResponseReadError::Io(error),
-        })?
-        .ok_or(ResponseReadError::Eof)?;
+fn read_response(input: &mut impl BufRead) -> std::result::Result<Response, HandshakeError> {
+    let frame = read_bounded_frame(input, MAX_RESPONSE_BYTES)?;
     let response: Response =
-        serde_json::from_slice(&frame).map_err(|_| ResponseReadError::InvalidFrame)?;
+        serde_json::from_slice(&frame).map_err(|_| HandshakeError::InvalidFrame)?;
     if response.protocol_version != PROTOCOL_VERSION
         || response.data.is_some() == response.error.is_some()
         || !matches!(
@@ -263,23 +255,35 @@ fn read_response(input: &mut impl BufRead) -> std::result::Result<Response, Resp
         )
         || response.commit_state != crate::CommitState::from_effect(&response.effect)
     {
-        return Err(ResponseReadError::InvalidFrame);
+        return Err(HandshakeError::InvalidFrame);
     }
     Ok(response)
 }
 
 enum HandshakeError {
-    Read(ResponseReadError),
+    InvalidFrame,
+    Eof,
+    Read(io::Error),
     Write(io::Error),
     Timeout,
     Rejected,
     Stopped,
 }
 
+impl From<FrameError> for HandshakeError {
+    fn from(error: FrameError) -> Self {
+        match error {
+            FrameError::Invalid => Self::InvalidFrame,
+            FrameError::Eof => Self::Eof,
+            FrameError::Io(error) => Self::Read(error),
+        }
+    }
+}
+
 impl HandshakeError {
     fn diagnostic(self, child: &mut Option<Child>, deadline: Instant) -> crate::AutomationError {
         // Pipe closure can become visible before the child's exit status.
-        let possible_exit = matches!(self, Self::Read(ResponseReadError::Eof))
+        let possible_exit = matches!(self, Self::Eof)
             || matches!(&self, Self::Write(e) if e.kind() == io::ErrorKind::BrokenPipe);
         if possible_exit {
             if let Some(status) = child
@@ -297,13 +301,13 @@ impl HandshakeError {
             }
         }
         let message = match self {
-            Self::Read(ResponseReadError::InvalidFrame) if child.is_some() =>
+            Self::InvalidFrame if child.is_some() =>
                 "remote handshake received an invalid response frame. Child stdout must contain only control protocol NDJSON. Send startup messages to stderr".into(),
-            Self::Read(ResponseReadError::InvalidFrame) =>
+            Self::InvalidFrame =>
                 "remote handshake received an invalid response frame. Expected control protocol NDJSON".into(),
-            Self::Read(ResponseReadError::Eof) =>
+            Self::Eof =>
                 "remote response stream ended before the handshake completed".into(),
-            Self::Read(ResponseReadError::Io(error)) => format!("remote handshake read failed: {error}"),
+            Self::Read(error) => format!("remote handshake read failed: {error}"),
             Self::Write(error) => format!("remote handshake write failed: {error}"),
             Self::Timeout => "remote handshake timed out".into(),
             Self::Rejected => "remote server rejected the handshake".into(),
@@ -416,7 +420,6 @@ impl RemoteClient {
         std::thread::spawn(move || {
             let mut input = BufReader::new(input);
             let hello = read_response(&mut input)
-                .map_err(HandshakeError::Read)
                 .and_then(|response| validate_handshake(response, &request.request_id));
             let established = hello.as_ref().is_ok_and(|response| !terminal(response));
             let _ = startup.send(hello);
@@ -630,7 +633,7 @@ fn validate_handshake(
     request_id: &str,
 ) -> std::result::Result<Response, HandshakeError> {
     if response.request_id != request_id {
-        return Err(HandshakeError::Read(ResponseReadError::InvalidFrame));
+        return Err(HandshakeError::InvalidFrame);
     }
     if response.error.is_some() {
         return Err(HandshakeError::Rejected);
@@ -642,7 +645,7 @@ fn validate_handshake(
             .and_then(|data| data["session_id"].as_str())
             != Some(response.session_id.as_str())
     {
-        return Err(HandshakeError::Read(ResponseReadError::InvalidFrame));
+        return Err(HandshakeError::InvalidFrame);
     }
     Ok(response)
 }
