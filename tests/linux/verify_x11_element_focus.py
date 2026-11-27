@@ -528,11 +528,7 @@ def trial(aad, helper, out, baseline, scenario):
                     assert focus["sibling_has_focus"] and focus["xid"] == fixtures["owner"]["xid"], focus
                     assert any(r["kind"] == "x_queue_resumed" for r in rows("owner", case)), case
                     if not baseline:
-                        details = reply["error"]["details"]
-                        reason = ("cause", "focused_element_changed")
-                        if details.get("helper_code") == "text_stroke_unconfirmed":
-                            reason = ("helper_code", "text_stroke_unconfirmed")
-                        denied(reply, "DRIVER.UNKNOWN_EFFECT", reason, 1, 9, "unknown")
+                        denied(reply, "DRIVER.UNKNOWN_EFFECT", ("cause", "focused_element_changed"), 1, 9, "unknown")
                         assert values == {"Target entry": "a", "Sibling entry": ""}, values
                         assert [(r["target"], r["key"]) for r in presses] == [("Target entry", "a")], presses
             if not baseline:
