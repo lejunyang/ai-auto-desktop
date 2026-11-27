@@ -29,6 +29,9 @@ class X11:
             ("XSync", integer, [pointer, integer]),
             ("XGetInputFocus", integer, [pointer, c.POINTER(unsigned), c.POINTER(integer)]),
             ("XQueryKeymap", integer, [pointer, c.c_char_p]),
+            ("XDisplayKeycodes", integer, [pointer, c.POINTER(integer), c.POINTER(integer)]),
+            ("XGetKeyboardMapping", c.POINTER(unsigned), [pointer, c.c_ubyte, integer, c.POINTER(integer)]),
+            ("XFree", integer, [pointer]),
             ("XInternAtom", unsigned, [pointer, c.c_char_p, integer]),
             ("XGetSelectionOwner", unsigned, [pointer, unsigned]),
         ):
@@ -51,6 +54,18 @@ class X11:
         keys = c.create_string_buffer(32)
         assert self.api.XQueryKeymap(self.display, keys)
         return [i for i in range(256) if keys.raw[i // 8] & (1 << i % 8)]
+
+    def keyboard_mapping(self):
+        first, last, width = c.c_int(), c.c_int(), c.c_int()
+        self.api.XDisplayKeycodes(self.display, c.byref(first), c.byref(last))
+        count = last.value - first.value + 1
+        symbols = self.api.XGetKeyboardMapping(self.display, first.value, count, c.byref(width))
+        assert symbols
+        try:
+            return {first.value + index: tuple(symbols[index * width.value:(index + 1) * width.value])
+                    for index in range(count)}
+        finally:
+            self.api.XFree(symbols)
 
     def clipboard_owner(self):
         atom = self.api.XInternAtom(self.display, b"CLIPBOARD", 0)
@@ -245,6 +260,11 @@ def helper_proxy(state_file, helper, args):
             os.environ["AAD_TEST_OWNER_REPLY"] = str(state_file.with_suffix(f".{case}.owner-reply"))
         if case == "paste_owner_timeout":
             os.environ["AAD_TEST_OWNER_REPLY_AFTER_NS"] = deadline
+    if case == "cancelled_stroke" and args[0] == "type-text":
+        os.environ.update(
+            LD_PRELOAD=str(state_file.with_name("text-ping-marker.so")),
+            AAD_TEST_TEXT_PING=str(state_file.with_suffix(".text-ping")),
+        )
     if case not in {"first_stroke", "chord_refused", "paste_refused"} or "--anchor-token" not in args:
         os.execv(helper, [helper, *args])
     with subprocess.Popen([helper, *args], stdout=subprocess.PIPE, text=True) as child:
@@ -277,6 +297,10 @@ def trial(aad, helper, out, baseline, scenario):
             subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC",
                             str(Path(__file__).with_name("x11_paste_restore_delay.c")),
                             "-ldl", "-o", str(root / "paste-restore-delay.so")], check=True)
+        if scenario == "stroke-barrier-cancel":
+            subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC",
+                            str(Path(__file__).with_name("x11_text_ping_marker.c")),
+                            "-ldl", "-o", str(root / "text-ping-marker.so")], check=True)
         proxy = root / "helper"
         proxy_args = [sys.executable, str(Path(__file__).resolve()), "helper-proxy",
                       str(state_file), helper]
@@ -517,6 +541,30 @@ def trial(aad, helper, out, baseline, scenario):
             complete_text(reply, text)
             assert reply["commit_state"] == "committed", reply
             return
+        if scenario == "stroke-barrier-cancel":
+            original = x.keyboard_mapping()
+
+            def cancel_at_ping(case, request):
+                until(lambda: state_file.with_suffix(".text-ping").exists()
+                      and any(r["kind"] == "key_down" for r in rows("owner", case)), "first stroke's window ping")
+                current = x.keyboard_mapping()
+                changed = [code for code, keysyms in original.items() if current[code] != keysyms]
+                assert changed and not x.keys_down(), changed
+                assert not any(r["kind"] == "x_queue_resumed" for r in rows("owner", case))
+                emit(checkpoints, "cancel_after_window_ping", case=case, remapped_keycodes=changed)
+                mcp.send("notifications/cancelled", {"requestId": request}, notification=True)
+
+            case = "cancelled_stroke"
+            reply, values, _ = type_text(case, "a汉b", queue_delay_ms=450, before_reply=cancel_at_ping)
+            denied(reply, "DRIVER.CANCELLED", ("dispatch_started", True), 1, 3, "unknown")
+            assert values == {"Target entry": "a", "Sibling entry": ""}, values
+            until(lambda: any(r["kind"] == "key_up" for r in rows("owner", case)), "GTK key release")
+            keys = [(r["kind"], r["target"], r["key"]) for role in events for r in rows(role, case)
+                    if r["kind"] in {"key_down", "key_up"}]
+            assert keys == [("key_down", "Target entry", "a"), ("key_up", "Target entry", "a")], keys
+            assert x.keyboard_mapping() == original
+            emit(checkpoints, "keyboard_mapping_restored", case=case)
+            return
         if scenario == "stroke-barrier":
             for mode in ("unicode", "keys"):
                 for index in range(9):
@@ -605,7 +653,8 @@ if __name__ == "__main__":
         parser.add_argument("output", type=Path)
         parser.add_argument("--baseline", action="store_true")
         parser.add_argument("--scenario", choices=["full", "window-preflight", "paste-recovery", "paste-unreadable",
-                                                  "stroke-barrier", "typing-speed", "submit-unicode", "submit-keys"],
+                                                  "stroke-barrier", "stroke-barrier-cancel", "typing-speed",
+                                                  "submit-unicode", "submit-keys"],
                             default="full")
         args = parser.parse_args()
         if args.baseline and args.scenario not in {"full", "stroke-barrier", "typing-speed"}:
