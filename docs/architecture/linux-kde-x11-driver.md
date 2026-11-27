@@ -112,10 +112,14 @@ X11 窗口/PID/几何/命中。Rust 只读 worker 不占主循环；AX 调用阻
 触发 helper 释放，迟到结果不再 ACK。每个 backend 同时只保留一个此类 worker，尚未退出的
 只读请求会阻止新路径。空路径行为不变。
 
-兼容 helper 声明 `anchored-drag-between` 后，Linux provider 启用双观察 `drag_between`。
-控制层继续使用 `drag`，分别保留起终点的 snapshot/revision/locator、scope 授权与输入租约。
-provider 每个已解析应用仅保留最新观察，最多 16 份且 300 秒过期，输入尝试使整组失效；
-所有入口共用可取消、有期限的调用门禁，防止并行观察在输入期间重新发布有效目标。
+在 X11 会话中，Linux provider 为每个已解析应用保留最新一份观察，合计最多 16 份，每份在
+300 秒后过期。输入尝试使整组观察失效。使用旧 helper 的 X11 会话也适用这套保留规则。
+Wayland 会话仅保留该 provider 的最新一份观察。所有入口共用可取消、有期限的调用门禁，
+防止并行观察在输入期间重新发布有效目标。
+
+X11 helper 同时声明 `anchored-drag-between` 和 `window-geometry-proof-v1` 时，Linux provider
+额外启用双观察 `drag_between`。控制层继续使用 `drag`，分别保留起终点的
+snapshot/revision/locator、scope 授权与输入租约。
 双端 fresh 校验使用独立只读状态，仍通过 nonce/序号 ACK 与 helper 连接；源点 hover 后、
 按下前，以及每段移动和释放前均复核两端身份、指纹、bounds、窗口与命中。
 等待期间只读系统调用即使阻塞，helper 仍独立执行 deadline/cancel 与自有键鼠释放。

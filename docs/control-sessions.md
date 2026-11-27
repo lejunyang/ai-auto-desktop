@@ -515,7 +515,9 @@ MCP 的 `run_steps` 和全部由 `control.session` 步骤组成的非持久化 `
 ```
 
 `target` 绑定会话、资源、观察及节点。跨会话引用、篡改资源、重复 ID、未知字段和裸坐标均拒绝。
-每个 provider 仅保留最新一次观察，最长 5 分钟；新的观察尝试或派发的输入尝试会撤销旧引用。
+默认每个 provider 仅保留最新一次观察，最长 5 分钟，遇到新的观察尝试或派发的输入尝试即撤销旧引用。
+个别 provider 可声明按资源保留最新观察，实际保留规则与份数上限见 `capabilities` 回包中该 provider 的
+`observation_retention` 和 `max_retained_observations` 字段。
 截断观察不能证明唯一性，不能用于 find/act。动作前还要实时校验原生元素，或浏览器的
 page/frame/loader/document、节点连接状态及语义指纹。导航、frame 替换和节点替换使引用失效。
 动作成功后应重新 observe，并验证实际效果；成功派发不能证明业务目标已达成。
