@@ -3773,6 +3773,8 @@ pub(crate) use linux::file_dialog::GtkFileDialog;
 pub(crate) use linux::gtk4_picker::Gtk4Picker;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::kde_picker::KdeDialog;
+#[cfg(target_os = "linux")]
+pub use linux::require_x11_keyboard_features;
 
 #[cfg(test)]
 mod tests {

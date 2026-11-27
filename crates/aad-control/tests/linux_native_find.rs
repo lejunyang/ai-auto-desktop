@@ -13,11 +13,13 @@ use std::{
     time::Instant,
 };
 
+const LEGACY_DRAG_HELPER: &[&str] = &["type-text", "window-focus", "anchored-drag-between"];
+
 #[derive(Default)]
 struct Tree {
     distinct: bool,
     after_first: Option<usize>,
-    legacy_x11_helper: bool,
+    legacy_x11_helper: Option<&'static [&'static str]>,
     incompatible_handshake: bool,
     two_apps: bool,
     context_sibling: bool,
@@ -48,10 +50,10 @@ impl AtspiBackend for Tree {
                 "input_helper".into(),
                 json!({"ready":false,"code":"DRIVER.HELPER_INCOMPATIBLE","message":"fixture rejected describe"}),
             )])
-        } else if self.legacy_x11_helper {
+        } else if let Some(features) = self.legacy_x11_helper {
             Map::from_iter([(
                 "input_helper".into(),
-                json!({"ready":true,"protocol":1,"features":["type-text","window-focus","anchored-drag-between"]}),
+                json!({"ready":true,"protocol":1,"features":features}),
             )])
         } else {
             Map::new()
@@ -244,10 +246,66 @@ fn explicit_x11_actions_report_incompatible_handshake_before_capability_rejectio
     assert_x11_helper_rejection(true);
 }
 
+#[test]
+fn explicit_x11_keyboard_actions_report_missing_features_of_geometry_helper() {
+    let tree = Arc::new(Tree {
+        distinct: true,
+        legacy_x11_helper: Some(&[
+            "focus-info",
+            "type-text",
+            "type-text-keys",
+            "key-chord",
+            "paste",
+            "window-focus",
+            "window-geometry-proof-v1",
+            "cooperative-cancel",
+        ]),
+        ..Default::default()
+    });
+    let provider = Arc::new(AtspiProvider::new(tree.clone()).unwrap());
+    let session = Session::new(
+        vec![Arc::new(NativeBackend::new(provider, Flavor::Linux))],
+        Policy {
+            allow_input: true,
+            ..Default::default()
+        },
+    );
+    let call = |operation| session.execute(&Request::new(Some(session.id().into()), operation));
+    let targets = call(Operation::Targets { provider: None }).data.unwrap();
+    let observed = call(Operation::Observe {
+        resource_id: targets["resources"][0]["resource_id"]
+            .as_str()
+            .unwrap()
+            .into(),
+        max_nodes: 10,
+        view: Default::default(),
+    })
+    .data
+    .unwrap();
+    let node = &observed["nodes"][0];
+    for action in [
+        json!({"type":"type_text","text":"seed"}),
+        json!({"type":"type_text","text":"seed","mode":"keys"}),
+        json!({"type":"key","keys":["ctrl","a"]}),
+        json!({"type":"paste","text":"seed"}),
+    ] {
+        let op =
+            serde_json::from_value(json!({"method":"act","target":node["target"],"action":action}))
+                .unwrap();
+        let response = call(op);
+        assert_eq!(response.effect, "not_applied");
+        let failure = response.error.unwrap();
+        assert_eq!(failure["code"], "DRIVER.HELPER_INCOMPATIBLE");
+        assert_eq!(failure["details"]["required_feature"], "anchored-type-text");
+        assert_eq!(failure["details"]["dispatch_started"], false);
+    }
+    assert_eq!(tree.captures.load(Ordering::SeqCst), 1);
+}
+
 fn assert_x11_helper_rejection(incompatible_handshake: bool) {
     let tree = Arc::new(Tree {
         distinct: true,
-        legacy_x11_helper: true,
+        legacy_x11_helper: Some(LEGACY_DRAG_HELPER),
         incompatible_handshake,
         context_sibling: true,
         ..Default::default()
@@ -341,7 +399,7 @@ fn legacy_x11_helper_retains_both_drag_observations_for_authorization() {
     for allow_input in [true, false] {
         let tree = Arc::new(Tree {
             distinct: true,
-            legacy_x11_helper: true,
+            legacy_x11_helper: Some(LEGACY_DRAG_HELPER),
             two_apps: true,
             context_sibling: true,
             ..Default::default()

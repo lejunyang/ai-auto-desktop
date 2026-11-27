@@ -2272,6 +2272,18 @@ fn anchored_keyboard_features(feature: &str) -> impl Iterator<Item = &str> {
         .chain(matches!(feature, "type-text" | "type-text-keys").then_some(TEXT_EVENT_BARRIER))
 }
 
+/// Check the XTest keyboard route against features from a successful helper handshake.
+pub fn require_x11_keyboard_features(
+    command: &str,
+    mut has_feature: impl FnMut(&str) -> bool,
+) -> Result<(), AutomationError> {
+    if let Some(missing) = anchored_keyboard_features(command).find(|feature| !has_feature(feature))
+    {
+        return Err(missing_helper_feature(missing));
+    }
+    Ok(())
+}
+
 impl InputSupport {
     fn has_drag(&self) -> bool {
         DragKind::ALL.into_iter().any(|kind| kind.available(self))
@@ -2286,17 +2298,14 @@ impl InputSupport {
     }
 
     fn require_anchored_keyboard(&self, feature: &str) -> Result<(), AutomationError> {
-        anchored_keyboard_features(feature).try_for_each(|feature| self.require(feature))
+        require_x11_keyboard_features(feature, |required| self.has(required))
     }
 
     fn require(&self, feature: &str) -> Result<(), AutomationError> {
         if self.has(feature) {
             Ok(())
         } else {
-            Err(
-                incompatible_helper("required helper feature is unavailable")
-                    .with_detail("required_feature", json!(feature)),
-            )
+            Err(missing_helper_feature(feature))
         }
     }
 
@@ -2312,6 +2321,11 @@ impl InputSupport {
         }
         Ok(())
     }
+}
+
+fn missing_helper_feature(feature: &str) -> AutomationError {
+    incompatible_helper("required helper feature is unavailable")
+        .with_detail("required_feature", json!(feature))
 }
 
 fn incompatible_helper(reason: &str) -> AutomationError {

@@ -403,6 +403,24 @@ impl Backend for NativeBackend {
         let features = helper["features"].as_array();
         let has_feature =
             |name: &str| features.is_some_and(|list| list.iter().any(|feature| feature == name));
+        #[cfg(target_os = "linux")]
+        match action {
+            Action::TypeText { mode, .. } => {
+                let command = if *mode == Some(crate::model::TypeMode::Keys) {
+                    "type-text-keys"
+                } else {
+                    "type-text"
+                };
+                return aad_linux::atspi::require_x11_keyboard_features(command, has_feature);
+            }
+            Action::Key { .. } => {
+                return aad_linux::atspi::require_x11_keyboard_features("key-chord", has_feature);
+            }
+            Action::Paste { .. } => {
+                return aad_linux::atspi::require_x11_keyboard_features("paste", has_feature);
+            }
+            _ => {}
+        }
         let missing = if requires_geometry && !has_feature("window-geometry-proof-v1") {
             "window-geometry-proof-v1"
         } else if straight_drag && !has_feature("anchored-straight-drag") {
