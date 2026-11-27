@@ -380,6 +380,39 @@ fn handshake_preserves_the_child_exit_code_in_details() {
 }
 
 #[test]
+fn handshake_rejects_an_already_closed_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    let server = std::thread::spawn(move || {
+        let frame = transport::read_frame(&mut BufReader::new(&peer), transport::MAX_REQUEST_BYTES)
+            .unwrap()
+            .unwrap();
+        let request: Request = serde_json::from_slice(&frame).unwrap();
+        writeln!(
+            peer,
+            "{}",
+            json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": request.request_id,
+                "session_id": "closed-session",
+                "effect": "not_applied",
+                "commit_state": "not_committed",
+                "data": {"session_id": "closed-session", "closed": true},
+            })
+        )
+        .unwrap();
+    });
+
+    let failure = RemoteClient::from_streams(client.try_clone().unwrap(), client)
+        .err()
+        .expect("a terminal handshake must fail");
+    server.join().unwrap();
+    assert_eq!(failure.code, "CONTROL.CONNECT_FAILED");
+    assert_eq!(failure.details["reason"], "rejected");
+}
+
+#[test]
 fn reconnect_never_replays_pending_input_or_accepts_old_targets() {
     let h = Harness::new(true, Duration::from_millis(150), false);
     let target = h.target();

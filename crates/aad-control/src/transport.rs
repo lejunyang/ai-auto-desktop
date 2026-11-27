@@ -440,7 +440,7 @@ impl RemoteClient {
             let mut input = BufReader::new(input);
             let hello = read_response(&mut input)
                 .and_then(|response| validate_handshake(response, &request.request_id));
-            let established = hello.as_ref().is_ok_and(|response| !terminal(response));
+            let established = hello.is_ok();
             let _ = startup.send(hello);
             drop(startup);
             if established {
@@ -654,7 +654,7 @@ fn validate_handshake(
     if response.request_id != request_id {
         return Err(HandshakeError::InvalidFrame);
     }
-    if response.error.is_some() {
+    if response.error.is_some() || terminal(&response) {
         return Err(HandshakeError::Rejected);
     }
     if response.session_id.is_empty()
