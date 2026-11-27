@@ -62,24 +62,23 @@ impl LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        for (prefix, end, binding) in [
-            ("source", &source, source_binding),
-            ("destination", &destination, destination_binding),
+        for (prefix, window_prefix, end, binding) in [
+            ("--source-", "--source-window-", &source, source_binding),
+            (
+                "--destination-",
+                "--destination-window-",
+                &destination,
+                destination_binding,
+            ),
         ] {
-            let bounds = end.window.bounds;
             for (name, value) in [
                 ("pid", end.process_id.to_string()),
                 ("x", end.point.0.to_string()),
                 ("y", end.point.1.to_string()),
-                ("window-id", binding.client.to_string()),
-                ("window-proof", binding.input_proof().to_string()),
-                ("window-x", bounds.x.to_string()),
-                ("window-y", bounds.y.to_string()),
-                ("window-width", bounds.width.to_string()),
-                ("window-height", bounds.height.to_string()),
             ] {
-                args.extend([format!("--{prefix}-{name}"), value]);
+                args.extend([format!("{prefix}{name}"), value]);
             }
+            append_window_args(&mut args, window_prefix, end.window, Some(binding));
         }
         if !modifiers.is_empty() {
             args.extend(["--modifiers".into(), modifiers.join(",")]);

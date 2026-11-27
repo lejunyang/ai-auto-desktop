@@ -74,7 +74,7 @@ impl LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        append_window_args(&mut args, window, Some(binding));
+        append_window_args(&mut args, "--window-", window, Some(binding));
         if !modifiers.is_empty() {
             args.extend(["--modifiers".into(), modifiers.join(",")]);
         }

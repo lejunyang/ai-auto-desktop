@@ -16,28 +16,37 @@ impl WindowAnchor {
 
 pub(super) fn append_window_args(
     args: &mut Vec<String>,
+    prefix: &str,
     window: &WindowAnchor,
     binding: Option<&X11WindowBinding>,
 ) {
     let bounds = window.bounds;
     args.extend([
-        "--window-x".into(),
+        format!("{prefix}x"),
         bounds.x.to_string(),
-        "--window-y".into(),
+        format!("{prefix}y"),
         bounds.y.to_string(),
-        "--window-width".into(),
+        format!("{prefix}width"),
         bounds.width.to_string(),
-        "--window-height".into(),
+        format!("{prefix}height"),
         bounds.height.to_string(),
     ]);
     if let Some(binding) = binding {
-        args.extend([
-            "--window-id".into(),
-            binding.client.to_string(),
-            "--window-proof".into(),
-            binding.input_proof().to_string(),
-        ]);
+        append_window_proof_args(args, prefix, binding);
     }
+}
+
+pub(super) fn append_window_proof_args(
+    args: &mut Vec<String>,
+    prefix: &str,
+    binding: &X11WindowBinding,
+) {
+    args.extend([
+        format!("{prefix}id"),
+        binding.client.to_string(),
+        format!("{prefix}proof"),
+        binding.input_proof().to_string(),
+    ]);
 }
 
 pub(super) struct AnchoredKeyboard<'a> {
@@ -118,7 +127,7 @@ impl LinuxBackend {
                     after_focus(error)
                 }
             })?;
-        append_window_args(args, window, Some(binding));
+        append_window_args(args, "--window-", window, Some(binding));
         Ok((support.path, focus))
     }
 
@@ -365,7 +374,7 @@ impl LinuxBackend {
             "--deadline-monotonic-ns".into(),
             monotonic_deadline_ns(deadline)?.to_string(),
         ];
-        append_window_args(&mut args, window, window.x11.as_ref());
+        append_window_args(&mut args, "--window-", window, window.x11.as_ref());
         if window.x11.is_none() {
             args.extend(["--geometry-proof".into(), "1".into()]);
         }

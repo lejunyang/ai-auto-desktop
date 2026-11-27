@@ -35,7 +35,9 @@ mod table;
 mod wayland_input;
 use focus_discovery::FocusDiscovery;
 mod window_focus;
-use window_focus::{append_window_args, AnchoredKeyboard, GEOMETRY_FEATURE};
+use window_focus::{
+    append_window_args, append_window_proof_args, AnchoredKeyboard, GEOMETRY_FEATURE,
+};
 
 const REGISTRY_NAME: &str = "org.a11y.atspi.Registry";
 const REGISTRY_PATH: &str = "/org/a11y/atspi/accessible/root";
@@ -573,7 +575,7 @@ impl LinuxBackend {
             } else {
                 window.input_binding()?
             };
-            append_window_args(&mut args, window, Some(binding));
+            append_window_args(&mut args, "--window-", window, Some(binding));
         }
         if bound_drag {
             let destination = destination_window.ok_or_else(|| {
@@ -582,11 +584,12 @@ impl LinuxBackend {
                     "drag requires an observed destination window",
                 )
             })?;
-            let first = args.len();
-            append_window_args(&mut args, destination, Some(destination.input_binding()?));
-            for option in args[first..].iter_mut().step_by(2) {
-                option.insert_str(2, "destination-");
-            }
+            append_window_args(
+                &mut args,
+                "--destination-window-",
+                destination,
+                Some(destination.input_binding()?),
+            );
         }
         args.extend([
             "--deadline-monotonic-ns".into(),
@@ -1873,11 +1876,8 @@ impl AtspiBackend for LinuxBackend {
                 )
             })?;
         let mut args = window_args("window-action", process_id, bounds);
+        append_window_proof_args(&mut args, "--window-", binding);
         args.extend([
-            "--window-id".into(),
-            binding.client.to_string(),
-            "--window-proof".into(),
-            binding.input_proof().to_string(),
             "--action".into(),
             if action == "close_window" {
                 "close"
