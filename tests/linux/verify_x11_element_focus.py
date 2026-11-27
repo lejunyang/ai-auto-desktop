@@ -631,11 +631,15 @@ def trial(aad, helper, out, baseline, scenario):
                         assert values == {"Target entry": "a", "Sibling entry": ""}, values
                         assert [(r["target"], r["key"]) for r in presses] == [("Target entry", "a")], presses
             if not baseline:
-                reply, values, presses = type_text("unconfirmed_stroke", "a汉b", queue_delay_ms=450)
+                case = "unconfirmed_stroke"
+                original = x.keyboard_mapping()
+                emit(checkpoints, "keyboard_mapping_before", case=case, keymap=original)
+                reply, values, presses = type_text(case, "a汉b", queue_delay_ms=450)
                 denied(reply, "DRIVER.UNKNOWN_EFFECT", ("helper_code", "text_stroke_unconfirmed"), 1, 3, "unknown")
                 assert values == {"Target entry": "a", "Sibling entry": ""}, values
                 assert [(r["target"], r["key"]) for r in presses] == [("Target entry", "a")], presses
-                until(lambda: any(r["kind"] == "x_queue_resumed" for r in rows("owner", "unconfirmed_stroke")),
+                check_keyboard_mapping_restored(case, original)
+                until(lambda: any(r["kind"] == "x_queue_resumed" for r in rows("owner", case)),
                       "GTK to resume its X event queue")
             return
         if scenario == "typing-speed":
