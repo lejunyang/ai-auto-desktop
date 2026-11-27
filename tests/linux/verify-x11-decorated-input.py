@@ -2,7 +2,8 @@
 """Check GTK3 input effects under xfwm4 in a private Xvfb and D-Bus session.
 
 Run with /usr/bin/python3 and pass the aad and x11_xtest_helper binaries.
-Requires GTK3 GI bindings, xauth, Xvfb, xfwm4, xprop and setxkbmap.
+Requires GTK3 GI bindings, xauth, Xvfb, xfwm4, xprop, setxkbmap,
+and a C compiler with X11/XTest development headers for the XRecord observer.
 """
 import json
 import os
@@ -79,6 +80,208 @@ def try_until(query, accept):
     raise AssertionError(f"private fixture did not become ready: {result}")
 
 
+def control_client(control):
+    session = None
+    sequence = 0
+
+    def call(method, **fields):
+        nonlocal session, sequence
+        sequence += 1
+        request = {"request_id": str(sequence), "timeout_ms": 6000,
+                   "operation": {"method": method, **fields}}
+        if session is not None:
+            request["session_id"] = session
+        control.stdin.write(json.dumps(request) + "\n")
+        control.stdin.flush()
+        response = json.loads(control.stdout.readline())
+        assert response["request_id"] == str(sequence), response
+        session = response["session_id"]
+        return response
+
+    return call
+
+
+def drag_fixture(icon):
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, GLib, Gtk
+
+    def make_window(title, name, size):
+        window = Gtk.Window(title=title)
+        window.set_default_size(*size)
+        window.set_resizable(False)
+        surface = Gtk.EventBox()
+        surface.get_accessible().set_name(name)
+        layout = Gtk.Fixed()
+        window.add(surface)
+        surface.add(layout)
+        return window, layout
+
+    separate = icon == "two-windows"
+    window, layout = make_window("AAD GTK drag source", "Trial drag surface",
+                                 (270, 180) if separate else (680, 400))
+    if separate:
+        target_window, target_layout = make_window("AAD GTK drag destination", "Trial destination surface",
+                                                   (270, 180))
+        window.move(275, 420)
+        target_window.move(275, 140)
+    else:
+        target_window, target_layout = window, layout
+    source = Gtk.ListBox()
+    source.set_selection_mode(Gtk.SelectionMode.NONE)
+    source.set_size_request(136, 58)
+    layout.put(source, 45, 60 if separate else 169)
+    item = Gtk.EventBox()
+    item.set_size_request(128, 52)
+    item.add(Gtk.Label(label="Trial list item"))
+    source.add(item)
+    row = source.get_row_at_index(0)
+    row.get_accessible().set_name("Trial list row")
+    slot = Gtk.EventBox()
+    slot.get_accessible().set_name("Destination slot")
+    slot.set_size_request(136, 58)
+    target_layout.put(slot, 45 if separate else 493, 60 if separate else 169)
+    destination = Gtk.ListBox()
+    destination.set_selection_mode(Gtk.SelectionMode.NONE)
+    slot.add(destination)
+    placeholder = Gtk.Label(label="Empty slot")
+    destination.add(placeholder)
+    status = Gtk.Label(label="Placement source count 0")
+    layout.put(status, 20 if separate else 232, 135 if separate else 335)
+    targets = [Gtk.TargetEntry.new("application/x-aad-trial-list-item", Gtk.TargetFlags.SAME_APP, 1)]
+    item.drag_source_set(Gdk.ModifierType.BUTTON1_MASK, targets, Gdk.DragAction.MOVE)
+    slot.drag_dest_set(Gtk.DestDefaults.ALL, targets, Gdk.DragAction.MOVE)
+    payload = b"aad-trial-item"
+    placements = 0
+    drops = 0
+
+    def begin(_item, context):
+        if icon != "default":
+            hotspot = -35 if separate else 0
+            Gtk.drag_set_icon_widget(context, Gtk.Label(label="Moving trial row"), hotspot, hotspot)
+
+    def place():
+        nonlocal placements
+        source.remove(row)
+        destination.remove(placeholder.get_parent())
+        destination.add(row)
+        destination.show_all()
+        placements += 1
+        status.set_text(f"Placement destination count {placements}")
+        return False
+
+    def receive(_slot, context, _x, _y, data, _info, time_):
+        nonlocal drops
+        drops += 1
+        accepted = data.get_data() == payload and row.get_parent() == source and drops == 1
+        Gtk.drag_finish(context, accepted, False, time_)
+        if accepted:
+            GLib.idle_add(place)
+
+    def read(stream, _condition):
+        if not stream.readline():
+            Gtk.main_quit()
+            return False
+        print(json.dumps({"drops": drops, "placements": placements, "source": len(source.get_children()),
+                          "destination": row.get_parent() == destination}), flush=True)
+        return True
+
+    item.connect("drag-begin", begin)
+    item.connect("drag-data-get", lambda _, _ctx, data, _info, _time: data.set(data.get_target(), 8, payload))
+    slot.connect("drag-data-received", receive)
+    window.show_all()
+    if separate:
+        target_window.show_all()
+    GLib.io_add_watch(sys.stdin, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, read)
+    Gtk.main()
+
+
+def straight_drags(aad, recorder):
+    def center(bounds):
+        return tuple(bounds[p] + bounds[s] // 2 for p, s in (("x", "width"), ("y", "height")))
+
+    def contains(bounds, point):
+        x, y = point
+        return (bounds["x"] <= x < bounds["x"] + bounds["width"]
+                and bounds["y"] <= y < bounds["y"] + bounds["height"])
+
+    with subprocess.Popen([aad, "control", "serve", "--allow-input"], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, text=True) as control:
+        call = control_client(control)
+        try:
+            assert "data" in call("capabilities")
+            for icon in ("default", "custom", "two-windows"):
+                with subprocess.Popen([sys.executable, __file__, "--drag-fixture", icon],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as gtk:
+                    try:
+                        apps = lambda: [r for r in call("targets")["data"]["resources"]
+                                        if r["metadata"].get("process_id") == gtk.pid]
+                        resource = try_until(apps, lambda rows: len(rows) == 1)[0]["resource_id"]
+
+                        def observe():
+                            response = call("observe", resource_id=resource, view={"mode": "nodes"})
+                            assert not response.get("error") and not response["data"]["truncated"], response
+                            return {node["name"]: node for node in response["data"]["nodes"]}
+
+                        nodes = observe()
+                        assert "Placement source count 0" in nodes
+                        surface = nodes["Trial drag surface"]
+                        destination = nodes.get("Trial destination surface", surface)
+                        start, end = (center(nodes[name]["bounds"]) for name in ("Trial list row", "Destination slot"))
+
+                        def fraction(node, point):
+                            b = node["bounds"]
+                            return {"fx": (point[0] - b["x"]) / b["width"],
+                                    "fy": (point[1] - b["y"]) / b["height"]}
+
+                        with subprocess.Popen([recorder], stdout=subprocess.PIPE, text=True) as record:
+                            try:
+                                assert record.stdout.readline() == "ready\n", "XRecord setup failed"
+                                result = call("act", target=surface["target"],
+                                              action={"type": "drag", "to": destination["target"],
+                                                      "fraction": fraction(surface, start),
+                                                      "to_fraction": fraction(destination, end)})
+                                if result["effect"] == "not_applied":
+                                    record.terminate()
+                                output, _ = record.communicate(timeout=5)
+                            finally:
+                                if record.poll() is None:
+                                    record.kill()
+                        trace = [tuple(map(int, line.split())) for line in output.splitlines()]
+                        buttons = [e for e in trace if e[0] in (4, 5)]
+                        moves = [e for e in trace if e[0] == 6 and e[4] & 256]
+                        def receipt():
+                            gtk.stdin.write("read\n")
+                            gtk.stdin.flush()
+                            return json.loads(gtk.stdout.readline())
+
+                        print(f"GTK {icon}: effect={result['effect']}, moves={len(moves)}, buttons={buttons}", flush=True)
+                        if result["effect"] != "applied":
+                            print(f"GTK {icon} receipt: {receipt()}", flush=True)
+                        assert result["effect"] == "applied", result
+                        assert [(e[0], e[3]) for e in buttons] == [(4, 1), (5, 1)], trace
+                        assert len(moves) == 12 and moves[-1][1:3] == buttons[1][1:3], trace
+                        assert buttons[0][1:3] == start and buttons[1][1:3] == end, trace
+                        if icon == "two-windows":
+                            frame = nodes["AAD GTK drag source"]["bounds"]
+                            client = surface["bounds"]
+                            title_hits = [e[1:3] for e in moves[:-1] if contains(frame, e[1:3]) and e[2] < client["y"]]
+                            assert title_hits, (frame, client, moves)
+                            print(f"GTK two-windows: held moves through source title bar {title_hits}", flush=True)
+                        final = try_until(observe, lambda rows: "Placement destination count 1" in rows)
+                        assert contains(final["Destination slot"]["bounds"], center(final["Trial list row"]["bounds"]))
+                        assert receipt() == {
+                            "drops": 1, "placements": 1, "source": 0, "destination": True
+                        }
+                        print(f"PASS decorated GTK {icon}: 12 held moves, one drop and one placement", flush=True)
+                    finally:
+                        gtk.terminate()
+        finally:
+            control.terminate()
+
+
 def window_fixture():
     import gi
 
@@ -125,22 +328,7 @@ def window_actions(aad):
         subprocess.Popen([aad, "control", "serve", "--allow-input"], stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, text=True) as control,
     ):
-        session = None
-        sequence = 0
-
-        def call(method, **fields):
-            nonlocal session, sequence
-            sequence += 1
-            request = {"request_id": str(sequence), "timeout_ms": 6000,
-                       "operation": {"method": method, **fields}}
-            if session is not None:
-                request["session_id"] = session
-            control.stdin.write(json.dumps(request) + "\n")
-            control.stdin.flush()
-            response = json.loads(control.stdout.readline())
-            assert response["request_id"] == str(sequence), response
-            session = response["session_id"]
-            return response
+        call = control_client(control)
 
         try:
             assert "data" in call("capabilities")
@@ -219,7 +407,7 @@ def window_actions(aad):
             gtk.terminate()
 
 
-def run(aad):
+def run(aad, recorder):
     display = os.environ.get("DISPLAY", "").removeprefix(":")
     assert display.isdecimal() and int(display) >= 170
     assert os.environ.get("XAUTHORITY") and os.environ.get("DBUS_SESSION_BUS_ADDRESS")
@@ -271,6 +459,7 @@ def run(aad):
                     finally:
                         gtk.terminate()
             window_actions(aad)
+            straight_drags(aad, recorder)
         finally:
             wm.terminate()
             try:
@@ -282,13 +471,20 @@ def run(aad):
 if __name__ == "__main__":
     if sys.argv[1] == "--fixture":
         fixture(sys.argv[2] == "decorated")
+    elif sys.argv[1] == "--drag-fixture":
+        drag_fixture(sys.argv[2])
     elif sys.argv[1] == "--window-fixture":
         window_fixture()
     elif sys.argv[1] == "--private":
-        run(sys.argv[2])
+        run(sys.argv[2], sys.argv[3])
     else:
         aad, helper = (str(Path(path).resolve(strict=True)) for path in sys.argv[1:])
         with tempfile.TemporaryDirectory(prefix="aad-x11-decorated-") as profile:
+            recorder = str(Path(profile) / "x11-pointer-events")
+            flags = subprocess.check_output(["pkg-config", "--cflags", "--libs", "x11", "xtst"], text=True).split()
+            subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                            str(Path(__file__).with_name("x11_pointer_events.c")),
+                            "-o", recorder, *flags], check=True)
             env = {**os.environ, "AAD_LINUX_XTEST_HELPER": helper, "GDK_BACKEND": "x11",
                    "XDG_SESSION_TYPE": "x11", "GTK_A11Y": "always", "GTK_IM_MODULE": "gtk-im-context-simple"}
             for key in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET",
@@ -301,5 +497,5 @@ if __name__ == "__main__":
                 isolated.mkdir(mode=0o700)
                 env[key] = str(isolated)
             subprocess.run(["xvfb-run", "-a", "-n", "170", "-s", "-screen 0 1024x768x24 -nolisten tcp",
-                            "dbus-run-session", "--", sys.executable, __file__, "--private", aad],
+                            "dbus-run-session", "--", sys.executable, __file__, "--private", aad, recorder],
                            env=env, check=True, timeout=120)

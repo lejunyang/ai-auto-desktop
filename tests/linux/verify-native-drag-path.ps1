@@ -48,7 +48,8 @@ try {
     $script:server=[Diagnostics.Process]::Start($info)
     Call-Control @{method='capabilities'} | Out-Null
     $cases = if ($StraightGeometryOnly -or $ExpectIncompatibleStraightDrag) { @('geometry-straight') } else {
-        @('invalid','success','success-scoped','geometry','overlay','overlay-scoped','cancel','geometry-straight')
+        @('invalid','success','success-scoped','geometry','overlay','overlay-scoped','cancel','geometry-straight',
+          'overlay-straight','transparent-straight')
     }
     foreach ($caseName in $cases) {
         $script:caseName = $caseName
@@ -81,7 +82,7 @@ try {
         $action=@{type='drag';to=$target;fraction=@{fx=0.1;fy=0.1};to_fraction=@{fx=0.9;fy=0.9};
             path=@(@{target=$target;fraction=@{fx=0.8;fy=0.2}},@{target=$target;fraction=@{fx=0.2;fy=0.8}})}
         if ($mode -eq 'invalid') { $action.path[0].fraction.fx=1.1 }
-        if ($mode -eq 'geometry-straight') {
+        if ($mode.EndsWith('-straight')) {
             $action=@{type='drag';to=$target;fraction=@{fx=0.3;fy=0.3};to_fraction=@{fx=0.7;fy=0.7};hold_ms=250;path=@()}
         }
         $script:caseClock=[Diagnostics.Stopwatch]::StartNew()
@@ -129,6 +130,18 @@ try {
                 if ($result.effect -ne 'unknown' -or $result.error.code -ne 'DRIVER.POINT_NOT_PROVEN' -or
                     ($events.event -join ',') -ne 'down,up' -or $releaseMs -gt 1500) {
                     throw "moving straight drag delivered $($events.event -join ',') with effect $($result.effect) and code $($result.error.code)"
+                }
+            } elseif ($mode -eq 'overlay-straight') {
+                $extra=$fixture.StandardOutput.ReadLineAsync()
+                if ($extra.Wait(150)) { throw "unexpected event after release: $($extra.Result)" }
+                if ($result.effect -ne 'unknown' -or $result.error.code -ne 'DRIVER.POINT_NOT_PROVEN' -or
+                    $moves.Count -ne 5 -or $event.fx -ne $moves[-1].fx -or $event.fy -ne $moves[-1].fy -or $releaseMs -gt 1500) {
+                    throw "covered straight drag delivered $($events.event -join ',') with effect $($result.effect) and code $($result.error.code)"
+                }
+            } elseif ($mode -eq 'transparent-straight') {
+                if ($result.effect -ne 'applied' -or $moves.Count -ne 12 -or
+                    $event.fx -ne 0.7 -or $event.fy -ne 0.7) {
+                    throw "input-transparent window interrupted straight drag: $($events.event -join ',')"
                 }
             } else {
                 if (-not $result.error -or $result.effect -ne 'unknown') { throw 'interrupted path did not preserve uncertain effect' }
