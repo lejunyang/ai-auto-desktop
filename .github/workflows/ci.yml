@@ -377,7 +377,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get install -y --no-install-recommends xdotool x11-xserver-utils
+          sudo apt-get install -y --no-install-recommends openbox xdotool x11-xserver-utils
           python3 -m venv /tmp/assist-venv
           /tmp/assist-venv/bin/pip install --quiet pillow
           cargo build --locked -p aad-cli
