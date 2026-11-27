@@ -308,13 +308,9 @@ impl Desk {
         let response = self.session.execute(&request);
         match (response.data, response.error) {
             (Some(data), _) => Ok(data),
-            (None, error) => {
-                let mut error = error.unwrap_or_else(|| json!({"code": "CONTROL.UNKNOWN"}));
-                if let Some(hint) = error["code"].as_str().and_then(hint) {
-                    error["hint"] = json!(hint);
-                }
-                Err((json!({"status": "error", "error": error}), EXIT_FAILED))
-            }
+            (None, error) => Err(error_outcome(
+                error.unwrap_or_else(|| json!({"code": "CONTROL.UNKNOWN"})),
+            )),
         }
     }
 
@@ -353,7 +349,7 @@ impl Desk {
                     "CONTROL.TARGET_UNKNOWN",
                     &format!("no window or application matches {given:?}"),
                     Some(
-                        json!({"hint": hint("CONTROL.TARGET_UNKNOWN"), "unavailable": listed["unavailable"]}),
+                        json!({"hint": hint("CONTROL.TARGET_UNKNOWN", &Value::Null), "unavailable": listed["unavailable"]}),
                     ),
                 ),
                 EXIT_FAILED,
@@ -396,8 +392,18 @@ impl Desk {
     }
 }
 
+fn error_outcome(mut error: Value) -> (Value, u8) {
+    if let Some(hint) = error["code"]
+        .as_str()
+        .and_then(|code| hint(code, &error["details"]))
+    {
+        error["hint"] = json!(hint);
+    }
+    (json!({"status": "error", "error": error}), EXIT_FAILED)
+}
+
 /// What the CLI user can do about a failure, in this command line's terms.
-fn hint(code: &str) -> Option<&'static str> {
+fn hint(code: &str, details: &Value) -> Option<&'static str> {
     Some(match code {
         "CONTROL.STALE_TARGET" | "DRIVER.STALE_HANDLE" => {
             "The interface changed while the command ran. Run it again."
@@ -439,6 +445,14 @@ Use a keyboard action only if the target offers it."
             "Regions are computed for Windows windows only; use `aad describe` without --region."
         }
         "CONTROL.TARGET_UNKNOWN" => "Run `aad apps` and pass one of the resource ids it lists.",
+        "DRIVER.UNAVAILABLE"
+            if details["helper"] == "aad-linux-capture-helper"
+                && details["environment"] == "AAD_LINUX_CAPTURE_HELPER" =>
+        {
+            "In an X11 session, use the Linux release package with `aad-linux-capture-helper` \
+alongside `aad`, or run `plugins/linux_atspi/build_x11_capture_helper.sh` from the repository \
+root for a source build. Set `AAD_LINUX_CAPTURE_HELPER` to use a trusted helper path."
+        }
         _ => return None,
     })
 }
@@ -845,11 +859,7 @@ pub struct RecordArgs {
 }
 
 fn automation(error: aad_core::AutomationError) -> (Value, u8) {
-    let mut error = error.to_json();
-    if let Some(hint) = error["code"].as_str().and_then(hint) {
-        error["hint"] = json!(hint);
-    }
-    (json!({"status": "error", "error": error}), EXIT_FAILED)
+    error_outcome(error.to_json())
 }
 
 /// The longest a recording may run, in seconds.
@@ -1141,7 +1151,7 @@ mod tests {
             "DRIVER.AMBIGUOUS_MATCH",
             "DRIVER.AMBIGUOUS",
         ] {
-            let recovery = hint(code).unwrap();
+            let recovery = hint(code, &Value::Null).unwrap();
             if code == "DRIVER.AMBIGUOUS_MATCH" {
                 for flag in ["--in", "--near", "--nth"] {
                     assert!(recovery.contains(flag), "{code}: {flag}");
@@ -1163,8 +1173,10 @@ mod tests {
                 }
             }
         }
-        assert!(hint("CONTROL.TARGET_UNKNOWN").unwrap().contains("aad apps"));
-        let point = hint("DRIVER.POINT_NOT_PROVEN").unwrap();
+        assert!(hint("CONTROL.TARGET_UNKNOWN", &Value::Null)
+            .unwrap()
+            .contains("aad apps"));
+        let point = hint("DRIVER.POINT_NOT_PROVEN", &Value::Null).unwrap();
         for way in [
             "no input was sent",
             "aad describe",
@@ -1174,6 +1186,26 @@ mod tests {
         ] {
             assert!(point.contains(way), "{way}");
         }
-        assert!(hint("CONTROL.SOMETHING_ELSE").is_none());
+        assert!(hint("CONTROL.SOMETHING_ELSE", &Value::Null).is_none());
+    }
+
+    #[test]
+    fn only_missing_x11_capture_helper_gets_install_hint() {
+        let capture = json!({
+            "helper": "aad-linux-capture-helper",
+            "environment": "AAD_LINUX_CAPTURE_HELPER",
+        });
+        let recovery = hint("DRIVER.UNAVAILABLE", &capture).unwrap();
+        assert!(recovery.contains("X11 session"));
+        assert!(recovery.contains("plugins/linux_atspi/build_x11_capture_helper.sh"));
+        assert!(hint("DRIVER.CAPTURE_FAILED", &capture).is_none());
+
+        let input = json!({
+            "helper": "aad-linux-xtest-helper",
+            "environment": "AAD_LINUX_XTEST_HELPER",
+        });
+        assert!(hint("DRIVER.UNAVAILABLE", &input).is_none());
+        assert!(hint("DRIVER.UNAVAILABLE", &json!({"helper_exit_code": 69})).is_none());
+        assert!(hint("DRIVER.UNAVAILABLE", &Value::Null).is_none());
     }
 }
