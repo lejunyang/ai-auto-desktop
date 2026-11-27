@@ -19,6 +19,7 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IN_FLIGHT: usize = 8;
 const TRANSPORT_SLACK: Duration = Duration::from_millis(250);
+const CHILD_EXIT_GRACE: Duration = Duration::from_millis(250);
 
 pub trait Endpoint: Send + Sync {
     fn session_id(&self) -> &str;
@@ -281,14 +282,14 @@ impl From<FrameError> for HandshakeError {
 }
 
 impl HandshakeError {
-    fn diagnostic(self, child: &mut Option<Child>, deadline: Instant) -> crate::AutomationError {
+    fn diagnostic(self, child: &mut Option<Child>) -> crate::AutomationError {
         // Pipe closure can become visible before the child's exit status.
         let possible_exit = matches!(self, Self::Eof)
             || matches!(&self, Self::Write(e) if e.kind() == io::ErrorKind::BrokenPipe);
         if possible_exit {
             if let Some(status) = child
                 .as_mut()
-                .and_then(|child| observe_exit(child, deadline))
+                .and_then(|child| observe_exit(child, Instant::now() + CHILD_EXIT_GRACE))
             {
                 *child = None;
                 let status = status
@@ -305,6 +306,8 @@ impl HandshakeError {
                 "remote handshake received an invalid response frame. Child stdout must contain only control protocol NDJSON. Send startup messages to stderr".into(),
             Self::InvalidFrame =>
                 "remote handshake received an invalid response frame. Expected control protocol NDJSON".into(),
+            Self::Eof if child.is_some() =>
+                "child stdout closed before the remote handshake while the child was still running. Child stdout must contain only control protocol NDJSON. Check the startup script for stdout redirection".into(),
             Self::Eof =>
                 "remote response stream ended before the handshake completed".into(),
             Self::Read(error) => format!("remote handshake read failed: {error}"),
@@ -446,7 +449,7 @@ impl RemoteClient {
                 Err(mpsc::RecvTimeoutError::Timeout) => Err(HandshakeError::Timeout),
                 Err(mpsc::RecvTimeoutError::Disconnected) => Err(HandshakeError::Stopped),
             }
-            .map_err(|error| error.diagnostic(client.child.get_mut().unwrap(), deadline))?;
+            .map_err(|error| error.diagnostic(client.child.get_mut().unwrap()))?;
         client.request_gate = response
             .data
             .as_ref()

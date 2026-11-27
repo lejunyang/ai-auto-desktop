@@ -139,6 +139,32 @@ fn cli_proxy_waits_for_natural_exit_after_stdout_closes() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_proxy_reports_closed_stdout_without_waiting_for_the_handshake_timeout() {
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    let stderr = failed_startup(with_remote(
+        &["control", "connect", "--command"],
+        &["/bin/sh", "-c", "exec 1>&-; exec sleep 30"],
+    ));
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}: {stderr}");
+    assert!(stderr.starts_with("aad control: --command:"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "child stdout closed before the remote handshake while the child was still running"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("stdout must contain only control protocol NDJSON"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("stdout redirection"), "{stderr}");
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_proxy_keeps_stderr_banner_out_of_the_session_stream() {
