@@ -5,7 +5,7 @@
 //! observation returned. Every position is a fraction of an observed element's
 //! box, never a screen coordinate.
 use crate::tools::Tool;
-use aad_control::{transport::Endpoint, Operation, Request, Response};
+use aad_control::{transport::Endpoint, Operation, PointFailureStage, Request, Response};
 use serde_json::{json, Map, Value};
 
 fn target_schema() -> Value {
@@ -853,38 +853,33 @@ files; check the name, or ask the person where the file is."
 }
 
 pub fn payload(response: Response) -> Value {
+    let point_failure_stage = response.point_failure_stage();
     let mut value = serde_json::to_value(response).unwrap();
     let error = &value["error"];
     let details = &error["details"];
-    let guidance = match error["code"].as_str() {
-        Some("DRIVER.POINT_NOT_PROVEN")
-            if value["effect"] == "unknown" && details["dispatch_started"] == true =>
-        {
-            Some(
-                "The drag stopped after input dispatch started because an endpoint could no \
+    let guidance = match (point_failure_stage, error["code"].as_str()) {
+        (Some(PointFailureStage::AfterDispatch), _) => Some(
+            "The drag stopped after input dispatch started because an endpoint could no \
 longer be confirmed. Check details.input_progress.delivered and details.input_progress.released \
 when present. Call control_observe again for the drag source and target and verify the result \
 before retrying.",
-            )
-        }
-        Some("DRIVER.POINT_NOT_PROVEN")
-            if value["effect"] == "not_applied" && details["dispatch_started"] != true =>
-        {
-            Some(
-                "The center-point hit could not be confirmed inside the target; no input was sent. \
+        ),
+        (Some(PointFailureStage::BeforeDispatch), _) => Some(
+            "The center-point hit could not be confirmed inside the target; no input was sent. \
 Call control_observe again and select a specific leaf node, or scroll and retry. \
 Use a keyboard action only if the target's capabilities offer it.",
+        ),
+        (_, Some("DRIVER.UNKNOWN_EFFECT")) if details["cause"] == "focused_element_changed" => {
+            Some(
+                "Keyboard focus moved to another control. Check details.input_progress.delivered \
+and observe the field's current value before continuing with fill or type_text.",
             )
         }
-        Some("DRIVER.UNKNOWN_EFFECT") if details["cause"] == "focused_element_changed" => Some(
-            "Keyboard focus moved to another control. Check details.input_progress.delivered \
-and observe the field's current value before continuing with fill or type_text.",
-        ),
-        Some("DRIVER.TIMEOUT") if details["input_progress"]["unit"] == "codepoint" => Some(
+        (_, Some("DRIVER.TIMEOUT")) if details["input_progress"]["unit"] == "codepoint" => Some(
             "The deadline elapsed while typing. Check details.input_progress.delivered \
 and observe the field before continuing. On X11, increase timeout_ms up to 30000 or use fill.",
         ),
-        Some("DRIVER.CLIPBOARD_BUSY")
+        (_, Some("DRIVER.CLIPBOARD_BUSY"))
             if matches!(
                 details["helper_code"].as_str(),
                 Some(
@@ -897,7 +892,7 @@ and observe the field before continuing. On X11, increase timeout_ms up to 30000
         {
             Some("Use fill or type_text to enter the text without replacing the clipboard.")
         }
-        code => code.and_then(hint),
+        (_, code) => code.and_then(hint),
     };
     if let Some(guidance) = guidance {
         value["error"]["hint"] = json!(guidance);
