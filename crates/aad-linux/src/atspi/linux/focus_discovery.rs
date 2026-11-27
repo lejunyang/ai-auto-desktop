@@ -296,7 +296,6 @@ impl LinuxBackend {
                 Some(parent),
                 &snapshot.application,
                 input,
-                snapshot.qt_x11_windows.as_deref(),
                 deadline,
             ) else {
                 return Ok(());
@@ -315,7 +314,6 @@ impl LinuxBackend {
             max_depth - depth,
             available,
             input,
-            snapshot.qt_x11_windows.as_deref(),
             deadline,
         ) else {
             return Ok(());

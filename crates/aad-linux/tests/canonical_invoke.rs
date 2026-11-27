@@ -62,7 +62,6 @@ impl AtspiBackend for CanonicalBackend {
             }],
             truncated: false,
             truncation_reasons: vec![],
-            qt_x11_windows: None,
         })
     }
     fn focus(

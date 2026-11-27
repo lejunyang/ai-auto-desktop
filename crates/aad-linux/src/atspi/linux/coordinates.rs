@@ -131,16 +131,18 @@ impl LinuxBackend {
                     .get_extents(CoordType::Screen),
             )
             .map_err(|e| native_failure("coordinate window geometry", &native, e))?;
-            result.push((
-                native,
-                name,
-                Bounds {
-                    x,
-                    y,
-                    width,
-                    height,
-                },
-            ));
+            if width > 0 && height > 0 {
+                result.push((
+                    native,
+                    name,
+                    Bounds {
+                        x,
+                        y,
+                        width,
+                        height,
+                    },
+                ));
+            }
         }
         self.check_cancelled(false)?;
         remaining(deadline, false)?;
@@ -263,44 +265,6 @@ impl LinuxBackend {
             .application
             .get("process_id")
             .and_then(Value::as_u64)
-            .and_then(|process| u32::try_from(process).ok())
-            .unwrap_or(0);
-        let mut maps = Vec::new();
-        for window in snapshot.nodes.iter().filter(|n| n.parent_index == Some(0)) {
-            let Some(calibrated) = snapshot.qt_x11_windows.iter().flatten().find(|calibrated| {
-                calibrated.native == window.native
-                    && Some(calibrated.raw) == window.bounds
-                    && window.name.as_deref() == Some(calibrated.name.as_str())
-            }) else {
-                continue;
-            };
-            if let Some((client, physical)) = calibrated.client {
-                maps.push(CoordinateMap {
-                    window: calibrated.native.clone(),
-                    raw: calibrated.raw,
-                    physical,
-                    client,
-                    process,
-                    members: BTreeSet::new(),
-                });
-            }
-        }
-        self.apply_coordinate_maps(snapshot, maps)
-    }
-
-    pub(super) fn read_qt_x11_windows(
-        &self,
-        application: &mut Map<String, Value>,
-        deadline: Instant,
-    ) -> Result<Option<Vec<QtX11Window>>, AutomationError> {
-        if application.get("toolkit_name").and_then(Value::as_str) != Some("Qt")
-            || crate::wayland_portal::is_wayland_session()
-        {
-            return Ok(None);
-        }
-        let process = application
-            .get("process_id")
-            .and_then(Value::as_u64)
             .and_then(|p| u32::try_from(p).ok())
             .unwrap_or(0);
         let mut clients = match self.read_client_geometry(process, deadline) {
@@ -309,7 +273,9 @@ impl LinuxBackend {
                 return Err(error);
             }
             Err(error) => {
-                application.insert("coordinate_diagnostic".into(), json!(error.code));
+                snapshot
+                    .application
+                    .insert("coordinate_diagnostic".into(), json!(error.code));
                 Vec::new()
             }
         };
@@ -345,47 +311,62 @@ impl LinuxBackend {
             self.check_cancelled(false)?;
             remaining(deadline, false)?;
         }
-        let windows = match self.application_coordinate_windows(application, deadline) {
+        let windows = match self.application_coordinate_windows(&snapshot.application, deadline) {
             Ok(windows) => windows,
             Err(error) if matches!(error.code.as_str(), "DRIVER.TIMEOUT" | "DRIVER.CANCELLED") => {
                 return Err(error);
             }
             Err(error) => {
                 remaining(deadline, false)?;
-                application.insert("coordinate_diagnostic".into(), json!(error.code));
+                snapshot
+                    .application
+                    .insert("coordinate_diagnostic".into(), json!(error.code));
                 Vec::new()
             }
         };
-        let calibrated = windows
-            .iter()
-            .map(|(native, name, raw)| {
-                let mut candidates = clients.iter().filter(|client| {
-                    client.title_matches(name) && calibration(*raw, bounds(client))
-                });
-                let client = candidates.next().filter(|client| {
-                    candidates.next().is_none()
-                        && !windows.iter().any(|(other, title, raw)| {
-                            other != native
-                                && client.title_matches(title)
-                                && calibration(*raw, bounds(client))
-                        })
-                });
-                QtX11Window {
-                    native: native.clone(),
-                    name: name.clone(),
-                    raw: *raw,
-                    client: client.map(|client| (client.id, bounds(client))),
-                }
-            })
-            .collect();
-        Ok(Some(calibrated))
-    }
-
-    fn apply_coordinate_maps(
-        &self,
-        snapshot: &mut BackendSnapshot,
-        mut maps: Vec<CoordinateMap>,
-    ) -> Result<(), AutomationError> {
+        let mut maps = Vec::new();
+        for window in snapshot.nodes.iter().filter(|n| n.parent_index == Some(0)) {
+            let Some(raw) = window.bounds.filter(|b| b.width > 0 && b.height > 0) else {
+                continue;
+            };
+            let matches = clients
+                .iter()
+                .filter(|c| {
+                    window
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| c.title_matches(name))
+                        && calibration(raw, bounds(c))
+                })
+                .collect::<Vec<_>>();
+            let [client] = matches.as_slice() else {
+                // Keep semantic observation; synthetic actions must not guess
+                // between clients or use toolkit coordinates as physical ones.
+                continue;
+            };
+            let candidates = windows
+                .iter()
+                .filter(|(_, name, bounds)| {
+                    client.title_matches(name) && calibration(*bounds, self::bounds(client))
+                })
+                .collect::<Vec<_>>();
+            if candidates.len() != 1 || candidates[0].0 != window.native || candidates[0].2 != raw {
+                continue;
+            }
+            maps.push(CoordinateMap {
+                window: window.native.clone(),
+                raw,
+                physical: bounds(client),
+                client: client.id,
+                process,
+                members: BTreeSet::new(),
+            });
+        }
+        let mut counts = BTreeMap::new();
+        for map in &maps {
+            *counts.entry(map.client).or_insert(0usize) += 1;
+        }
+        maps.retain(|map| counts[&map.client] == 1);
         for index in 0..snapshot.nodes.len() {
             let mut ancestor = index;
             let mut visited = BTreeSet::new();
