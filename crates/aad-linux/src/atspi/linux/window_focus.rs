@@ -413,7 +413,7 @@ impl LinuxBackend {
         let client = windows
             .iter()
             .find(|entry| entry.native == window.native && entry.raw == window.bounds)
-            .and_then(|entry| entry.client)
+            .and_then(|entry| entry.unique_client(windows))
             .filter(|client| client.viewable)
             .ok_or_else(unproven_focus_window)?;
         window.bounds = client.bounds;
@@ -486,23 +486,28 @@ fn qt_binding_matches(
     observed: Bounds,
     binding: &X11WindowBinding,
 ) -> bool {
-    windows.iter().any(|entry| entry.native == *target)
-        && windows.iter().all(|entry| {
-            let Some(client) = entry.client else {
-                return false;
-            };
-            if entry.native == *target {
-                // A minimized window keeps its raw observation for window
-                // actions, which still require a strict native proof.
-                client.xid == binding.client
-                    && observed
-                        == if client.viewable {
-                            client.bounds
-                        } else {
-                            entry.raw
-                        }
-            } else {
-                !binding.matches(client.bounds)
-            }
-        })
+    let Some(entry) = windows.iter().find(|entry| entry.native == *target) else {
+        return false;
+    };
+    let Some(client) = entry.unique_client(windows) else {
+        return false;
+    };
+    // A minimized target still needs a native proof for its raw observation.
+    let expected = if client.viewable {
+        client.bounds
+    } else {
+        entry.raw
+    };
+    client.xid == binding.client
+        && observed == expected
+        && windows
+            .iter()
+            .filter(|other| other.native != *target)
+            .all(|other| {
+                !other.candidates.is_empty()
+                    && !other
+                        .candidates
+                        .iter()
+                        .any(|candidate| binding.matches(candidate.bounds))
+            })
 }

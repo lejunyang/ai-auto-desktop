@@ -258,16 +258,20 @@ impl LinuxBackend {
             .and_then(Value::as_u64)
             .and_then(|process| u32::try_from(process).ok())
             .unwrap_or(0);
+        let windows = snapshot.qt_x11_windows.as_deref().unwrap_or_default();
         let mut maps = Vec::new();
         for window in snapshot.nodes.iter().filter(|n| n.parent_index == Some(0)) {
-            let Some(calibrated) = snapshot.qt_x11_windows.iter().flatten().find(|calibrated| {
+            let Some(calibrated) = windows.iter().find(|calibrated| {
                 calibrated.native == window.native
                     && Some(calibrated.raw) == window.bounds
                     && window.name.as_deref() == Some(calibrated.name.as_str())
             }) else {
                 continue;
             };
-            if let Some(client) = calibrated.client.filter(|client| client.viewable) {
+            if let Some(client) = calibrated
+                .unique_client(windows)
+                .filter(|client| client.viewable)
+            {
                 maps.push(CoordinateMap {
                     window: calibrated.native.clone(),
                     raw: calibrated.raw,
@@ -351,28 +355,21 @@ impl LinuxBackend {
         };
         let calibrated = windows
             .iter()
-            .map(|(native, name, raw)| {
-                let mut candidates = clients.iter().filter(|client| {
-                    client.title_matches(name) && calibration(*raw, bounds(client))
-                });
-                let client = candidates.next().filter(|client| {
-                    candidates.next().is_none()
-                        && !windows.iter().any(|(other, title, raw)| {
-                            other != native
-                                && client.title_matches(title)
-                                && calibration(*raw, bounds(client))
-                        })
-                });
-                QtX11Window {
-                    native: native.clone(),
-                    name: name.clone(),
-                    raw: *raw,
-                    client: client.map(|client| QtX11Client {
+            .map(|(native, name, raw)| QtX11Window {
+                native: native.clone(),
+                name: name.clone(),
+                raw: *raw,
+                candidates: clients
+                    .iter()
+                    .filter(|client| {
+                        client.title_matches(name) && calibration(*raw, bounds(client))
+                    })
+                    .map(|client| QtX11Client {
                         xid: client.id,
                         bounds: bounds(client),
                         viewable: client.viewable,
-                    }),
-                }
+                    })
+                    .collect(),
             })
             .collect();
         Ok(Some(calibrated))

@@ -3,7 +3,8 @@ param(
     [string]$InputHelper = '',
     [string]$BuildDirectory = '',
     [switch]$BuildOnly,
-    [switch]$ScopedGeometryOnly
+    [switch]$ScopedGeometryOnly,
+    [switch]$ThreeWindowsOnly
 )
 
 # Run alone on an authorized interactive X11 desktop. This fixture independently
@@ -226,11 +227,58 @@ function Assert-ScopedGeometry {
     if ($failed.Count -gt 0) { throw "scoped geometry checks failed: $($failed.case -join ', ')" }
 }
 
+function Test-ThreeWindowGeometry {
+    $ids = $fixture.StandardOutput.ReadLineAsync()
+    if (-not $ids.Wait(5000) -or $ids.Result -notmatch '^\d+ \d+ \d+$') { throw 'fixture window IDs missing' }
+    $primary, $duplicate, $secondary = $ids.Result -split ' '
+    $primaryOrigin = Window-Origin $primary
+    $duplicateOrigin = Window-Origin $duplicate
+    if ($primaryOrigin.x -eq $duplicateOrigin.x -and $primaryOrigin.y -eq $duplicateOrigin.y) {
+        throw 'same-title siblings did not start at distinct origins'
+    }
+    $names = @('Stale primary target', 'Duplicate primary target', 'Live secondary target')
+    $counts = {
+        foreach ($name in $names) {
+            Read-Timing ('^' + [regex]::Escape($name) + ' delivered (\d+) released (\d+)$')
+        }
+    }
+    foreach ($overlap in @($false, $true)) {
+        if ($overlap) {
+            Move-FixtureWindow $duplicate $primaryOrigin.x $primaryOrigin.y
+            & xdotool windowactivate --sync $primary
+            $name = $names[0]; $focused = $primary; $expected = '0,0,0,0,0,0'
+        } else {
+            & xdotool windowactivate --sync $secondary
+            $name = $names[2]; $focused = $secondary; $expected = '0,0,0,0,1,1'
+        }
+        if ($LASTEXITCODE -ne 0 -or (& xdotool getwindowfocus) -ne $focused) { throw 'fixture focus mismatch' }
+        foreach ($scoped in @($false, $true)) {
+            $before = @(& $counts)
+            $node = Find-Target $name
+            if ($scoped) {
+                $anchor = if ($overlap) { $node } else { Find-Target 'AAD Secondary Window' }
+                $observation = Call-Control @{method='observe';resource_id=$script:resourceId;max_nodes=100;
+                    view=@{mode='nodes';scope_target=$anchor.target}}
+                $nodes = @($observation.data.nodes | Where-Object { $_.name -eq $name })
+                if ($observation.error -or $observation.data.truncated -or $nodes.Count -ne 1) { throw 'scoped key target missing' }
+                $node = $nodes[0]
+            }
+            $result = Call-Control @{method='act';target=$node.target;action=@{type='key';keys=@('f2')}}
+            $after = @(& $counts)
+            $events = @(for ($i = 0; $i -lt $before.Count; $i++) { $after[$i] - $before[$i] })
+            $effect = if ($overlap) { 'not_applied' } else { 'applied' }
+            $checks.Add(@{case="three_windows_overlap_${overlap}_scoped_${scoped}";effect=$result.effect;code=$result.error.code;
+                key_events=$events;passed=($result.effect -eq $effect -and ($events -join ',') -eq $expected)})
+        }
+    }
+}
+
 try {
     $fixtureInfo = [Diagnostics.ProcessStartInfo]::new()
     $fixtureInfo.FileName = $fixturePath
     $fixtureInfo.UseShellExecute = $false
     $fixtureInfo.RedirectStandardOutput = $true
+    if ($ThreeWindowsOnly) { $fixtureInfo.Arguments = '--three-windows' }
     $fixture = [Diagnostics.Process]::Start($fixtureInfo)
     $ready = $fixture.StandardOutput.ReadLineAsync()
     if (-not $ready.Wait(10000) -or $ready.Result -ne 'READY') { throw 'fixture failed to start' }
@@ -252,6 +300,15 @@ try {
     }
     if ($found.Count -ne 1) { throw 'fixture resource not found' }
     $script:resourceId = $found[0].resource_id
+
+    if ($ThreeWindowsOnly) {
+        Test-ThreeWindowGeometry
+        @{passed=(@($checks | Where-Object { $_.passed -eq $false }).Count -eq 0);checks=@($checks)} |
+            ConvertTo-Json -Depth 12 | Set-Content -Encoding UTF8 (Join-Path $BuildDirectory 'summary.json')
+        Assert-ScopedGeometry
+        Write-Output 'PASS: full and scoped observations deliver keys to the distinct target and reject overlapping same-title windows'
+        return
+    }
 
     if ($ScopedGeometryOnly) {
         Test-ScopedGeometry

@@ -145,7 +145,23 @@ pub struct QtX11Window {
     native: NativeRef,
     name: String,
     raw: Bounds,
-    client: Option<QtX11Client>,
+    candidates: Vec<QtX11Client>,
+}
+
+impl QtX11Window {
+    fn unique_client(&self, windows: &[Self]) -> Option<QtX11Client> {
+        let [candidate] = self.candidates.as_slice() else {
+            return None;
+        };
+        (!windows.iter().any(|other| {
+            other.native != self.native
+                && other
+                    .candidates
+                    .iter()
+                    .any(|client| client.xid == candidate.xid)
+        }))
+        .then_some(*candidate)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
