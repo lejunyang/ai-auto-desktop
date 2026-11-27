@@ -380,37 +380,33 @@ impl RemoteClient {
             child: Mutex::new(child),
         };
         let request = Request::new(None, Operation::Capabilities {});
-        let write_deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
-        let deadline = write_deadline + TRANSPORT_SLACK;
-        let mut bytes = serde_json::to_vec(&request).map_err(|cause| {
+        let deadline = Instant::now() + Duration::from_millis(request.timeout_ms) + TRANSPORT_SLACK;
+        let mut handshake_bytes = serde_json::to_vec(&request).map_err(|cause| {
             error(
                 "CONTROL.CONNECT_FAILED",
                 format!("could not encode remote handshake request: {cause}"),
             )
         })?;
-        bytes.push(b'\n');
-        let handshake = Packet {
-            bytes,
-            deadline: write_deadline,
-        };
+        handshake_bytes.push(b'\n');
         let (startup, response) = mpsc::channel();
         let write_failure = startup.clone();
         let (failed, writing) = (closed.clone(), pending.clone());
         std::thread::spawn(move || {
             let mut output = output;
-            let mut write_failure = Some(write_failure);
-            for packet in std::iter::once(handshake).chain(queue) {
-                let startup = write_failure.take();
-                if startup.is_none() && failed.load(Ordering::SeqCst) {
+            if let Err(error) = write_frame(&mut output, &handshake_bytes) {
+                let _ = write_failure.send(Err(HandshakeError::Write(error)));
+                failed.store(true, Ordering::SeqCst);
+                return;
+            }
+            drop(write_failure);
+            while let Ok(packet) = queue.recv() {
+                if failed.load(Ordering::SeqCst) {
                     break;
                 }
                 if Instant::now() >= packet.deadline {
                     continue;
                 }
-                if let Err(error) = write_frame(&mut output, &packet.bytes) {
-                    if let Some(startup) = startup {
-                        let _ = startup.send(Err(HandshakeError::Write(error)));
-                    }
+                if write_frame(&mut output, &packet.bytes).is_err() {
                     failed.store(true, Ordering::SeqCst);
                     writing.lock().unwrap().clear();
                     break;
