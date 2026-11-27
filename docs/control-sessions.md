@@ -505,6 +505,8 @@ MCP 的 `run_steps` 和全部由 `control.session` 步骤组成的非持久化 `
 
 可读属性为 `name`（观察中的控件名称）、`value`（控件值）、`checked`、`enabled`、`selected` 和 `present`。只有 `present` 会把找不到当成 `false`。同名命中多个要收窄 locator；控件没提供的属性会报错，受保护输入框的值不能读取。若要查一个元素并继续操作它，用 `control_find` 或 `control_find_many`。
 
+单个字段出错时，整批读失败，`details.field` 给出该字段请求里的 `as`。属性不可用时，`CONTROL.FIELD_UNAVAILABLE` 还会在 `details.property` 给出请求的属性，并在已定位到元素时通过 `details.available_properties` 列出它当前可读的属性名。
+
 ## 引用、期限与结果
 
 直接 NDJSON 示例（每行一个对象；先发送第一行，读取真实 session ID 后再发送后续行）：

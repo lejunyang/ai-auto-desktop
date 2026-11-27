@@ -76,8 +76,11 @@ impl Backend for Fake {
         let clicked = !self.acted.lock().unwrap().is_empty();
         let mut nodes = vec![
             json!({"node_id": "n1", "role": "button", "name": "Save", "actions": ["click", "drag"]}),
-            json!({"node_id": "n2", "role": "edit", "name": "Text", "actions": ["fill"]}),
+            json!({"node_id": "n2", "role": "edit", "name": "Text", "value": "Sample", "actions": ["fill"]}),
             json!({"node_id": "n3", "role": "list", "name": "Bin", "actions": ["drag"]}),
+            json!({"node_id": "n6", "role": "edit", "name": "Password", "value": "fixture-secret", "states": {"protected": true, "enabled": false}}),
+            json!({"node_id": "n7", "role": "edit", "name": "Truncated", "value": "partial", "value_truncated": true}),
+            json!({"node_id": "n8", "role": "edit", "name": "Oversized", "value": "x".repeat(4097)}),
         ];
         if clicked {
             nodes.push(json!({"node_id": "n4", "role": "text", "name": "Saved", "actions": []}));
@@ -206,28 +209,68 @@ fn reads_named_fields_in_a_read_only_session() {
             .unwrap(),
         )
     };
-    let label = json!({"as":"label","locator":{"name":"Save"},"property":"name"});
-    let absent = json!({"as":"saved","locator":{"name":"Saved"},"property":"present"});
+    let field = |alias: &str, name: &str, property: &str| {
+        json!({
+            "as": alias,
+            "locator": {"name": name},
+            "property": property,
+        })
+    };
+    let label = field("label", "Save", "name");
+    let absent = field("saved", "Saved", "present");
     assert_eq!(
         read(json!([label, absent])).data.unwrap(),
         json!({"values":{"label":"Save","saved":false}})
     );
-    for fields in [
-        json!([]),
-        json!([label, label]),
-        json!(vec![label.clone(); 33]),
-    ] {
-        assert_eq!(
-            read(fields).error.unwrap()["code"],
-            "CONTROL.INVALID_REQUEST"
-        );
+    for fields in [json!([]), json!(vec![label.clone(); 33])] {
+        let error = read(fields).error.unwrap();
+        assert_eq!(error["code"], "CONTROL.INVALID_REQUEST");
+        assert_eq!(error["details"], json!({}));
     }
-    assert_eq!(
-        read(json!([{"as":"price","locator":{"name":"Save"},"property":"value"}]))
-            .error
-            .unwrap()["code"],
-        "CONTROL.FIELD_UNAVAILABLE"
-    );
+    for (fields, alias) in [
+        (json!([label, label]), "label"),
+        (json!([field("Bad", "Save", "name")]), "Bad"),
+        (
+            json!([{"as":"empty","locator":{},"property":"value"}]),
+            "empty",
+        ),
+    ] {
+        let error = read(fields).error.unwrap();
+        assert_eq!(error["code"], "CONTROL.INVALID_REQUEST");
+        assert_eq!(error["details"]["field"], alias);
+    }
+
+    for (alias, name, code) in [
+        ("missing", "Missing", "CONTROL.NOT_FOUND"),
+        ("pin", "Password", "POLICY.DENIED"),
+        ("partial", "Truncated", "CONTROL.FIELD_TOO_LARGE"),
+        ("long", "Oversized", "CONTROL.FIELD_TOO_LARGE"),
+    ] {
+        let reply = read(json!([label, field(alias, name, "value")]));
+        assert!(reply.data.is_none());
+        let error = reply.error.unwrap();
+        assert_eq!(error["code"], code);
+        assert_eq!(error["details"]["field"], alias);
+        assert!(!error.to_string().contains("fixture-secret"));
+    }
+    for (name, available) in [
+        ("Save", json!(["name", "present"])),
+        ("Text", json!(["name", "value", "present"])),
+        ("Password", json!(["name", "present", "enabled"])),
+        ("Truncated", json!(["name", "present"])),
+        ("Oversized", json!(["name", "present"])),
+    ] {
+        let reply = read(json!([label, field("price", name, "checked")]));
+        assert!(reply.data.is_none());
+        let error = reply.error.unwrap();
+        assert_eq!(error["code"], "CONTROL.FIELD_UNAVAILABLE");
+        assert_eq!(error["message"], "field price does not expose Checked");
+        assert_eq!(
+            error["details"],
+            json!({"field":"price","property":"checked","available_properties":available})
+        );
+        assert!(!error.to_string().contains("fixture-secret"));
+    }
 }
 
 #[test]

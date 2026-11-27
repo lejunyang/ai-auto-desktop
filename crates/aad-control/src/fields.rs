@@ -23,6 +23,47 @@ pub enum Property {
     Selected,
 }
 
+impl Property {
+    const ALL: [Self; 6] = [
+        Self::Name,
+        Self::Value,
+        Self::Present,
+        Self::Checked,
+        Self::Enabled,
+        Self::Selected,
+    ];
+
+    fn read(self, found: &Value) -> std::result::Result<&Value, PropertyError> {
+        let node = &found["node"];
+        let value = match self {
+            Self::Present => &found["found"],
+            Self::Name => &node["name"],
+            Self::Value if node["states"]["protected"] == true => {
+                return Err(PropertyError::Protected);
+            }
+            Self::Value if node["value_truncated"] == true => {
+                return Err(PropertyError::Truncated);
+            }
+            Self::Value => &node["value"],
+            Self::Checked => &node["states"]["checked"],
+            Self::Enabled => &node["states"]["enabled"],
+            Self::Selected => &node["states"]["selected"],
+        };
+        match value {
+            Value::String(text) if text.len() > 4096 => Err(PropertyError::TooLarge),
+            Value::String(_) | Value::Bool(_) | Value::Number(_) => Ok(value),
+            _ => Err(PropertyError::Unavailable),
+        }
+    }
+}
+
+enum PropertyError {
+    Protected,
+    Truncated,
+    TooLarge,
+    Unavailable,
+}
+
 pub(crate) fn validate(fields: &[ReadField]) -> Result<()> {
     let mut names = BTreeSet::new();
     if !(1..=MAX_FIND_LOCATORS).contains(&fields.len()) {
@@ -46,7 +87,8 @@ pub(crate) fn validate(fields: &[ReadField]) -> Result<()> {
             return Err(error(
                 "CONTROL.INVALID_REQUEST",
                 "each field needs a distinct lowercase identifier and a locator",
-            ));
+            )
+            .with_detail("field", json!(field.alias)));
         }
     }
     Ok(())
@@ -75,39 +117,38 @@ pub(super) fn project(
                 context,
             )
             .map_err(|err| err.with_detail("field", json!(field.alias)))?;
-        let node = &found["node"];
-        let value = match field.property {
-            Property::Present => &found["found"],
-            Property::Name => &node["name"],
-            Property::Value if node["states"]["protected"] == true => {
-                return Err(error(
-                    "POLICY.DENIED",
-                    format!("field {} is protected", field.alias),
-                ));
-            }
-            Property::Value if node["value_truncated"] == true => {
-                return Err(error(
+        let value = field.property.read(&found).map_err(|failure| {
+            let alias = &field.alias;
+            let err = match failure {
+                PropertyError::Protected => {
+                    error("POLICY.DENIED", format!("field {alias} is protected"))
+                }
+                PropertyError::Truncated => error(
                     "CONTROL.FIELD_TOO_LARGE",
-                    format!("field {} was truncated in the observation", field.alias),
-                ));
-            }
-            Property::Value => &node["value"],
-            Property::Checked => &node["states"]["checked"],
-            Property::Enabled => &node["states"]["enabled"],
-            Property::Selected => &node["states"]["selected"],
-        };
-        if !matches!(value, Value::String(_) | Value::Bool(_) | Value::Number(_)) {
-            return Err(error(
-                "CONTROL.FIELD_UNAVAILABLE",
-                format!("field {} does not expose {:?}", field.alias, field.property),
-            ));
-        }
-        if value.as_str().is_some_and(|text| text.len() > 4096) {
-            return Err(error(
-                "CONTROL.FIELD_TOO_LARGE",
-                format!("field {} exceeds 4096 bytes", field.alias),
-            ));
-        }
+                    format!("field {alias} was truncated in the observation"),
+                ),
+                PropertyError::TooLarge => error(
+                    "CONTROL.FIELD_TOO_LARGE",
+                    format!("field {alias} exceeds 4096 bytes"),
+                ),
+                PropertyError::Unavailable => {
+                    let mut err = error(
+                        "CONTROL.FIELD_UNAVAILABLE",
+                        format!("field {alias} does not expose {:?}", field.property),
+                    )
+                    .with_detail("property", json!(field.property));
+                    if found["found"] == true {
+                        let available: Vec<_> = Property::ALL
+                            .into_iter()
+                            .filter(|property| property.read(&found).is_ok())
+                            .collect();
+                        err = err.with_detail("available_properties", json!(available));
+                    }
+                    err
+                }
+            };
+            err.with_detail("field", json!(alias))
+        })?;
         values.insert(field.alias.clone(), value.clone());
     }
     Ok(json!({"values":values}))
