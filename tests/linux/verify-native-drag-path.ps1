@@ -95,6 +95,10 @@ try {
             $moves=@($events | Where-Object { $_.event -eq 'move' })
             if ($mode -eq 'success') {
                 if ($result.error -or $result.effect -ne 'applied' -or $moves.Count -ne 3) { throw 'successful drag did not deliver all anchors' }
+                $progress=$result.data.backend_result.backend_result.input.input_progress
+                if ($progress.unit -ne 'button' -or $progress.delivered -ne 1 -or $progress.total -ne 1 -or $progress.released -ne $true) {
+                    throw 'successful drag did not report the released button'
+                }
                 $expected=@(@(0.8,0.2),@(0.2,0.8),@(0.9,0.9))
                 for ($i=0;$i -lt 3;$i++) {
                     if ([Math]::Abs($moves[$i].fx-$expected[$i][0]) -gt 0.015 -or [Math]::Abs($moves[$i].fy-$expected[$i][1]) -gt 0.015) { throw 'actual pointer trace differs from normalized anchors' }

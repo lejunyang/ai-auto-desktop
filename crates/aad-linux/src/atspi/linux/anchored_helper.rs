@@ -116,9 +116,17 @@ fn write_pipe(
     }
 }
 
+#[derive(PartialEq, Eq)]
+enum StreamPhase {
+    Dispatch,
+    Progress,
+    Result,
+}
+
 fn collect_frames(
     frames: &mut Vec<u8>,
     output: &mut Vec<u8>,
+    phase: &mut StreamPhase,
     mut validate: impl FnMut(&Value) -> Result<(), AutomationError>,
 ) -> Result<(), AutomationError> {
     let mut cursor = 0;
@@ -128,6 +136,11 @@ fn collect_frames(
         cursor = end;
         let value: Value =
             serde_json::from_slice(line).map_err(|_| protocol("malformed helper frame"))?;
+        if *phase == StreamPhase::Result
+            || (*phase == StreamPhase::Progress && value.get("event").is_some())
+        {
+            return Err(protocol("unexpected frame after helper completion"));
+        }
         if value["event"] == "validate_segment" {
             validate(&value)?;
         } else {
@@ -137,7 +150,14 @@ fn collect_frames(
             output.extend_from_slice(line);
             if value["event"] == "dispatch_started" {
                 validate(&value)?;
-            } else if value["event"] != "input_progress" && !value["ok"].is_boolean() {
+            } else if value["event"] == "input_progress" {
+                if value.get("ok").is_some() || parse_helper_progress(&value).is_none() {
+                    return Err(protocol("invalid helper input progress"));
+                }
+                *phase = StreamPhase::Progress;
+            } else if value.get("event").is_none() && value["ok"].is_boolean() {
+                *phase = StreamPhase::Result;
+            } else {
                 return Err(protocol("unknown helper frame"));
             }
         }
@@ -221,6 +241,7 @@ pub(super) fn run(request: Request<'_>) -> Result<HelperOutput, AutomationError>
     let mut next = 0usize;
     let mut worker: Option<mpsc::Receiver<Result<(), AutomationError>>> = None;
     let mut ready = false;
+    let mut phase = StreamPhase::Dispatch;
     let result = (|| loop {
         check_wait(deadline, token)?;
         let stdin = child.stdin.as_mut().expect("piped stdin");
@@ -233,14 +254,16 @@ pub(super) fn run(request: Request<'_>) -> Result<HelperOutput, AutomationError>
             .map_err(|_| protocol("helper state unavailable"))?;
         drain(&mut stdout, &mut frames)?;
         drain(&mut stderr, &mut diagnostics)?;
-        collect_frames(&mut frames, &mut output, |value| {
+        let mut validation_requested = false;
+        collect_frames(&mut frames, &mut output, &mut phase, |value| {
             if value["event"] == "dispatch_started" {
                 if next == 0 {
                     return Err(protocol("helper dispatched before validation"));
                 }
                 return Ok(());
             }
-            if worker.is_some()
+            if validation_requested
+                || worker.is_some()
                 || ready
                 || !pending.is_empty()
                 || next >= handshakes
@@ -249,9 +272,22 @@ pub(super) fn run(request: Request<'_>) -> Result<HelperOutput, AutomationError>
             {
                 return Err(protocol("unexpected helper validation sequence"));
             }
-            if status.is_some() {
-                return Ok(());
+            validation_requested = true;
+            Ok(())
+        })?;
+        if let Some(status) = status {
+            if !frames.is_empty() {
+                return Err(protocol("incomplete helper frame"));
             }
+            if status.success() && next != handshakes {
+                return Err(protocol("helper skipped validation"));
+            }
+            return Ok(status);
+        }
+        if phase != StreamPhase::Dispatch {
+            worker = None;
+            ready = false;
+        } else if validation_requested {
             match &validation {
                 Validation::Inline(validate) => {
                     validate(next)?;
@@ -272,13 +308,6 @@ pub(super) fn run(request: Request<'_>) -> Result<HelperOutput, AutomationError>
                     worker = Some(rx);
                 }
             }
-            Ok(())
-        })?;
-        if let Some(status) = status {
-            if status.success() && next != handshakes {
-                return Err(protocol("helper skipped validation"));
-            }
-            return Ok(status);
         }
         if let Some(receiver) = &worker {
             match receiver.try_recv() {
@@ -363,6 +392,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    const PROGRESS: &str = r#"{"event":"input_progress","unit":"button","delivered":1,"total":1,"proven_window":42,"released":true}"#;
 
     struct Script(PathBuf);
     impl Script {
@@ -389,6 +419,8 @@ for index in 0 1 2 3; do
     [ "$line" = "ack {NONCE} $index" ] || exit 2
     if [ "$index" = 0 ]; then printf '{{"event":"dispatch_started"}}\n'; fi
 done
+printf '%s\n' '{PROGRESS}'
+sleep 0.2
 printf '{{"ok":true,"dispatch_started":true,"events":5}}\n'
 "#
         ))
@@ -414,7 +446,9 @@ printf '{{"ok":true,"dispatch_started":true,"events":5}}\n'
             }),
         )
         .unwrap();
-        assert!(result.status.success());
+        let input = parse_input_helper(result, "drag_path", 5, 42).unwrap();
+        assert_eq!(input["input_progress"]["released"], true);
+        assert_eq!(input["input_progress"]["delivered"], 1);
         assert_eq!(*visited.lock().unwrap(), vec![0, 1, 2, 3]);
         assert!(!busy.load(Ordering::SeqCst));
         for event in [
@@ -436,6 +470,56 @@ printf '{{"ok":true,"dispatch_started":true,"events":5}}\n'
             .unwrap();
             assert_eq!(error.effect, "not_applied");
             assert_eq!(error.code, "DRIVER.ACTION_FAILED");
+        }
+    }
+
+    #[test]
+    fn terminal_progress_preserves_helper_failure_and_rejects_invalid_frames() {
+        let initial_progress = PROGRESS.replace("\"delivered\":1", "\"delivered\":0");
+        let result = r#"{"ok":false,"code":"focus_owner_changed","dispatch_started":false}"#;
+        let invalid_progress = PROGRESS.replace("\"total\":1", "\"total\":0");
+        for (body, expected) in [
+            (
+                format!("printf '%s\\n' '{initial_progress}' '{result}'"),
+                "DRIVER.FOCUS_LOST",
+            ),
+            (
+                format!("printf '%s\\n' '{invalid_progress}' '{result}'"),
+                "DRIVER.ACTION_FAILED",
+            ),
+            (
+                format!("printf '%s\\n' '{result}' '{initial_progress}'"),
+                "DRIVER.ACTION_FAILED",
+            ),
+            (
+                format!(
+                    "printf '%s\\n' '{initial_progress}' '{{\"event\":\"dispatch_started\"}}' '{result}'"
+                ),
+                "DRIVER.ACTION_FAILED",
+            ),
+            (
+                format!("printf '%s\\n' '{initial_progress}'; printf '%s' '{result}'"),
+                "DRIVER.ACTION_FAILED",
+            ),
+        ] {
+            let script = Script::new(&format!("{body}\nexit 73"));
+            let error = run_drag(
+                &script.0,
+                &[],
+                NONCE,
+                3,
+                Instant::now() + Duration::from_secs(2),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(|_| panic!("terminal frames must not request validation")),
+            )
+            .and_then(|output| parse_input_helper(output, "drag_path", 5, 42))
+            .unwrap_err();
+            assert_eq!(error.code, expected, "{body}");
+            if expected == "DRIVER.FOCUS_LOST" {
+                assert_eq!(error.details["input_progress"]["released"], true);
+                assert_eq!(error.effect, "not_applied");
+            }
         }
     }
 
