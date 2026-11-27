@@ -292,32 +292,48 @@ impl HandshakeError {
                 .and_then(|child| observe_exit(child, Instant::now() + CHILD_EXIT_GRACE))
             {
                 *child = None;
-                let status = status
-                    .code()
-                    .map_or_else(String::new, |code| format!(" (exit code {code})"));
-                return error(
-                    "CONTROL.CONNECT_FAILED",
-                    format!("child exited before the remote handshake{status}. Run the command separately and check its exit code and stderr"),
-                );
+                let message = "child exited before the remote handshake";
+                return if let Some(code) = status.code() {
+                    connect_failure("child_exited", format!("{message} (exit code {code})"))
+                        .with_detail("exit_code", code.into())
+                } else {
+                    connect_failure("child_exited", message)
+                };
             }
         }
-        let message = match self {
-            Self::InvalidFrame if child.is_some() =>
-                "remote handshake received an invalid response frame. Child stdout must contain only control protocol NDJSON. Send startup messages to stderr".into(),
-            Self::InvalidFrame =>
-                "remote handshake received an invalid response frame. Expected control protocol NDJSON".into(),
-            Self::Eof if child.is_some() =>
-                "child stdout closed before the remote handshake while the child was still running. Child stdout must contain only control protocol NDJSON. Check the startup script for stdout redirection".into(),
-            Self::Eof =>
-                "remote response stream ended before the handshake completed".into(),
-            Self::Read(error) => format!("remote handshake read failed: {error}"),
-            Self::Write(error) => format!("remote handshake write failed: {error}"),
-            Self::Timeout => "remote handshake timed out".into(),
-            Self::Rejected => "remote server rejected the handshake".into(),
-            Self::Stopped => "remote transport stopped before the handshake completed".into(),
-        };
-        error("CONTROL.CONNECT_FAILED", message)
+        match self {
+            Self::InvalidFrame => connect_failure(
+                "invalid_frame",
+                "remote handshake received an invalid response frame",
+            ),
+            Self::Eof if child.is_some() => connect_failure(
+                "child_stdout_closed",
+                "child stdout closed before the remote handshake while the child was still running",
+            ),
+            Self::Eof => connect_failure(
+                "eof",
+                "remote response stream ended before the handshake completed",
+            ),
+            Self::Read(error) => connect_failure(
+                "read_error",
+                format!("remote handshake read failed: {error}"),
+            ),
+            Self::Write(error) => connect_failure(
+                "write_error",
+                format!("remote handshake write failed: {error}"),
+            ),
+            Self::Timeout => connect_failure("timeout", "remote handshake timed out"),
+            Self::Rejected => connect_failure("rejected", "remote server rejected the handshake"),
+            Self::Stopped => connect_failure(
+                "stopped",
+                "remote transport stopped before the handshake completed",
+            ),
+        }
     }
+}
+
+fn connect_failure(reason: &str, message: impl Into<String>) -> crate::AutomationError {
+    error("CONTROL.CONNECT_FAILED", message).with_detail("reason", reason.into())
 }
 
 fn observe_exit(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {

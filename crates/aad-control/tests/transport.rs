@@ -324,22 +324,21 @@ fn handshake_distinguishes_invalid_frames_eof_and_read_errors() {
     let invalid = RemoteClient::from_streams(&b"private startup banner\n"[..], io::sink())
         .err()
         .unwrap();
-    assert!(invalid.message.contains("invalid response frame"));
-    assert!(invalid.message.contains("control protocol NDJSON"));
+    assert_eq!(invalid.code, "CONTROL.CONNECT_FAILED");
+    assert_eq!(invalid.details["reason"], "invalid_frame");
     assert!(!invalid.message.contains("private startup banner"));
 
     let eof = RemoteClient::from_streams(io::empty(), io::sink())
         .err()
         .unwrap();
-    assert!(eof.message.contains("stream ended before the handshake"));
+    assert_eq!(eof.code, "CONTROL.CONNECT_FAILED");
+    assert_eq!(eof.details["reason"], "eof");
 
     let read = RemoteClient::from_streams(FailingReader, io::sink())
         .err()
         .unwrap();
-    assert_eq!(
-        read.message,
-        "remote handshake read failed: fixture read error"
-    );
+    assert_eq!(read.code, "CONTROL.CONNECT_FAILED");
+    assert_eq!(read.details["reason"], "read_error");
 }
 
 #[test]
@@ -364,11 +363,20 @@ fn handshake_reports_write_error_while_response_stream_is_open() {
     let write = RemoteClient::from_streams(reader, FailingWriter)
         .err()
         .unwrap();
-    assert_eq!(
-        write.message,
-        "remote handshake write failed: fixture write error"
-    );
+    assert_eq!(write.code, "CONTROL.CONNECT_FAILED");
+    assert_eq!(write.details["reason"], "write_error");
     drop(peer);
+}
+
+#[cfg(unix)]
+#[test]
+fn handshake_preserves_the_child_exit_code_in_details() {
+    let failure = RemoteClient::spawn(&["/bin/sh".into(), "-c".into(), "exit 23".into()])
+        .err()
+        .unwrap();
+    assert_eq!(failure.code, "CONTROL.CONNECT_FAILED");
+    assert_eq!(failure.details["reason"], "child_exited");
+    assert_eq!(failure.details["exit_code"], 23);
 }
 
 #[test]
