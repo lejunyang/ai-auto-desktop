@@ -7,6 +7,7 @@ and a C compiler with X11/XTest development headers for the XRecord observer.
 """
 from contextlib import ExitStack
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -164,7 +165,7 @@ def drag_fixture(icon, role="both", obstructed=False):
     def begin(_item, context):
         nonlocal cover
         if icon != "default" and not cross:
-            hotspot = -35 if separate else 0
+            hotspot = -35 if separate or icon == "curve" else 0
             Gtk.drag_set_icon_widget(context, Gtk.Label(label="Moving trial row"), hotspot, hotspot)
         if obstructed:
             origin = item.get_window().get_origin()
@@ -223,7 +224,7 @@ def drag_fixture(icon, role="both", obstructed=False):
     Gtk.main()
 
 
-def straight_drags(aad, recorder):
+def drags(aad, recorder):
     def center(bounds):
         return tuple(bounds[p] + bounds[s] // 2 for p, s in (("x", "width"), ("y", "height")))
 
@@ -238,6 +239,7 @@ def straight_drags(aad, recorder):
         try:
             assert "data" in call("capabilities")
             for icon, cross, obstructed in (("default", False, False), ("custom", False, False),
+                                            ("curve", False, False),
                                             ("two-windows", False, False), ("default", False, True),
                                             ("default", True, False), ("default", True, True)):
                 case = "cross-process default" if cross else icon
@@ -279,13 +281,25 @@ def straight_drags(aad, recorder):
                         return {"fx": (point[0] - b["x"]) / b["width"],
                                 "fy": (point[1] - b["y"]) / b["height"]}
 
+                    action = {"type": "drag", "to": destination["target"],
+                              "fraction": fraction(surface, start),
+                              "to_fraction": fraction(destination, end)}
+                    curve = []
+                    if icon == "curve":
+                        frame = nodes["AAD GTK drag source"]["bounds"]
+                        assert frame["y"] < surface["bounds"]["y"], (frame, surface["bounds"])
+                        for index in range(1, 12):
+                            progress = index / 12
+                            curve.append((round(start[0] + (end[0] - start[0]) * progress),
+                                          round(start[1] + (end[1] - start[1]) * progress
+                                                + 70 * math.sin(math.pi * progress))))
+                        action["path"] = [{"target": surface["target"], "fraction": fraction(surface, point)}
+                                          for point in curve]
+
                     with subprocess.Popen([recorder], stdout=subprocess.PIPE, text=True) as record:
                         try:
                             assert record.stdout.readline() == "ready\n", "XRecord setup failed"
-                            result = call("act", target=surface["target"],
-                                          action={"type": "drag", "to": destination["target"],
-                                                  "fraction": fraction(surface, start),
-                                                  "to_fraction": fraction(destination, end)})
+                            result = call("act", target=surface["target"], action=action)
                             if result["effect"] == "not_applied":
                                 record.terminate()
                             output, _ = record.communicate(timeout=5)
@@ -315,6 +329,10 @@ def straight_drags(aad, recorder):
                     assert result["effect"] == "applied", result
                     assert len(moves) == 12 and moves[-1][1:3] == buttons[1][1:3], trace
                     assert buttons[0][1:3] == start and buttons[1][1:3] == end, trace
+                    if curve:
+                        actual = [event[1:3] for event in moves]
+                        assert actual == curve + [end], (actual, curve, end)
+                        print(f"GTK curve: held pointer at each waypoint {actual}; released at {end}", flush=True)
                     if icon == "two-windows":
                         frame = nodes["AAD GTK drag source"]["bounds"]
                         client = surface["bounds"]
@@ -514,7 +532,7 @@ def run(aad, recorder):
                     finally:
                         gtk.terminate()
             window_actions(aad)
-            straight_drags(aad, recorder)
+            drags(aad, recorder)
         finally:
             wm.terminate()
             try:
