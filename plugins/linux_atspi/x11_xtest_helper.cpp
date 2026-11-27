@@ -297,6 +297,16 @@ struct KeyboardEventBarrier {
                                     XInternAtom(display, "AAD_TIMESTAMP", False)};
     }
 
+    bool MatchesReply(const XEvent &event, const XClientMessageEvent &sent, unsigned long request) const {
+        const auto &reply = event.xclient;
+        // Xlib can sign-extend these 32-bit wire values when decoding into long.
+        return event.type == ClientMessage && reply.send_event && reply.serial >= request &&
+               reply.window == root && reply.message_type == protocols && reply.format == 32 &&
+               std::equal(reply.data.l, reply.data.l + 5, sent.data.l, [](long actual, long expected) {
+                   return static_cast<std::uint32_t>(actual) == static_cast<std::uint32_t>(expected);
+               });
+    }
+
     std::string_view Wait(std::uint64_t deadline_ns) const {
         const auto until = std::chrono::steady_clock::now() + kTextEventWait;
         const auto wait_for = [&](auto matches) {
@@ -336,10 +346,7 @@ struct KeyboardEventBarrier {
             if (XSendEvent(display, target, False, NoEventMask, &ping_event)) {
                 XFlush(display);
                 if (wait_for([&](const XEvent &event) {
-                    const auto &reply = event.xclient;
-                    return event.type == ClientMessage && reply.send_event && reply.serial >= request &&
-                           reply.window == root && reply.message_type == protocols && reply.format == 32 &&
-                           std::equal(reply.data.l, reply.data.l + 5, ping_event.xclient.data.l);
+                    return MatchesReply(event, ping_event.xclient, request);
                 })) return {};
             }
         }

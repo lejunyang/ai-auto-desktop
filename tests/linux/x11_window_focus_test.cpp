@@ -186,6 +186,36 @@ int main() {
                       wrong_reply.output.find("\"delivered\":1,\"total\":2") != std::string::npos &&
                       wrong_reply.output.find("\"index\":1") == std::string::npos,
                       "unmatched client reply authorized another stroke or left input state changed");
+        const auto barrier = KeyboardEventBarrier::Open(display, target);
+        RequireWindow(barrier.has_value(), "could not open window reply protocol");
+        for (std::uint32_t time : {0x7fffffffu, 0x80000000u, 0xffffffffu}) {
+            XClientMessageEvent sent{};
+            sent.type = ClientMessage;
+            sent.window = target;
+            sent.message_type = barrier->protocols;
+            sent.format = 32;
+            sent.data.l[0] = static_cast<long>(ping);
+            sent.data.l[1] = static_cast<long>(time);
+            sent.data.l[2] = static_cast<long>(target);
+            for (bool matching : {true, false}) {
+                XEvent reply{};
+                reply.xclient = sent;
+                reply.xclient.window = root;
+                if (!matching) reply.xclient.data.l[1] ^= 1;
+                const unsigned long request = NextRequest(display);
+                RequireWindow(XSendEvent(display, root, False, SubstructureNotifyMask, &reply),
+                              "could not send client reply");
+                XSync(display, False);
+                XEvent decoded{};
+                RequireWindow(XCheckTypedWindowEvent(display, root, ClientMessage, &decoded),
+                              "client reply missing after Xlib round-trip");
+                if (barrier->MatchesReply(decoded, sent, request) != matching) {
+                    std::cerr << "Client reply timestamp sent as " << sent.data.l[1]
+                              << ", decoded as " << decoded.xclient.data.l[1] << '\n';
+                    throw std::runtime_error("client reply did not match its 32-bit timestamp");
+                }
+            }
+        }
         unsigned wrong_window = 0;
         bool switched = false;
         const auto interrupted = invoke({"type-text"}, false, [&](const XEvent &event) {
@@ -246,7 +276,7 @@ int main() {
                                          std::to_string(target) + ",\"released\":true") != std::string::npos,
                       "last Return closed the window but typing did not report complete dispatch");
         XCloseDisplay(display);
-        std::cout << "PASS: strict window binding, queued focus switch, burst cleanup, text ACK and event barrier, mapping and hold cleanup\n";
+        std::cout << "PASS: strict window binding, queued focus switch, burst cleanup, text ACK and 32-bit event barrier, mapping and hold cleanup\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "FAIL: " << error.what() << '\n'; return 1;
