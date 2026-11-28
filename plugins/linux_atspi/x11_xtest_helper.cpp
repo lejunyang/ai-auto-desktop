@@ -415,6 +415,8 @@ void MarkDispatchStarted(bool &dispatched) {
 
 struct TimedClickProgress {
     std::size_t moves = 0;
+    std::uint64_t press_check_ms = 0;
+    std::uint64_t release_check_ms = 0;
     bool down_attempted = false;
     bool up_confirmed = false;
     bool cleanup_motion = false;
@@ -460,6 +462,8 @@ struct InputProgress {
                   << (released ? "true" : "false");
         if (timed_click) {
             std::cout << ",\"moves\":" << timed_click->moves
+                      << ",\"press_check_ms\":" << timed_click->press_check_ms
+                      << ",\"release_check_ms\":" << timed_click->release_check_ms
                       << ",\"down_attempted\":" << (timed_click->down_attempted ? "true" : "false")
                       << ",\"up_confirmed\":" << (timed_click->up_confirmed ? "true" : "false")
                       << ",\"cleanup_motion\":" << (timed_click->cleanup_motion ? "true" : "false");

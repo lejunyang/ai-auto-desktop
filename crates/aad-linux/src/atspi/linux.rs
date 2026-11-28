@@ -2700,6 +2700,8 @@ fn parse_helper_progress(progress: &Value) -> Option<Value> {
                 "proven_window": proven_window, "released": released});
     if unit == "pointer_event" {
         let moves = progress["moves"].as_u64()?;
+        let press_check_ms = progress["press_check_ms"].as_u64()?;
+        let release_check_ms = progress["release_check_ms"].as_u64()?;
         let down_attempted = progress["down_attempted"].as_bool()?;
         let up_confirmed = progress["up_confirmed"].as_bool()?;
         let cleanup_motion = progress["cleanup_motion"].as_bool()?;
@@ -2707,6 +2709,8 @@ fn parse_helper_progress(progress: &Value) -> Option<Value> {
             return None;
         }
         result["moves"] = json!(moves);
+        result["press_check_ms"] = json!(press_check_ms);
+        result["release_check_ms"] = json!(release_check_ms);
         result["down_attempted"] = json!(down_attempted);
         result["up_confirmed"] = json!(up_confirmed);
         result["cleanup_motion"] = json!(cleanup_motion);

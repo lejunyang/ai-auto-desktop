@@ -179,7 +179,9 @@ int RunTimedClick(Display *display, unsigned long pid, Atom pid_atom,
         ++click.moves;
         previous = Clock::now();
     }
+    const auto press_check = Clock::now();
     if (const auto problem = revalidate(false); !problem.empty()) return finish(problem);
+    click.press_check_ms = std::chrono::duration_cast<Ms>(Clock::now() - press_check).count();
     if (const auto problem = wait(previous + Ms(plan.settle), false); !problem.empty()) return finish(problem);
     const auto allowed = []() -> std::string_view { return {}; };
     const auto down = inject(false, [&]() -> std::string_view {
@@ -201,7 +203,9 @@ int RunTimedClick(Display *display, unsigned long pid, Atom pid_atom,
         if (const auto problem = revalidate(true); !problem.empty()) return finish(problem);
     }
     if (const auto problem = wait(held_since + Ms(plan.hold), true); !problem.empty()) return finish(problem);
+    const auto release_check = Clock::now();
     if (const auto problem = revalidate(true); !problem.empty()) return finish(problem);
+    click.release_check_ms = std::chrono::duration_cast<Ms>(Clock::now() - release_check).count();
     const auto up = inject(true, allowed, [&] { return XTestFakeButtonEvent(display, 1, False, 0) != 0; });
     if (!up.empty()) return finish(up);
     const auto released = TimedPointerState(display);
