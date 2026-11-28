@@ -194,6 +194,7 @@ fn in_flight_file_grants_stop_keys_clicks_paths_typing_and_ancestor_input() {
                 hold_ms: Some(1000),
             },
             "click" | "double_click" => Action::Click {
+                input_timing: None,
                 button: None,
                 count: (kind == "double_click").then_some(2),
                 fraction: None,

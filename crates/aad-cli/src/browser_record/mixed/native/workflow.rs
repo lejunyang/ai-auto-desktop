@@ -54,11 +54,29 @@ impl Watch {
                     json!({"direction":action["direction"],"notches":action["notches"]});
                 "pointer_gesture"
             }
-            Some("click") if action["button"].is_null() && action["count"].is_null() => {
+            Some("click")
+                if [
+                    "button",
+                    "count",
+                    "fraction",
+                    "modifiers",
+                    "hold_ms",
+                    "input_timing",
+                ]
+                .iter()
+                .all(|key| action[key].is_null()) =>
+            {
                 "pointer_click"
             }
             Some("click") => {
-                for key in ["count", "button"] {
+                for key in [
+                    "count",
+                    "button",
+                    "fraction",
+                    "modifiers",
+                    "hold_ms",
+                    "input_timing",
+                ] {
                     if let Some(v) = action.get(key) {
                         args[key] = v.clone();
                     }

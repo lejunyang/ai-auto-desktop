@@ -1250,6 +1250,7 @@ pub(crate) fn session_providers(
 pub(crate) fn run_workflow(
     session: &Arc<aad_control::Session>,
     arguments: &Value,
+    cancel: Option<&aad_runtime::CancellationToken>,
 ) -> Result<Value, String> {
     check_run_arguments(arguments, false)?;
     let (name, descriptor) = compiled_workflow(arguments)?;
@@ -1258,7 +1259,12 @@ pub(crate) fn run_workflow(
         session,
         descriptor,
         arguments,
-        aad_runtime::RunOptions::default(),
+        aad_runtime::RunOptions {
+            cancel: cancel
+                .map(aad_runtime::CancellationToken::shared_flag)
+                .unwrap_or_default(),
+            ..Default::default()
+        },
     )
 }
 
@@ -1285,13 +1291,15 @@ fn execute_compiled(
 ) -> Result<Value, String> {
     let name = &descriptor.name;
     let inputs = workflow_inputs(arguments)?;
-    let typed = descriptor.steps.iter().all(|step| {
-        step.get("uses")
-            .and_then(Value::as_str)
-            .is_some_and(|name| name.starts_with("control.session."))
-    });
-    let timings = typed.then(|| Arc::new(aad_control::steps::StepTimings::default()));
-    let providers = session_providers(session, timings.clone())?;
+    let mut providers_used = descriptor
+        .steps
+        .iter()
+        .filter_map(|step| step.get("uses").and_then(Value::as_str));
+    let is_control_step = |uses: &str| uses.starts_with("control.session.");
+    let typed =
+        providers_used.next().is_some_and(is_control_step) && providers_used.all(is_control_step);
+    let timings = Arc::new(aad_control::steps::StepTimings::default());
+    let providers = session_providers(session, Some(timings.clone()))?;
     let artifacts = Arc::new(aad_runtime::ArtifactStore::default());
 
     let result = aad_runtime::run(
@@ -1303,7 +1311,7 @@ fn execute_compiled(
             .with_granted_permissions(WORKFLOW_PERMISSIONS),
     );
 
-    let progress = if typed {
+    let mut progress: Vec<Value> = if typed {
         result
             .events
             .iter()
@@ -1313,6 +1321,13 @@ fn execute_compiled(
     } else {
         walk_through(&result)
     };
+    let receipts = timings.input_timing_receipts();
+    for step in &mut progress {
+        if let Some(receipt) = step["id"].as_str().and_then(|id| receipts.get(id)) {
+            step["input_timing"] = receipt["input_timing"].clone();
+            step["input_progress"] = receipt["input_progress"].clone();
+        }
+    }
 
     let mut payload = json!({
         "kind": "WorkflowRun",
@@ -1327,7 +1342,7 @@ fn execute_compiled(
         // a value and failed to submit will write it twice.
         "steps": progress,
     });
-    if let Some(timings) = timings {
+    if typed {
         payload["phase_timings"] = timings.snapshot();
     }
     if let Some(error) = &result.error {
@@ -1340,6 +1355,12 @@ fn execute_compiled(
             "effect": error.effect,
             "stepId": error.location.step_id,
         });
+        if error.details.contains_key("input_timing") {
+            payload["error"]["details"] = json!({
+                "input_timing": error.details.get("input_timing"),
+                "input_progress": error.details.get("input_progress")
+            });
+        }
         if typed {
             let last = progress
                 .iter()
@@ -1772,17 +1793,21 @@ pub(crate) mod tests {
 
     #[test]
     fn nested_selectors_cannot_smuggle_in_a_coordinate() {
-        // `near.anchor` and `within` accept a nested locator, so they are
-        // deliberately open-ended. That must not become a way around the rule
-        // that an agent never names a point on the screen: the check above only
-        // reads top-level properties.
         fn walk(schema: &Value, path: &str) {
             if let Some(properties) = schema["properties"].as_object() {
-                for (key, value) in properties {
+                for key in properties.keys() {
                     for forbidden in ["x", "y", "point", "coordinates", "position"] {
                         assert_ne!(key, forbidden, "{path} must not accept {forbidden}");
                     }
+                }
+            }
+            if let Some(object) = schema.as_object() {
+                for (key, value) in object {
                     walk(value, &format!("{path}.{key}"));
+                }
+            } else if let Some(array) = schema.as_array() {
+                for (index, value) in array.iter().enumerate() {
+                    walk(value, &format!("{path}[{index}]"));
                 }
             }
         }
@@ -2056,12 +2081,17 @@ pub(crate) mod tests {
                         "app": app,
                         "locator": {"role": "text", "name": "Moved"},
                         "check": {"present": true, "within_ms": 2000}
+                    },
+                    {
+                        "app": {"provider":"desktop.linux_atspi", "title":"click fixture"},
+                        "locator": {"role":"push_button", "name":"Target"},
+                        "action": {"type":"click", "input_timing":{"seed":42,"speed":1.5}}
                     }
                 ]
             }),
         )
         .expect("save structured actions");
-        assert_eq!(saved["executed_steps"], 3);
+        assert_eq!(saved["executed_steps"], 4);
         assert!(saved["recording_path"].is_string());
 
         let stored: Value = serde_json::from_str(
@@ -2087,20 +2117,25 @@ pub(crate) mod tests {
             aad_control::steps::steps_of(&recording)
                 .expect("steps")
                 .len(),
-            3
+            4
         );
 
         let described =
             call_without_driver("describe_workflow", &json!({"name": "structured_actions"}))
                 .expect("describe structured actions");
         let actions = described["actions"].as_array().unwrap();
-        assert_eq!(actions.len(), 3);
+        assert_eq!(actions.len(), 4);
         assert_eq!(actions[0]["action"], "key");
         assert_eq!(actions[0]["app"]["process"], "fixture.exe");
         assert_eq!(actions[0]["parameters"]["keys"], json!(["ctrl", "a"]));
         assert_eq!(actions[1]["finds"]["name"], "Todo");
         assert_eq!(actions[1]["destination"]["name"], "Done");
         assert_eq!(actions[2]["action"], "check");
+        assert_eq!(actions[3]["finds"]["name"], "Target");
+        assert_eq!(
+            actions[3]["parameters"]["input_timing"],
+            json!({"seed":42,"speed":1.5})
+        );
     }
 
     #[test]
@@ -2265,6 +2300,7 @@ pub(crate) mod tests {
         let result = run_workflow(
             &stub_session(),
             &json!({"name": "greeter", "inputs": {"who": "agent"}}),
+            None,
         )
         .expect("run");
 
@@ -2295,8 +2331,8 @@ pub(crate) mod tests {
         workflow["outputs"] = json!({});
         store.save("recorded", workflow);
 
-        let result =
-            run_workflow(&stub_session(), &json!({"name": "recorded"})).expect("the run completes");
+        let result = run_workflow(&stub_session(), &json!({"name": "recorded"}), None)
+            .expect("the run completes");
 
         assert_eq!(
             result["status"],
@@ -2349,6 +2385,7 @@ pub(crate) mod tests {
         let ran = run_workflow(
             &stub_session(),
             &json!({"name": "greeter", "inputs": {"who": "a"}}),
+            None,
         )
         .expect("run");
 
@@ -2374,7 +2411,7 @@ pub(crate) mod tests {
         workflow["outputs"] = json!({});
         store.save("dangerous", workflow);
 
-        let error = run_workflow(&stub_session(), &json!({"name": "dangerous"}))
+        let error = run_workflow(&stub_session(), &json!({"name": "dangerous"}), None)
             .expect_err("must be refused");
         let payload: Value = serde_json::from_str(&error).expect("structured error");
 
@@ -2425,7 +2462,7 @@ pub(crate) mod tests {
 
         // Either the compiler refuses it or the run fails; both must name the
         // problem rather than returning a bare failure.
-        match run_workflow(&stub_session(), &json!({"name": "broken"})) {
+        match run_workflow(&stub_session(), &json!({"name": "broken"}), None) {
             Ok(result) => {
                 assert_ne!(result["status"], json!("succeeded"));
                 let error = &result["error"];
@@ -2450,6 +2487,7 @@ pub(crate) mod tests {
         let error = run_workflow(
             &stub_session(),
             &json!({"name": "greeter", "inputs": "who=agent"}),
+            None,
         )
         .expect_err("must be refused");
         let payload: Value = serde_json::from_str(&error).unwrap();

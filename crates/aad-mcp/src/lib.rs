@@ -403,8 +403,9 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
             .local
             .as_ref()
             .expect("local tools need a local session");
-        let batch = (name == browser_script::NAME || name == "run_steps" && self.allows_input())
-            .then(aad_runtime::CancellationToken::new);
+        let batch = (name == browser_script::NAME
+            || matches!(name, "run_steps" | "run_workflow") && self.allows_input())
+        .then(aad_runtime::CancellationToken::new);
         if !self.start(rpc_id, None, batch.as_ref()) {
             return Ok(content(&cancelled_before_start(), true));
         }
@@ -422,18 +423,18 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
                 true,
             ));
         }
-        if let Some(token) = batch {
+        if let Some(token) = batch.as_ref().filter(|_| name != "run_workflow") {
             if name == browser_script::NAME {
                 let run = serde_json::from_value(arguments)
                     .map_err(|e| json!({"code":"BROWSER.SCRIPT_INVALID","message":e.to_string()}))
-                    .and_then(|script| browser_script::run(session.clone(), script, token));
+                    .and_then(|script| browser_script::run(session.clone(), script, token.clone()));
                 self.calls.lock().unwrap().batch = None;
                 return Ok(match run {
                     Ok(report) => content(&report, false),
                     Err(error) => content(&error, true),
                 });
             }
-            let result = tools::run_inline(session, &arguments, &token);
+            let result = tools::run_inline(session, &arguments, token);
             self.calls.lock().unwrap().batch = None;
             return Ok(match result {
                 Ok(payload) => content(&payload, payload["status"] != "succeeded"),
@@ -477,10 +478,11 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
         }
 
         if !tools::wants_durable(&arguments) {
-            let (payload, is_error) = run_in_memory(session, &arguments);
+            let (payload, is_error) = run_in_memory(session, &arguments, batch.as_ref());
+            self.calls.lock().unwrap().batch = None;
             return Ok(content(&payload, is_error));
         }
-        Ok(match self.runs.start(session, &arguments) {
+        let result = match self.runs.start(session, &arguments) {
             Ok(result) => content(&result, false),
             Err(durable_tools::StartError::Failed(payload)) => {
                 content(&parse_payload(&payload), true)
@@ -489,18 +491,21 @@ notifications/cancelled to request cancellation of an in-flight JSON-RPC request
                 // Falling back is the caller's decision, never ours: an
                 // in-memory run cannot be followed up or resumed.
                 if arguments.get("fallback_in_memory").and_then(Value::as_bool) != Some(true) {
+                    self.calls.lock().unwrap().batch = None;
                     return Ok(content(&refusal, true));
                 }
                 let memory = json!({
                     "name": arguments.get("name").cloned().unwrap_or(Value::Null),
                     "inputs": arguments.get("inputs").cloned().unwrap_or(Value::Null),
                 });
-                let (mut payload, is_error) = run_in_memory(session, &memory);
+                let (mut payload, is_error) = run_in_memory(session, &memory, batch.as_ref());
                 payload["durable"] = json!(false);
                 payload["durable_refusal"] = refusal;
                 content(&payload, is_error)
             }
-        })
+        };
+        self.calls.lock().unwrap().batch = None;
+        Ok(result)
     }
 }
 
@@ -523,7 +528,11 @@ fn cancelled_before_start() -> Value {
 ///
 /// A workflow drives the desktop like control_act does: one gate, one input
 /// owner, the session's own provider instances.
-fn run_in_memory(session: &Arc<aad_control::Session>, arguments: &Value) -> (Value, bool) {
+fn run_in_memory(
+    session: &Arc<aad_control::Session>,
+    arguments: &Value,
+    cancel: Option<&aad_runtime::CancellationToken>,
+) -> (Value, bool) {
     let through_session = match tools::steps_through_session(arguments) {
         Ok(steps) => steps,
         Err(payload) => return (parse_payload(&payload), true),
@@ -540,7 +549,7 @@ fn run_in_memory(session: &Arc<aad_control::Session>, arguments: &Value) -> (Val
             Err(error) => return (error.to_json(), true),
         }
     };
-    match tools::run_workflow(session, arguments) {
+    match tools::run_workflow(session, arguments, cancel) {
         Ok(result) => (result, false),
         Err(payload) => (parse_payload(&payload), true),
     }

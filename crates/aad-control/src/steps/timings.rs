@@ -1,6 +1,6 @@
 use crate::Operation;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -21,17 +21,39 @@ struct Totals {
     collect_table: Phase,
 }
 
-/// Fixed-size counters for a single run of control steps. Request contents are never stored.
+/// Phase counters and timed-click receipts for a run. Request contents are never stored.
 #[derive(Default)]
-pub struct StepTimings(Mutex<Totals>);
+pub struct StepTimings {
+    phases: Mutex<Totals>,
+    receipts: Mutex<Map<String, Value>>,
+}
 
 impl StepTimings {
     pub fn snapshot(&self) -> Value {
-        json!(*self.0.lock().unwrap_or_else(|e| e.into_inner()))
+        json!(*self.phases.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    pub fn input_timing_receipts(&self) -> Map<String, Value> {
+        self.receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(super) fn record_input_timing(&self, step: &str, timing: &Value, progress: &Value) {
+        if timing.is_object() {
+            self.receipts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    step.into(),
+                    json!({"input_timing": timing, "input_progress": progress}),
+                );
+        }
     }
 
     pub(super) fn record(&self, op: &Operation, elapsed: Duration, failed: bool) {
-        let mut totals = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut totals = self.phases.lock().unwrap_or_else(|e| e.into_inner());
         let phase = match op {
             Operation::Targets { .. } => &mut totals.targets,
             Operation::Observe { .. } => &mut totals.observe,

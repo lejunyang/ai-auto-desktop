@@ -217,6 +217,45 @@ fn policy_and_unsupported_actions_do_not_dispatch() {
     );
     assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn timed_click_rejects_ineligible_requests_without_dispatching() {
+    let (session, backend) = fixture(true, Duration::ZERO);
+    let target = observed(&session);
+    for (action, code) in [
+        (
+            json!({"type":"click","input_timing":{"seed":42,"speed":1.5}}),
+            "CONTROL.ACTION_UNSUPPORTED",
+        ),
+        (
+            json!({"type":"click","count":2,"input_timing":{}}),
+            "CONTROL.INVALID_REQUEST",
+        ),
+        (
+            json!({"type":"click","input_timing":{"speed":0.49}}),
+            "CONTROL.INVALID_REQUEST",
+        ),
+    ] {
+        let reply = call(
+            &session,
+            Operation::Act {
+                verify: None,
+                target: target.clone(),
+                action: serde_json::from_value(action).unwrap(),
+            },
+        );
+        assert_eq!(reply.effect, "not_applied");
+        assert_eq!(reply.error.unwrap()["code"], code);
+    }
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    for action in [
+        json!({"type":"invoke","input_timing":{}}),
+        json!({"type":"click","input_timing":{"point":{"x":15,"y":4}}}),
+        json!({"type":"click","input_timing":{"seed":4294967296u64}}),
+    ] {
+        assert!(serde_json::from_value::<Action>(action).is_err());
+    }
+}
 #[test]
 fn cancellation_after_dispatch_reports_unknown_and_does_not_retry() {
     let (session, backend) = fixture(true, Duration::from_millis(80));

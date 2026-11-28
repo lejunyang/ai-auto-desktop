@@ -44,6 +44,13 @@ pub fn error(code: &str, message: impl Into<String>) -> AutomationError {
     AutomationError::new(code, message).with_effect("not_applied")
 }
 
+fn click_timing_unsupported() -> AutomationError {
+    error(
+        "CONTROL.ACTION_UNSUPPORTED",
+        "timed clicks require the Linux AT-SPI X11 backend",
+    )
+}
+
 #[derive(Clone)]
 pub struct BackendResource {
     pub resource: Resource,
@@ -85,9 +92,12 @@ pub trait Backend: Send + Sync {
     fn check_action_support(
         &self,
         _snapshot: &Value,
-        _action: &Action,
+        action: &Action,
         _cross_resource: bool,
     ) -> Result<()> {
+        if action.has_click_timing() {
+            return Err(click_timing_unsupported());
+        }
         Ok(())
     }
     /// Whether `drag_between` can execute and revalidate both endpoints.
@@ -2644,6 +2654,28 @@ fn validate_action(action: &Action, access: &browser_access::BrowserAccess) -> R
         }
         if matches!(action, Action::Click { count: Some(2), .. }) {
             return invalid("a held click must have count 1");
+        }
+    }
+    if let Action::Click {
+        input_timing: Some(timing),
+        button,
+        count,
+        modifiers,
+        ..
+    } = action
+    {
+        use aad_platform::input_timing::{MAX_CLICK_SPEED, MIN_CLICK_SPEED};
+        if timing
+            .speed
+            .is_some_and(|speed| !(MIN_CLICK_SPEED..=MAX_CLICK_SPEED).contains(&speed))
+        {
+            return invalid("input_timing.speed must be in 0.5..2");
+        }
+        if !matches!(button, None | Some(Button::Left))
+            || !matches!(count, None | Some(1))
+            || !modifiers.is_empty()
+        {
+            return invalid("input_timing requires a single unmodified left click");
         }
     }
     if let Action::Click { modifiers, .. } | Action::Drag { modifiers, .. } = action {

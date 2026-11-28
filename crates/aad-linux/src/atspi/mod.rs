@@ -14,7 +14,10 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 mod cross_resource;
+mod timed_click;
 pub use cross_resource::{DragBetweenEndpoint, DragBetweenRequest};
+#[doc(hidden)]
+pub use timed_click::{TimedClickOptions, TimedClickRequest, TimedClickValidation};
 
 pub const PROVIDER_NAME: &str = "desktop.linux_atspi";
 pub const PROVIDER_VERSION: &str = "0.1.0";
@@ -376,6 +379,14 @@ pub trait AtspiBackend: Send + Sync {
             "DRIVER.ACTION_UNSUPPORTED",
             "native pointer_gesture helper is unavailable",
         ))
+    }
+    #[doc(hidden)]
+    fn check_timed_click_support(&self, _deadline: Instant) -> Result<(), AutomationError> {
+        Err(timed_click::unsupported())
+    }
+    #[doc(hidden)]
+    fn timed_click(&self, _request: TimedClickRequest<'_>) -> Result<Value, AutomationError> {
+        Err(timed_click::unsupported())
     }
     fn pointer_click_in_window(
         &self,
@@ -1013,6 +1024,18 @@ impl AtspiProvider {
         scope: Option<Scope>,
         deadline: Instant,
     ) -> Result<Record, AutomationError> {
+        self.capture_scoped_with_window(selector, max_depth, max_nodes, scope, deadline, None)
+    }
+
+    fn capture_scoped_with_window(
+        &self,
+        selector: &Map<String, Value>,
+        max_depth: u32,
+        max_nodes: usize,
+        scope: Option<Scope>,
+        deadline: Instant,
+        pinned: Option<&WindowAnchor>,
+    ) -> Result<Record, AutomationError> {
         let mut raw = match scope.as_ref() {
             Some(scope) => {
                 self.backend
@@ -1028,7 +1051,21 @@ impl AtspiProvider {
                 "backend exceeded the requested node limit",
             ));
         }
-        let mut observed_windows = self.backend.observe_x11_windows(&mut raw, deadline);
+        let mut observed_windows = match pinned {
+            None => self.backend.observe_x11_windows(&mut raw, deadline),
+            // The running helper rechecks the pinned XID and geometry before
+            // every event. Here the fresh AX tree must still contain the same
+            // native top-level accessible at that geometry.
+            Some(window) => raw
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| {
+                    node.native == window.native && node.bounds == Some(window.bounds)
+                })
+                .filter_map(|(index, _)| window.x11.clone().map(|proof| (index, proof)))
+                .collect(),
+        };
         let mut state = self
             .state
             .lock()
@@ -1407,6 +1444,7 @@ impl AtspiProvider {
                 "hover_ms",
                 "modifiers",
                 "hold_ms",
+                "input_timing",
             ]),
             "drag" => allowed.extend([
                 "to",
@@ -1444,6 +1482,24 @@ impl AtspiProvider {
         };
         let modifiers = parse_modifiers(args.get("modifiers"))?;
         let hold_ms = parse_hold_ms(args.get("hold_ms"))?;
+        let timing = args
+            .get("input_timing")
+            .map(TimedClickOptions::parse)
+            .transpose()?;
+        if timing.is_some() {
+            if gesture
+                != Some(Gesture::Click {
+                    button: 1,
+                    count: 1,
+                })
+                || !modifiers.is_empty()
+            {
+                return Err(invalid(
+                    "input_timing requires a single unmodified left click",
+                ));
+            }
+            self.backend.check_timed_click_support(deadline)?;
+        }
         if hold_ms.is_some()
             && gesture.is_some_and(|gesture| !matches!(gesture, Gesture::Click { count: 1, .. }))
         {
@@ -1472,7 +1528,8 @@ impl AtspiProvider {
         };
         let pin_x11_window = matches!(action, "type_text" | "key_chord" | "paste" | "drag")
             || WINDOW_ACTIONS.contains(&action)
-            || !modifiers.is_empty();
+            || !modifiers.is_empty()
+            || timing.is_some();
         let (fresh, fresh_id, node, native) =
             self.fresh_target(args, deadline, action == "invoke", pin_x11_window)?;
         let available = node["actions"].as_array().expect("normalized action array");
@@ -1695,7 +1752,9 @@ impl AtspiProvider {
             }
         };
         let result = (|| {
-            dispatched = true;
+            // Timed clicks report the helper's actual dispatch boundary.
+            // Their planning and deadline checks can still refuse all input.
+            dispatched = timing.is_none();
             match action {
                 "focus" => self.backend.focus(&native, window.as_ref(), deadline),
                 "invoke" => match node["provenance"]["native_invoke_name"].as_str() {
@@ -1742,6 +1801,20 @@ impl AtspiProvider {
                     );
                     self.validate_point(&fresh, &fresh_id, point, deadline)?;
                     click(point)
+                }
+                "pointer_gesture" if let Some(timing) = timing => {
+                    self.dispatch_timed_click(timed_click::ObservedClick {
+                        args,
+                        fresh: &fresh,
+                        id: &fresh_id,
+                        node: &node,
+                        target: &native,
+                        window: window.as_ref(),
+                        point: pointer.expect("timed click landing"),
+                        hold_ms,
+                        timing,
+                        deadline,
+                    })
                 }
                 "pointer_gesture"
                     if gtk_pointer && matches!(gesture, Some(Gesture::Click { .. })) =>
@@ -3625,6 +3698,12 @@ fn manifest_document() -> Value {
     let fraction = json!({"type": "object", "required": ["fx", "fy"], "properties": {"fx": {"type": "number", "minimum": 0, "maximum": 1}, "fy": {"type": "number", "minimum": 0, "maximum": 1}}, "additionalProperties": false});
     let button = json!({"enum": ["left", "middle", "right"]});
     actions.insert("pointer_gesture".into(), contract("重新验证目标和比例位置的命中后，按节点公布的模式执行单击、双击、滚轮或悬停。Wayland GTK 3 支持已验证控件上的无修饰左键单击和滚轮。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"button": button, "count": {"enum": [1, 2]}, "fraction": fraction, "scroll": {"type": "object", "required": ["direction"], "properties": {"direction": {"enum": ["up", "down", "left", "right"]}, "notches": {"type": "integer", "minimum": 1, "maximum": 30}}, "additionalProperties": false}, "hover_ms": {"type": "integer", "minimum": 1, "maximum": 5000}}), &[]), write_output(), true, true));
+    actions["pointer_gesture"]["input_schema"]["properties"]["input_timing"] = json!({
+        "type":"object","additionalProperties":false,"properties":{
+            "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
+            "speed":{"type":"number","minimum":0.5,"maximum":2,"default":1}
+        }
+    });
     actions.insert("drag".into(), contract("分别重新验证起点与终点后执行拖拽。KDE/X11 使用 XTest helper；Wayland Qt Widgets 要求两个端点和直线路径均命中同一控件。", "non_idempotent", "modify", "high", &["desktop.observe", "desktop.input"], point_input(json!({"to": target_schema(), "to_locator": locator_schema(), "button": button, "fraction": fraction, "to_fraction": fraction}), &["to", "to_locator"]), write_output(), true, true));
     actions.insert("key_chord".into(), contract("重新验证元素后向其发送组合键；KDE/X11 验证原生焦点，Wayland Qt Widgets 需要已聚焦的元素和显式启用的窗口定向输入。", "non_idempotent", "input", "high", &["desktop.observe", "desktop.input"], point_input(json!({"keys": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 32}}}), &["keys"]), write_output(), true, true));
     for name in ["pointer_gesture", "drag"] {
@@ -3774,7 +3853,7 @@ pub(crate) use linux::gtk4_picker::Gtk4Picker;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::kde_picker::KdeDialog;
 #[cfg(target_os = "linux")]
-pub use linux::require_x11_keyboard_features;
+pub use linux::{check_x11_timed_click_support, require_x11_keyboard_features};
 
 #[cfg(test)]
 mod tests {

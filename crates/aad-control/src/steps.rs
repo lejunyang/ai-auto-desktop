@@ -263,6 +263,7 @@ impl Step {
             } else {
                 // A trusted pointer click supplies transient user activation.
                 Action::Click {
+                    input_timing: None,
                     button: None,
                     count: None,
                     fraction: Some(crate::Fraction { fx: 0.5, fy: 0.5 }),
@@ -654,6 +655,7 @@ fn perform_step(
         .transpose()?;
     let target = serde_json::from_value(found["target"].clone())
         .map_err(|e| error("STEP.BAD_TARGET", e.to_string()))?;
+    let timed = action.has_click_timing();
     let result = request(
         session,
         Operation::Act {
@@ -662,7 +664,28 @@ fn perform_step(
             verify: None,
         },
         deadline,
-    )?;
+    );
+    if let Some(timings) = session.timings.filter(|_| timed) {
+        match &result {
+            Ok(result) => {
+                let backend = &result["backend_result"];
+                timings.record_input_timing(
+                    &step.id,
+                    &backend["input_timing"],
+                    &backend["input"]["input_progress"],
+                );
+            }
+            Err(error) => {
+                let details = &error.details;
+                timings.record_input_timing(
+                    &step.id,
+                    details.get("input_timing").unwrap_or(&Value::Null),
+                    details.get("input_progress").unwrap_or(&Value::Null),
+                );
+            }
+        }
+    }
+    let result = result?;
     if let (Some(mut picker), Some(destination)) = (picker, destination) {
         picker
             .select(session.token, &destination, picker_deadline)

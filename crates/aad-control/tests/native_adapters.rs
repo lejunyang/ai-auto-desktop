@@ -646,6 +646,7 @@ fn windows_gestures_views_and_rich_locators_route_to_the_driver() {
         .unwrap();
     assert_eq!(last().0, "desktop.windows_uia.pointer_click@1");
     let right = Action::Click {
+        input_timing: None,
         button: Some(Button::Right),
         count: None,
         fraction: Some(Fraction { fx: 0.25, fy: 0.5 }),

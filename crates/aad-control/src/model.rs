@@ -177,6 +177,15 @@ pub struct DragAnchor {
 pub const MAX_DRAG_ANCHORS: usize = 32;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClickTiming {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     Focus {},
@@ -199,6 +208,9 @@ pub enum Action {
         /// Keep the button down for this bounded duration before releasing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hold_ms: Option<u64>,
+        /// Explicit timing for a physical single click on X11.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_timing: Option<ClickTiming>,
     },
     Fill {
         value: String,
@@ -415,7 +427,17 @@ impl Action {
             fraction: None,
             modifiers: Vec::new(),
             hold_ms: None,
+            input_timing: None,
         }
+    }
+    pub fn has_click_timing(&self) -> bool {
+        matches!(
+            self,
+            Self::Click {
+                input_timing: Some(_),
+                ..
+            }
+        )
     }
     pub fn name(&self) -> &'static str {
         match self {
@@ -463,6 +485,7 @@ impl Action {
                 fraction: None,
                 modifiers,
                 hold_ms: None,
+                input_timing: None,
             } if modifiers.is_empty()
         )
     }

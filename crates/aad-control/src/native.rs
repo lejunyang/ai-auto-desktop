@@ -360,6 +360,13 @@ impl Backend for NativeBackend {
         cross_resource: bool,
     ) -> Result<()> {
         let helper = &snapshot["metadata"]["input_helper"];
+        if action.has_click_timing() {
+            #[cfg(target_os = "linux")]
+            if matches!(self.flavor, Flavor::Linux) {
+                return aad_linux::atspi::check_x11_timed_click_support(helper);
+            }
+            return Err(crate::click_timing_unsupported());
+        }
         if !matches!(self.flavor, Flavor::Linux) {
             return Ok(());
         }
@@ -789,11 +796,13 @@ impl Backend for NativeBackend {
                 fraction: at,
                 modifiers,
                 hold_ms,
+                input_timing,
             } if native == "pointer_gesture" => {
                 set("button", serde_json::to_value(button).unwrap());
                 set("count", serde_json::to_value(count).unwrap());
                 set("fraction", fraction(at));
                 set("hold_ms", json!(hold_ms));
+                set("input_timing", json!(input_timing));
                 if !modifiers.is_empty() {
                     set("modifiers", json!(modifiers));
                 }
@@ -864,7 +873,11 @@ impl Backend for NativeBackend {
             }
             _ => {}
         }
-        self.invoke_controlled(native, args, context)
+        let mut result = self.invoke_controlled(native, args, context)?;
+        if action.has_click_timing() {
+            return Ok(result["backend_result"].take());
+        }
+        Ok(result)
     }
 
     fn secret_input(

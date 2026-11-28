@@ -1608,10 +1608,11 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
             providers.insert(provider.clone());
         }
     }
+    let timings = std::sync::Arc::new(aad_control::steps::StepTimings::default());
     if !providers.names().contains(&aad_control::steps::PROVIDER) {
-        providers.insert(std::sync::Arc::new(aad_control::steps::StepProvider::new(
-            session,
-        )));
+        providers.insert(std::sync::Arc::new(
+            aad_control::steps::StepProvider::new(session).with_timings(timings.clone()),
+        ));
     }
 
     let mut options = aad_runtime::RunOptions::default()
@@ -1651,7 +1652,12 @@ fn run_workflow(args: &RunArgs) -> (Value, u8) {
     };
     // `summary` is the shape meant for a caller reading the result, rather
     // than the full Run document, which nests outputs under `output`.
-    (result.summary(), code)
+    let mut summary = result.summary();
+    let receipts = timings.input_timing_receipts();
+    if !receipts.is_empty() {
+        summary["step_input_timing"] = Value::Object(receipts);
+    }
+    (summary, code)
 }
 
 // ------------------------------------------------------------ durable runs
