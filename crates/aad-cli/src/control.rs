@@ -289,12 +289,46 @@ fn invalid(error: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
 }
 
+fn remote_client(raw: &str, option: &str) -> std::io::Result<RemoteClient> {
+    RemoteClient::spawn(&command(raw)?).map_err(|error| {
+        let mut message = format!("{option}: {}", error.message);
+        let reason = error
+            .details
+            .get("reason")
+            .and_then(serde_json::Value::as_str);
+        if let Some(hint) = remote_startup_hint(reason) {
+            message.push_str(". Child stdout must contain only control protocol NDJSON. ");
+            message.push_str(hint);
+        }
+        if error
+            .details
+            .get("child_exited")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            message.push_str(". ");
+            message.push_str(CHECK_REMOTE_COMMAND);
+        }
+        invalid(message)
+    })
+}
+
+const CHECK_REMOTE_COMMAND: &str = "Run the command separately and check its exit code and stderr";
+
+fn remote_startup_hint(reason: Option<&str>) -> Option<&'static str> {
+    match reason {
+        Some("invalid_frame") => Some("Send startup messages to stderr"),
+        Some("child_stdout_closed") => Some("Check the startup script for stdout redirection"),
+        _ => None,
+    }
+}
+
 pub fn mcp(args: &McpArgs) -> std::io::Result<()> {
     let server = if let Some(raw) = &args.connect {
         if args.allow_input || args.grants.any() {
             return Err(invalid("remote grants must be configured on the remote server; local flags cannot replace them"));
         }
-        let client = RemoteClient::spawn(&command(raw)?).map_err(|e| invalid(e.message))?;
+        let client = remote_client(raw, "--connect")?;
         aad_mcp::Server::with_control(Arc::new(client))
     } else {
         args.grants.check(args.allow_input)?;
@@ -326,9 +360,7 @@ pub fn run(command_args: &ControlCommand) -> std::io::Result<()> {
                 args.grants.browser_bidi_port,
             ))
         }
-        ControlCommand::Connect(args) => {
-            Arc::new(RemoteClient::spawn(&command(&args.command)?).map_err(|e| invalid(e.message))?)
-        }
+        ControlCommand::Connect(args) => Arc::new(remote_client(&args.command, "--command")?),
     };
     transport::serve(std::io::stdin(), std::io::stdout(), endpoint)
 }

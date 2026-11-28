@@ -4,7 +4,7 @@ use aad_control::{
     *,
 };
 use serde_json::{json, Value};
-use std::io::{BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -307,6 +307,115 @@ fn framing_rejects_truncation_oversize_and_protocol_injection() {
     assert!(transport::read_frame(&mut BufReader::new(&b"{}"[..]), 64).is_err());
     assert!(serde_json::from_value::<Request>(json!({"request_id":"a","timeout_ms":20,"operation":{"method":"targets","principal":"admin"}})).is_err());
     assert!(serde_json::from_value::<Request>(json!({"request_id":"a","timeout_ms":20,"principal":"admin","operation":{"method":"targets"}})).is_err());
+}
+
+#[test]
+fn handshake_distinguishes_invalid_frames_eof_and_read_errors() {
+    struct FailingReader;
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fixture read error",
+            ))
+        }
+    }
+
+    let invalid = RemoteClient::from_streams(&b"private startup banner\n"[..], io::sink())
+        .err()
+        .unwrap();
+    assert_eq!(invalid.code, "CONTROL.CONNECT_FAILED");
+    assert_eq!(invalid.details["reason"], "invalid_frame");
+    assert!(!invalid.message.contains("private startup banner"));
+
+    let eof = RemoteClient::from_streams(io::empty(), io::sink())
+        .err()
+        .unwrap();
+    assert_eq!(eof.code, "CONTROL.CONNECT_FAILED");
+    assert_eq!(eof.details["reason"], "eof");
+
+    let read = RemoteClient::from_streams(FailingReader, io::sink())
+        .err()
+        .unwrap();
+    assert_eq!(read.code, "CONTROL.CONNECT_FAILED");
+    assert_eq!(read.details["reason"], "read_error");
+}
+
+#[test]
+fn handshake_reports_write_error_while_response_stream_is_open() {
+    struct FailingWriter;
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "fixture write error",
+            ))
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (reader, _) = listener.accept().unwrap();
+    let write = RemoteClient::from_streams(reader, FailingWriter)
+        .err()
+        .unwrap();
+    assert_eq!(write.code, "CONTROL.CONNECT_FAILED");
+    assert_eq!(write.details["reason"], "write_error");
+    drop(peer);
+}
+
+#[cfg(unix)]
+#[test]
+fn handshake_preserves_the_child_exit_code_in_details() {
+    for (script, reason) in [
+        ("exit 23", "child_exited"),
+        ("printf 'invalid frame\\n'; exit 23", "invalid_frame"),
+    ] {
+        let failure = RemoteClient::spawn(&["/bin/sh".into(), "-c".into(), script.into()])
+            .err()
+            .unwrap();
+        assert_eq!(failure.code, "CONTROL.CONNECT_FAILED");
+        assert_eq!(failure.details["reason"], reason);
+        assert_eq!(failure.details["child_exited"], true);
+        assert_eq!(failure.details["exit_code"], 23);
+    }
+}
+
+#[test]
+fn handshake_rejects_an_already_closed_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    let server = std::thread::spawn(move || {
+        let frame = transport::read_frame(&mut BufReader::new(&peer), transport::MAX_REQUEST_BYTES)
+            .unwrap()
+            .unwrap();
+        let request: Request = serde_json::from_slice(&frame).unwrap();
+        writeln!(
+            peer,
+            "{}",
+            json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": request.request_id,
+                "session_id": "closed-session",
+                "effect": "not_applied",
+                "commit_state": "not_committed",
+                "data": {"session_id": "closed-session", "closed": true},
+            })
+        )
+        .unwrap();
+    });
+
+    let failure = RemoteClient::from_streams(client.try_clone().unwrap(), client)
+        .err()
+        .expect("a terminal handshake must fail");
+    server.join().unwrap();
+    assert_eq!(failure.code, "CONTROL.CONNECT_FAILED");
+    assert_eq!(failure.details["reason"], "rejected");
 }
 
 #[test]
