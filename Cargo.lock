@@ -260,6 +260,7 @@ dependencies = [
  "image",
  "indexmap 2.14.1",
  "jsonschema",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
