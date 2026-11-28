@@ -23,6 +23,7 @@ use std::sync::Arc;
 pub mod buffer;
 pub mod clip;
 pub mod damage;
+pub mod input_timing;
 pub mod keys;
 pub mod picker;
 pub mod probe;
