@@ -39,6 +39,31 @@ AT-SPI 中心点命中校验无法确认落在新鲜目标子树时返回 `DRIVE
 `effect: not_applied`，不发送输入。重新观察并定位具体叶子节点，或滚动后重试；目标支持键盘动作时也可使用键盘。
 该错误表示命中证明失败；元素缺少动作能力仍返回 `DRIVER.ACTION_UNSUPPORTED`。
 
+### X11 按钮单击节奏
+
+对前台 X11 窗口内已观察、可见且可用的按钮，可以请求一次无修饰键的物理左键单击。
+指针须从同一 X11 客户窗口内出发，路线、落点和按钮身份在派发时复核。
+`aad do click` 通过 `--human` 启用。NDJSON `act`、MCP `control_act`、`run_steps` 和
+`save_workflow` 使用同一个动作对象。
+
+```json
+{"type":"click","input_timing":{"speed":1.5,"seed":42}}
+```
+
+`speed` 默认为 1，范围 0.5–2。`seed` 是可选的 32 位无符号整数。相同版本、种子、
+速度和几何条件会生成相同计划。省略种子时生成一次并在回包中给出。也可通过
+`fraction` 指定元素内落点，或通过 `hold_ms` 指定真实按下到释放的时长。
+省略 `input_timing` 时使用原有单击。语义激活用 `invoke`。该选项不受会话配置影响。
+其他后端会在派发前拒绝。X11 helper 须公布 `timed-click-v1`、窗口几何证明和合作取消能力。
+
+即时回包的 `backend_result.input_timing` 给出规划器版本、种子、速度和计划时序。
+`run_steps` 与 `run_workflow` 在步骤回包中给出该信息，`aad run` 在 `step_input_timing`
+中按步骤 ID 列出。保存的步骤只有应用选择器、locator 和动作参数。每次回放以新观察
+重新定位按钮，用实时指针和新几何计算轨迹。回包中的计划时间与应用实际接收时间分别测量。
+
+动作中止时，查看 `details.input_progress` 里的移动数、是否尝试按下和按钮释放状态。
+发生过派发而效果未能确认时返回 `effect: unknown`。先重新观察及核对应用状态，再决定后续操作。
+
 Chromium/CDP 键盘：先聚焦被观察元素并确认焦点（含开放 shadow root 内的深层焦点）和文档焦点都在它上面，再发键。
 `type_text` 只在可编辑节点上提供，逐字符发送，每个字符前重新确认焦点，焦点移走即以 `CONTROL.FOCUS_LOST`
 （`details.typed` 为已发字符数）停止：`mode: unicode`（默认）每字符一次 `Input.insertText`（有 input 事件，
