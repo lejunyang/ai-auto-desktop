@@ -292,8 +292,8 @@ impl HandshakeError {
                 .and_then(|child| observe_exit(deadline, || child.try_wait()))
             {
                 *child = None;
-                let mut failure = if matches!(self, Self::InvalidFrame) {
-                    let mut failure = self.failure(false).with_detail("child_exited", true.into());
+                let failure = if matches!(self, Self::InvalidFrame) {
+                    let mut failure = self.failure(false);
                     failure
                         .message
                         .push_str(". Child exited before the remote handshake");
@@ -301,6 +301,7 @@ impl HandshakeError {
                 } else {
                     connect_failure("child_exited", "child exited before the remote handshake")
                 };
+                let mut failure = failure.with_detail("child_exited", true.into());
                 if let Some(code) = status.code() {
                     failure.message.push_str(&format!(" (exit code {code})"));
                     failure = failure.with_detail("exit_code", code.into());

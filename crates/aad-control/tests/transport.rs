@@ -371,12 +371,18 @@ fn handshake_reports_write_error_while_response_stream_is_open() {
 #[cfg(unix)]
 #[test]
 fn handshake_preserves_the_child_exit_code_in_details() {
-    let failure = RemoteClient::spawn(&["/bin/sh".into(), "-c".into(), "exit 23".into()])
-        .err()
-        .unwrap();
-    assert_eq!(failure.code, "CONTROL.CONNECT_FAILED");
-    assert_eq!(failure.details["reason"], "child_exited");
-    assert_eq!(failure.details["exit_code"], 23);
+    for (script, reason) in [
+        ("exit 23", "child_exited"),
+        ("printf 'invalid frame\\n'; exit 23", "invalid_frame"),
+    ] {
+        let failure = RemoteClient::spawn(&["/bin/sh".into(), "-c".into(), script.into()])
+            .err()
+            .unwrap();
+        assert_eq!(failure.code, "CONTROL.CONNECT_FAILED");
+        assert_eq!(failure.details["reason"], reason);
+        assert_eq!(failure.details["child_exited"], true);
+        assert_eq!(failure.details["exit_code"], 23);
+    }
 }
 
 #[test]

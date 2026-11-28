@@ -297,7 +297,7 @@ fn remote_client(raw: &str, option: &str) -> std::io::Result<RemoteClient> {
             .get("reason")
             .and_then(serde_json::Value::as_str);
         if let Some(hint) = remote_startup_hint(reason) {
-            message.push_str(". ");
+            message.push_str(". Child stdout must contain only control protocol NDJSON. ");
             message.push_str(hint);
         }
         if error
@@ -317,13 +317,8 @@ const CHECK_REMOTE_COMMAND: &str = "Run the command separately and check its exi
 
 fn remote_startup_hint(reason: Option<&str>) -> Option<&'static str> {
     match reason {
-        Some("invalid_frame") => Some(
-            "Child stdout must contain only control protocol NDJSON. Send startup messages to stderr",
-        ),
-        Some("child_stdout_closed") => Some(
-            "Child stdout must contain only control protocol NDJSON. Check the startup script for stdout redirection",
-        ),
-        Some("child_exited") => Some(CHECK_REMOTE_COMMAND),
+        Some("invalid_frame") => Some("Send startup messages to stderr"),
+        Some("child_stdout_closed") => Some("Check the startup script for stdout redirection"),
         _ => None,
     }
 }
