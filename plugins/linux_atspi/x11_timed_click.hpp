@@ -156,15 +156,19 @@ int RunTimedClick(Display *display, unsigned long pid, Atom pid_atom,
     const auto ready_at = Clock::now() + duration;
     if (static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             ready_at.time_since_epoch()).count()) >= deadline) return finish("deadline_exceeded");
-    auto previous = Clock::now();
-    unsigned at = 0;
+    const auto movement_start = Clock::now();
+    auto previous = movement_start;
     bool overshoot_checked = false;
     for (const auto &move : plan.moves) {
         if (move.overshoot && !overshoot_checked) {
             if (const auto problem = revalidate(false); !problem.empty()) return finish(problem);
             overshoot_checked = true;
         }
-        if (const auto problem = wait(previous + Ms(move.at - at), false); !problem.empty()) return finish(problem);
+        // Use the plan's clock so round trips do not add their latency to
+        // every interval. Keep a minimum spacing after an unusually slow
+        // check instead of flushing queued motion events in a burst.
+        const auto due = std::max(movement_start + Ms(move.at), previous + Ms(4));
+        if (const auto problem = wait(due, false); !problem.empty()) return finish(problem);
         const auto sent = inject(false, [&]() -> std::string_view {
             return hit(move.x, move.y) ? "" : "target_point_mismatch";
         }, [&] { return XTestFakeMotionEvent(display, -1, move.x, move.y, 0) != 0; });
@@ -174,7 +178,6 @@ int RunTimedClick(Display *display, unsigned long pid, Atom pid_atom,
         ++progress.delivered;
         ++click.moves;
         previous = Clock::now();
-        at = move.at;
     }
     if (const auto problem = revalidate(false); !problem.empty()) return finish(problem);
     if (const auto problem = wait(previous + Ms(plan.settle), false); !problem.empty()) return finish(problem);
