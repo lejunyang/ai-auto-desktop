@@ -368,7 +368,8 @@ fn observe_exit(
 }
 
 enum HandshakeEvent {
-    Read(std::result::Result<Response, HandshakeError>),
+    // Boxed: a response is far larger than the write result (clippy::large_enum_variant).
+    Read(Box<std::result::Result<Response, HandshakeError>>),
     Write(io::Result<()>),
 }
 
@@ -386,7 +387,7 @@ fn wait_for_handshake(
             .unwrap_or(deadline)
             .saturating_duration_since(Instant::now());
         let failed = match events.recv_timeout(remaining) {
-            Ok(HandshakeEvent::Read(result)) => read.insert(result).is_err(),
+            Ok(HandshakeEvent::Read(result)) => read.insert(*result).is_err(),
             Ok(HandshakeEvent::Write(result)) => write.insert(result).is_err(),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 interruption = HandshakeError::Timeout;
@@ -509,7 +510,7 @@ impl RemoteClient {
             let mut input = BufReader::new(input);
             let hello = read_response(&mut input)
                 .and_then(|response| validate_handshake(response, &request.request_id));
-            let _ = read_startup.send(HandshakeEvent::Read(hello));
+            let _ = read_startup.send(HandshakeEvent::Read(Box::new(hello)));
             drop(read_startup);
             // Keep the response pipe open while startup is diagnosed. Closing
             // it sooner could make a child exit while writing its response.
@@ -770,7 +771,7 @@ mod tests {
         for write_first in [false, true] {
             let (sender, receiver) = mpsc::channel();
             let mut events = [
-                HandshakeEvent::Read(Err(HandshakeError::InvalidFrame)),
+                HandshakeEvent::Read(Box::new(Err(HandshakeError::InvalidFrame))),
                 HandshakeEvent::Write(Err(io::ErrorKind::BrokenPipe.into())),
             ];
             if write_first {
