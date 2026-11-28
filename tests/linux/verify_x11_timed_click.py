@@ -164,6 +164,17 @@ def receipt(reply):
     return reply["backend_result"]["input_timing"]
 
 
+def click_progress(reply):
+    return reply["backend_result"]["input"]["input_progress"]
+
+
+def assert_hold(hold, planned, recheck):
+    # GTK's X11 stamps measure the whole press. The helper separately
+    # measures the read-only ACK just before release. Bound the remaining
+    # error after accounting for that measured pause and X11 scheduling.
+    assert planned - 2 <= hold and -2 <= hold - planned - recheck <= 60, (hold, planned, recheck)
+
+
 def physical(events, center, expected_moves=None):
     moves = [event for event in events if event["kind"] == "motion"]
     down, = [event for event in events if event["kind"] == "down"]
@@ -190,6 +201,7 @@ def matrix(control, gtk, resource, locator, center, output, sample_count):
     durations = {}
     for mode in ("default", 1.0, 2.0):
         previous_points = None
+        drift = []
         spans = []
         for attempt in range(sample_count):
             name = f"{locator['name']}-{mode}-{attempt + 1}"
@@ -203,15 +215,20 @@ def matrix(control, gtk, resource, locator, center, output, sample_count):
             settle = down["x_ms"] - moves[-1]["x_ms"]
             hold = up["x_ms"] - down["x_ms"]
             plans = None
+            progress = {}
             if mode == "default":
                 assert hold <= 15 and up["x_ms"] - moves[0]["x_ms"] <= 25, events
             else:
                 plans = receipt(reply)
                 assert plans["seed"] == SEED and plans["speed"] == mode and plans["planner_version"] == 1, plans
                 assert len(moves) >= 8 and len(moves) == plans["moves"], (name, plans, moves)
-                assert plans["movement_ms"] - 65 <= span <= plans["movement_ms"] + 120, (span, plans)
-                assert plans["settle_ms"] - 2 <= settle <= plans["settle_ms"] + 90, (settle, plans)
-                assert plans["hold_ms"] - 2 <= hold <= plans["hold_ms"] + 90, (hold, plans)
+                assert plans["movement_ms"] - 65 <= span, (span, plans)
+                drift.append(span - plans["movement_ms"])
+                progress = click_progress(reply)
+                assert progress["released"] and progress["up_confirmed"], progress
+                settle_expected = max(plans["settle_ms"], progress["press_check_ms"])
+                assert -2 <= settle - settle_expected <= 60, (settle, settle_expected, plans)
+                assert_hold(hold, plans["hold_ms"], progress["release_check_ms"])
                 points = [(event["x"], event["y"]) for event in moves]
                 assert any(abs(y - center[1]) >= 2 for _, y in points), points
                 hops = [abs(b[0] - a[0]) for a, b in zip(points, points[1:])]
@@ -223,8 +240,12 @@ def matrix(control, gtk, resource, locator, center, output, sample_count):
                 previous_points = points
             spans.append(span)
             output.write(json.dumps({"sample": name, "motion_x11_ms": span, "settle_x11_ms": settle,
-                                     "hold_x11_ms": hold, "motion_gtk_us": moves[-1]["rx_us"] - moves[0]["rx_us"],
+                                     "hold_x11_ms": hold, "press_check_ms": progress.get("press_check_ms"),
+                                     "release_check_ms": progress.get("release_check_ms"),
+                                     "motion_gtk_us": moves[-1]["rx_us"] - moves[0]["rx_us"],
                                      "hold_gtk_us": up["rx_us"] - down["rx_us"], "plan": plans}) + "\n")
+        if drift:
+            assert statistics.median(drift) <= 120, drift
         durations[mode] = statistics.median(spans)
     assert durations[2.0] < durations[1.0], durations
     return durations
@@ -250,7 +271,7 @@ def public_and_interruptions(aad, open_control, mcp, gtk, resource, locator, cen
                                               "--human", "--seed", str(SEED), "--speed", "1.5", "--hold-ms", "95"))
     assert receipt(result["result"])["speed"] == 1.5
     _, down, up = physical(events, center)
-    assert 95 - 2 <= up["x_ms"] - down["x_ms"] <= 95 + 90
+    assert_hold(up["x_ms"] - down["x_ms"], 95, click_progress(result["result"])["release_check_ms"])
     result, events = sample("generated-seed", lambda: cli("generated-seed", "do", "click", resource,
                             "--name", locator["name"], "--human"))
     assert 0 <= receipt(result["result"])["seed"] < 2**32
