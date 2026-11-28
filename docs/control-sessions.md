@@ -560,8 +560,8 @@ aad control connect --command '["ssh","-T","-o","BatchMode=yes","-o","StrictHost
 
 启动脚本的 stdout 必须留给控制协议 NDJSON。启动提示写入 stderr。握手失败时，两个 CLI 入口均在
 stderr 输出诊断。`RemoteClient` 的握手错误使用 `CONTROL.CONNECT_FAILED`，通过 `details.reason`
-提供失败种类。握手前观察到子进程自然退出时，`details.exit_code` 提供可用的数字退出码。
-无效帧伴随自然退出时，`details.reason` 保留 `invalid_frame`，`details.child_exited` 为 `true`。
+提供失败种类。握手失败时，如果观察到子进程自然退出，`details.child_exited` 为 `true`，
+`details.exit_code` 提供可用的数字退出码。无效帧伴随自然退出时，`details.reason` 保留 `invalid_frame`。
 
 首次输入时，同一 OS 用户下协作会话通过文件锁获取独占 `desktop-input` 租约，涵盖 native 与 browser，
 到会话关闭或输入调用结束才释放。Unix 锁目录检查 owner/0700、拒绝符号链接；锁文件无凭证内容。
