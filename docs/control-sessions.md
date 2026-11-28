@@ -60,6 +60,8 @@ AT-SPI 中心点命中校验无法确认落在新鲜目标子树时返回 `DRIVE
 `run_steps` 与 `run_workflow` 在步骤回包中给出该信息，`aad run` 在 `step_input_timing`
 中按步骤 ID 列出。保存的步骤只有应用选择器、locator 和动作参数。每次回放以新观察
 重新定位按钮，用实时指针和新几何计算轨迹。回包中的计划时间与应用实际接收时间分别测量。
+按下和释放前的只读复核耗时分别记录在 `input_progress.press_check_ms` 与
+`input_progress.release_check_ms`。释放前复核计入应用实收的持按时长。
 
 动作中止时，查看 `details.input_progress` 里的移动数、是否尝试按下和按钮释放状态。
 发生过派发而效果未能确认时返回 `effect: unknown`。先重新观察及核对应用状态，再决定后续操作。
