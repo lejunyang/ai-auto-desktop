@@ -1332,6 +1332,7 @@ fn fractions_stay_relative_to_the_full_element_when_the_viewport_clips_it() {
         true
     );
     let click = |fraction| Action::Click {
+        input_timing: None,
         button: None,
         count: None,
         fraction,
@@ -1423,6 +1424,7 @@ fn bounded_holds_have_real_durations_and_release_on_focus_occlusion_and_cancel()
         hold_ms: Some(180),
     };
     let held_click = || Action::Click {
+        input_timing: None,
         button: None,
         count: None,
         fraction: None,
@@ -2132,6 +2134,7 @@ fn pointer_modifiers_reach_click_drag_and_drop_without_keyboard_state() {
             "canvas",
             "Modified surface",
             Action::Click {
+                input_timing: None,
                 hold_ms: None,
                 button: None,
                 count: None,
@@ -2342,6 +2345,7 @@ fn controls_inside_open_shadow_roots_are_observed_and_operated() {
         "button",
         "Go",
         Action::Click {
+            input_timing: None,
             hold_ms: None,
             modifiers: Vec::new(),
             button: None,
@@ -2383,6 +2387,7 @@ fn frame_of(session: &Session, wanted: impl Fn(&Value) -> bool) -> Value {
 }
 fn trusted_click() -> Action {
     Action::Click {
+        input_timing: None,
         hold_ms: None,
         modifiers: Vec::new(),
         button: None,
@@ -2431,6 +2436,7 @@ fn frames_in_and_out_of_process_take_trusted_pointer_and_keyboard_input() {
         "button",
         "CrossButton",
         Action::Click {
+            input_timing: None,
             hold_ms: None,
             modifiers: Vec::new(),
             button: Some(Button::Right),
@@ -3481,6 +3487,7 @@ fn tabs_open_front_and_close_and_popups_name_their_opener() {
         &session,
         popup,
         Action::Click {
+            input_timing: None,
             hold_ms: None,
             modifiers: Vec::new(),
             button: None,
@@ -3988,6 +3995,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Click {
+            input_timing: None,
             hold_ms: None,
             modifiers: Vec::new(),
             button: Some(Button::Right),
@@ -4003,6 +4011,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Click {
+            input_timing: None,
             hold_ms: None,
             modifiers: Vec::new(),
             button: None,
@@ -4076,6 +4085,7 @@ fn browser_actions_are_observed_document_bound_and_have_real_page_effects() {
         &session,
         target,
         Action::Click {
+            input_timing: None,
             hold_ms: None,
             modifiers: Vec::new(),
             button: None,

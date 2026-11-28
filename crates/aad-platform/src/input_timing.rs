@@ -66,6 +66,7 @@ pub struct ClickGeometry {
     pub target: Point,
     pub window: ClickBounds,
     pub hit: ClickBounds,
+    pub allow_overshoot: bool,
 }
 
 /// Fixed 32-bit LCG. Changes to arithmetic, draw order or rounding require
@@ -96,6 +97,7 @@ pub fn plan_click(
         target,
         window,
         hit,
+        allow_overshoot,
     } = geometry;
     if !(MIN_CLICK_SPEED..=MAX_CLICK_SPEED).contains(&speed)
         || !window.contains(start)
@@ -134,11 +136,12 @@ pub fn plan_click(
             .clamp(160.0, 650.0),
     );
     plan.movement_ms = duration;
-    let extra = if overshoot && distance >= 48.0 && forward_room >= overshoot_px + 1.0 {
-        overshoot_px
-    } else {
-        0.0
-    };
+    let extra =
+        if allow_overshoot && overshoot && distance >= 48.0 && forward_room >= overshoot_px + 1.0 {
+            overshoot_px
+        } else {
+            0.0
+        };
     let correction = if extra == 0.0 { 0 } else { scaled(40.0) };
     let approach = duration - correction;
     let bend = bend.signum() * (0.35 + 0.65 * bend.abs()) * (distance * 0.16).min(44.0);
@@ -195,6 +198,7 @@ mod tests {
                 min: (100 + distance - width / 2, 90),
                 max: (100 + distance + width / 2 - 1, 110),
             },
+            allow_overshoot: true,
         }
     }
 
@@ -237,20 +241,18 @@ mod tests {
             .unwrap();
         let wide = plan_click(roomy, seed, 1.0, None).unwrap();
         assert_eq!(wide.moves.last().unwrap().point, roomy.target);
-        assert!(
-            wide.moves
-                .iter()
-                .filter(|p| p.overshoot)
-                .all(|p| roomy.hit.contains(p.point))
-        );
+        assert!(wide
+            .moves
+            .iter()
+            .filter(|p| p.overshoot)
+            .all(|p| roomy.hit.contains(p.point)));
         let mut edge = roomy;
         edge.hit.max.0 = edge.target.0;
         let plan = plan_click(edge, seed, 1.0, None).unwrap();
-        assert!(
-            plan.moves
-                .iter()
-                .all(|p| !p.overshoot && p.point.0 <= edge.target.0)
-        );
+        assert!(plan
+            .moves
+            .iter()
+            .all(|p| !p.overshoot && p.point.0 <= edge.target.0));
         edge.start = edge.target;
         assert!(plan_click(edge, seed, 1.0, None).unwrap().moves.is_empty());
         assert!(plan_click(edge, seed, f64::NAN, None).is_none());

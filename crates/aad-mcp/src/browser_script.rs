@@ -166,6 +166,7 @@ impl Page {
         self.request(Operation::Act {
             target,
             action: Action::Click {
+                input_timing: None,
                 fraction: Some(Fraction { fx: 0.5, fy: 0.5 }),
                 button: None,
                 count: None,

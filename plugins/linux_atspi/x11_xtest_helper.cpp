@@ -30,6 +30,7 @@
 #include <functional>
 #include <optional>
 #include <poll.h>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -412,6 +413,13 @@ void MarkDispatchStarted(bool &dispatched) {
     }
 }
 
+struct TimedClickProgress {
+    std::size_t moves = 0;
+    bool down_attempted = false;
+    bool up_confirmed = false;
+    bool cleanup_motion = false;
+};
+
 struct InputProgress {
     std::string_view unit;
     std::size_t total;
@@ -429,7 +437,7 @@ struct InputProgress {
         if (binding) proven_window = binding->id;
     }
 
-    void Emit(Display *display = nullptr) const {
+    void Emit(Display *display = nullptr, const TimedClickProgress *timed_click = nullptr) const {
         bool released = true;
         if (attempted_keys.any()) {
             char keys[32]{};
@@ -449,7 +457,14 @@ struct InputProgress {
         std::cout << "{\"event\":\"input_progress\",\"unit\":\"" << unit
                   << "\",\"delivered\":" << delivered << ",\"total\":" << total
                   << ",\"proven_window\":" << proven_window << ",\"released\":"
-                  << (released ? "true" : "false") << "}" << std::endl;
+                  << (released ? "true" : "false");
+        if (timed_click) {
+            std::cout << ",\"moves\":" << timed_click->moves
+                      << ",\"down_attempted\":" << (timed_click->down_attempted ? "true" : "false")
+                      << ",\"up_confirmed\":" << (timed_click->up_confirmed ? "true" : "false")
+                      << ",\"cleanup_motion\":" << (timed_click->cleanup_motion ? "true" : "false");
+        }
+        std::cout << "}" << std::endl;
     }
 };
 
@@ -3300,6 +3315,8 @@ int RunGlobalKey(int argc, char **argv) {
 
 #include "x11_drag_between.hpp"
 
+#include "x11_timed_click.hpp"
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -3315,7 +3332,7 @@ int main(int argc, char **argv) {
             return kExitInvalid;
         }
         // This protocol handshake does not open a display or touch input state.
-        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys","anchored-drag-between","anchored-type-text","atomic-key-dispatch","text-event-barrier","window-geometry-proof-v1","anchored-straight-drag"]})"
+        std::cout << R"({"helper":"aad-linux-xtest","protocol":1,"features":["focus-info","type-text","pointer-click","pointer-gesture","drag","key-chord","window-info","window-action","paste","clipboard-read","global-key","record-input","pointer-modifiers","x11-desktop-independent","bounded-hold","window-focus","cooperative-cancel","anchored-drag-path","type-text-keys","anchored-drag-between","anchored-type-text","atomic-key-dispatch","text-event-barrier","window-geometry-proof-v1","anchored-straight-drag","timed-click-v1"]})"
                   << std::endl;
         return 0;
     }
@@ -3324,16 +3341,17 @@ int main(int argc, char **argv) {
     std::vector<char *> filtered;
     std::vector<char *> filtered_destination;
     std::string_view anchor_token;
+    const bool timed_click = command == "timed-click" || command == "timed-click-origin";
     if ((command != "window-info" && command != "window-action" &&
          !ExtractWindowBinding(&argc, &argv, &filtered, &binding, "--", &anchor_token)) ||
         (!anchor_token.empty() &&
-         (!binding || (command != "type-text" && command != "key-chord" && command != "paste"))) ||
+         (!binding || (command != "type-text" && command != "key-chord" && command != "paste" && !timed_click))) ||
         (binding.has_value() && command != "focus-info" && (binding->id == None || binding->request_proof))) {
         EmitError("invalid_window_binding", "arguments", false);
         return kExitInvalid;
     }
     if (binding.has_value() && command != "focus-info" && command != "type-text" &&
-        command != "key-chord" && command != "paste" && command != "pointer-gesture" && command != "drag") {
+        command != "key-chord" && command != "paste" && command != "pointer-gesture" && command != "drag" && !timed_click) {
         EmitError("invalid_window_binding", "arguments", false);
         return kExitInvalid;
     }
@@ -3361,6 +3379,7 @@ int main(int argc, char **argv) {
         return RunGlobalKey(argc, argv);
     }
     InputCancellation cancellation;
+    if (timed_click) return TimedClickCommand(command, argc, argv, binding, anchor_token);
     std::optional<std::uint64_t> expected_pid;
     std::optional<std::uint64_t> deadline_ns;
     std::optional<int> click_x;

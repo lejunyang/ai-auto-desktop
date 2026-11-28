@@ -266,6 +266,7 @@ fn drag_ends_share_one_observation_and_gestures_follow_node_capabilities() {
         "CONTROL.INVALID_REQUEST"
     );
     let outside = Action::Click {
+        input_timing: None,
         button: None,
         count: None,
         fraction: Some(Fraction { fx: 1.5, fy: 0.5 }),

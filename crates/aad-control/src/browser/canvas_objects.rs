@@ -428,6 +428,7 @@ impl Scene {
             }
         }
         Ok(Action::Click {
+            input_timing: None,
             fraction: Some(centre),
             count: None,
             button: None,

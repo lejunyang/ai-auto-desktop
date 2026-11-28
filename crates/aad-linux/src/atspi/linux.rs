@@ -32,8 +32,10 @@ mod gtk3_input;
 pub(super) mod gtk4_picker;
 pub(super) mod kde_picker;
 mod table;
+mod timed_click;
 mod wayland_input;
 use focus_discovery::FocusDiscovery;
+pub use timed_click::check_x11_timed_click_support;
 mod window_focus;
 use window_focus::{
     append_window_args, append_window_proof_args, AnchoredKeyboard, GEOMETRY_FEATURE,
@@ -1499,6 +1501,14 @@ impl AtspiBackend for LinuxBackend {
         )
     }
 
+    fn check_timed_click_support(&self, deadline: Instant) -> Result<(), AutomationError> {
+        self.timed_click_helper(deadline).map(|_| ())
+    }
+
+    fn timed_click(&self, request: super::TimedClickRequest<'_>) -> Result<Value, AutomationError> {
+        self.run_timed_click(request)
+    }
+
     fn pointer_gesture(
         &self,
         target: &NativeRef,
@@ -2678,14 +2688,30 @@ fn parse_helper_progress(progress: &Value) -> Option<Value> {
     let total = progress["total"].as_u64()?;
     let proven_window = progress["proven_window"].as_u64()?;
     let released = progress["released"].as_bool()?;
-    if !matches!(unit, "codepoint" | "key" | "chord" | "paste" | "button")
-        || delivered > total
+    if !matches!(
+        unit,
+        "codepoint" | "key" | "chord" | "paste" | "button" | "pointer_event"
+    ) || delivered > total
         || proven_window > u64::from(u32::MAX)
     {
         return None;
     }
-    Some(json!({"unit": unit, "delivered": delivered, "total": total,
-                "proven_window": proven_window, "released": released}))
+    let mut result = json!({"unit": unit, "delivered": delivered, "total": total,
+                "proven_window": proven_window, "released": released});
+    if unit == "pointer_event" {
+        let moves = progress["moves"].as_u64()?;
+        let down_attempted = progress["down_attempted"].as_bool()?;
+        let up_confirmed = progress["up_confirmed"].as_bool()?;
+        let cleanup_motion = progress["cleanup_motion"].as_bool()?;
+        if moves > delivered || (up_confirmed && !down_attempted) {
+            return None;
+        }
+        result["moves"] = json!(moves);
+        result["down_attempted"] = json!(down_attempted);
+        result["up_confirmed"] = json!(up_confirmed);
+        result["cleanup_motion"] = json!(cleanup_motion);
+    }
+    Some(result)
 }
 
 fn with_helper_receipt(mut error: AutomationError, stdout: &[u8]) -> AutomationError {
@@ -2967,6 +2993,18 @@ fn map_helper_code(code: &str) -> Option<AutomationError> {
         "target_point_mismatch" => driver_error(
             "DRIVER.POINT_NOT_PROVEN",
             "the pointer location is not on a target-process window; no input was sent",
+        ),
+        "pointer_position_changed" => driver_error(
+            "DRIVER.STALE_SNAPSHOT",
+            "pointer position changed after the timed click was planned",
+        ),
+        "pointer_state_changed" | "unsupported_pointer_mapping" => driver_error(
+            "DRIVER.ACTION_UNSUPPORTED",
+            "timed click requires an idle pointer and an ordinary left-button mapping",
+        ),
+        "no_timed_click_escape" => driver_error(
+            "DRIVER.POINT_NOT_PROVEN",
+            "timed click could not prove a release location outside the button",
         ),
         "modifier_unavailable_or_held" => driver_error(
             "DRIVER.ACTION_UNSUPPORTED",

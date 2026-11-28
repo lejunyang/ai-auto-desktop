@@ -164,6 +164,18 @@ pub struct ClickArgs {
     count: Option<u8>,
     #[command(flatten)]
     at: Position,
+    /// Use a timed physical single left click on an observed X11 button.
+    #[arg(long)]
+    human: bool,
+    /// Timed click speed from 0.5 to 2 (default 1).
+    #[arg(long, requires = "human")]
+    speed: Option<f64>,
+    /// Reproduce the timed click plan for the same start and target geometry.
+    #[arg(long, requires = "human")]
+    seed: Option<u32>,
+    /// Keep the button down for this many milliseconds (1..5000).
+    #[arg(long)]
+    hold_ms: Option<u64>,
 }
 
 #[derive(Args)]
@@ -719,11 +731,24 @@ fn plan(command: &DoCommand) -> Result<(&Pick, Value, Option<Locator>), (Value, 
         DoCommand::ChooseFiles(_) => unreachable!("choose-files has a native dialog target"),
         DoCommand::Focus(pick) => (pick, json!({"type": "focus"}), None),
         DoCommand::Invoke(pick) => (pick, json!({"type": "invoke"}), None),
-        DoCommand::Click(args) => (
-            &args.pick,
-            json!({"type": "click", "button": args.button, "count": args.count, "fraction": args.at.fraction()}),
-            None,
-        ),
+        DoCommand::Click(args) => {
+            if args
+                .speed
+                .is_some_and(|speed| !(0.5..=2.0).contains(&speed))
+            {
+                return Err(usage("speed must be in 0.5..2"));
+            }
+            let timing = args.human.then_some(aad_control::ClickTiming {
+                seed: args.seed,
+                speed: args.speed,
+            });
+            (
+                &args.pick,
+                json!({"type": "click", "button": args.button, "count": args.count,
+                    "fraction": args.at.fraction(), "hold_ms": args.hold_ms, "input_timing": timing}),
+                None,
+            )
+        }
         DoCommand::Fill(args) => (
             &args.pick,
             json!({"type": "fill", "value": args.value}),
@@ -1016,6 +1041,37 @@ mod tests {
         let mut argv = vec!["do"];
         argv.extend_from_slice(args);
         Probe::try_parse_from(argv).map(|p| p.command)
+    }
+
+    #[test]
+    fn timed_click_flags_are_explicit_and_action_local() {
+        let command = parse(&[
+            "click",
+            "Fixture",
+            "--name",
+            "OK",
+            "--human",
+            "--seed",
+            "0",
+            "--speed",
+            "1.5",
+            "--hold-ms",
+            "40",
+        ])
+        .unwrap();
+        assert_eq!(
+            plan(&command).unwrap().1["input_timing"],
+            json!({"seed":0,"speed":1.5})
+        );
+        let ordinary = parse(&["click", "Fixture", "--name", "OK"]).unwrap();
+        assert!(plan(&ordinary).unwrap().1.get("input_timing").is_none());
+        assert!(parse(&["click", "Fixture", "--name", "OK", "--seed", "0"]).is_err());
+        assert!(parse(&["invoke", "Fixture", "--name", "OK", "--human"]).is_err());
+        let bad = parse(&[
+            "click", "Fixture", "--name", "OK", "--human", "--speed", "NaN",
+        ])
+        .unwrap();
+        assert!(plan(&bad).is_err());
     }
 
     #[test]

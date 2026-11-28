@@ -1590,9 +1590,12 @@ mod tests {
             assert_eq!(parse(&payload)["code"], json!("MCP.INVALID_ARGUMENT"));
         }
         // Durable-only arguments on an in-memory run are a mistake, not a no-op.
-        let stray =
-            tools::run_workflow(&stub_session(), &json!({"name": "greeter", "wait_ms": 10}))
-                .expect_err("wait_ms without durable");
+        let stray = tools::run_workflow(
+            &stub_session(),
+            &json!({"name": "greeter", "wait_ms": 10}),
+            None,
+        )
+        .expect_err("wait_ms without durable");
         assert_eq!(parse(&stray)["code"], json!("MCP.INVALID_ARGUMENT"));
     }
 

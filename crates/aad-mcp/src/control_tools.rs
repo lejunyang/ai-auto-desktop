@@ -107,7 +107,15 @@ fn action_schema() -> Value {
             "count": {"type": "integer", "enum": [1, 2], "description": "1 for a single click, 2 for a double click."},
             "fraction": fraction_schema("Where inside the element to click"),
             "modifiers": pointer_modifiers_schema(),
-            "hold_ms": hold_schema("Keep the button down before release, in milliseconds. Only a single click (count 1) can be held.")
+            "hold_ms": hold_schema("Keep the button down before release, in milliseconds. Only a single click (count 1) can be held."),
+            "input_timing": {
+                "type":"object", "additionalProperties":false,
+                "description":"Enable a timed physical single unmodified left click on an observed X11 button only. Omit to use the default dispatch.",
+                "properties":{
+                    "speed":{"type":"number","minimum":0.5,"maximum":2,"default":1,"description":"Scale generated movement and timing. An explicit hold_ms keeps its original duration."},
+                    "seed":{"type":"integer","minimum":0,"maximum":4294967295u64,"description":"Reproduce the timing plan for the same start, geometry and planner version. If omitted, the reply reports the generated seed."}
+                }
+            }
         }), &[]),
         variant("fill", "Replace the element's value directly. Prefer this over \
     type_text for text fields: it is atomic and does not depend on focus.", json!({

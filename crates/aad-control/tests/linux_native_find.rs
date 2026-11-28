@@ -343,6 +343,10 @@ fn assert_x11_helper_rejection(incompatible_handshake: bool) {
         ),
         (json!({"type":"close_window"}), "DRIVER.HELPER_INCOMPATIBLE"),
         (
+            json!({"type":"click","input_timing":{"seed":1}}),
+            "DRIVER.HELPER_INCOMPATIBLE",
+        ),
+        (
             json!({"type":"drag","to":node["target"]}),
             "DRIVER.HELPER_INCOMPATIBLE",
         ),
@@ -369,6 +373,8 @@ fn assert_x11_helper_rejection(incompatible_handshake: bool) {
         assert_eq!(failure["code"], code);
         if incompatible_handshake && code == "DRIVER.HELPER_INCOMPATIBLE" {
             assert_eq!(failure["message"], "fixture rejected describe");
+        } else if action["input_timing"].is_object() {
+            assert_eq!(failure["details"]["required_feature"], "timed-click-v1");
         } else if straight_drag {
             assert_eq!(
                 failure["message"],
