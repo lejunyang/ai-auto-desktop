@@ -20,6 +20,10 @@ fs2 = "0.4"
 jsonschema = { workspace = true }
 image = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = { workspace = true }
+rusqlite = { workspace = true, features = ["hooks"] }
+
 # Inherit the workspace's deliberate lint allowances (see the root Cargo.toml).
 [lints]
 workspace = true

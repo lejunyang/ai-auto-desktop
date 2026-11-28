@@ -36,6 +36,9 @@ use sha2::{Digest, Sha256};
 mod writers;
 use writers::Writers;
 
+#[cfg(all(test, target_os = "linux"))]
+mod forked_writer_tests;
+
 /// The run store used when none is named.
 ///
 /// One per user, beside the saved workflows in `~/.ai-auto-desktop`, so a run
@@ -584,11 +587,12 @@ impl JournalStore {
     fn write<T>(&self, body: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let deadline = Instant::now() + self.busy_timeout;
         let _turn = self.writers.enter(deadline)?;
-        let reservation = self.writers.reserve(deadline)?;
-        let transaction = self.retry_busy(deadline, || {
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
-        })?;
-        drop(reservation);
+        let transaction = {
+            let _reservation = self.writers.reserve(deadline)?;
+            self.retry_busy(deadline, || {
+                Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+            })?
+        };
         let result = body(&transaction)?;
         transaction.commit()?;
         Ok(result)

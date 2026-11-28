@@ -35,9 +35,8 @@ impl Writers {
 
     /// Only the process waiting to begin the next write holds this lock. The
     /// current transaction runs without it, so a waiter can reserve the next
-    /// turn while SQLite is syncing a commit. Closing the handle, including on
-    /// process exit, releases the reservation. Keep the inode across calls.
-    pub(super) fn reserve(&self, deadline: Instant) -> Result<Option<File>> {
+    /// turn while SQLite is syncing a commit. Keep the inode across calls.
+    pub(super) fn reserve(&self, deadline: Instant) -> Result<Option<Reservation>> {
         if std::fs::symlink_metadata(&self.admission_path)
             .is_ok_and(|meta| !meta.is_file() || meta.len() != 0)
         {
@@ -58,7 +57,7 @@ impl Writers {
         let pause = Duration::from_millis(2 + u64::from(std::process::id() % 5));
         loop {
             match fs2::FileExt::try_lock_exclusive(&file) {
-                Ok(()) => return Ok(Some(file)),
+                Ok(()) => return Ok(Some(Reservation(file))),
                 Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => (),
                 Err(e) if e.kind() == std::io::ErrorKind::Unsupported => return Ok(None),
                 Err(e) => {
@@ -92,6 +91,16 @@ impl Writers {
             queue = turn.wait_timeout(queue, remaining).unwrap().0;
         }
         Ok(Turn(self))
+    }
+}
+
+pub(super) struct Reservation(File);
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        // A child can inherit the open file description until exec, so closing
+        // this handle alone may leave the lock held.
+        let _ = fs2::FileExt::unlock(&self.0);
     }
 }
 
