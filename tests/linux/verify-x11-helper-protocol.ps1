@@ -22,7 +22,8 @@ $required = @('focus-info', 'type-text', 'pointer-click', 'pointer-gesture', 'dr
     'window-info', 'window-action', 'paste', 'clipboard-read', 'global-key', 'record-input', 'pointer-modifiers',
     'x11-desktop-independent', 'bounded-hold', 'window-focus', 'cooperative-cancel',
     'anchored-drag-path', 'type-text-keys', 'anchored-drag-between', 'atomic-key-dispatch',
-    'anchored-type-text', 'text-event-barrier', 'window-geometry-proof-v1', 'anchored-straight-drag')
+    'anchored-type-text', 'text-event-barrier', 'window-geometry-proof-v1', 'anchored-straight-drag',
+    'timed-click-v1')
 foreach ($feature in $required) {
     if ($description.features -notcontains $feature) { throw "missing helper feature: $feature" }
 }
